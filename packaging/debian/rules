@@ -1,0 +1,16 @@
+#!/usr/bin/make -f
+
+export DH_VERBOSE = 1
+export PYBUILD_NAME = npu-proxy
+
+%:
+	dh $@ --with python3 --buildsystem=pybuild
+
+override_dh_auto_install:
+	dh_auto_install
+	# Install systemd service
+	install -D -m 644 packaging/npu-proxy.service debian/npu-proxy/lib/systemd/system/npu-proxy.service
+	install -D -m 644 packaging/npu-proxy.environment debian/npu-proxy/etc/default/npu-proxy
+
+override_dh_installsystemd:
+	dh_installsystemd --name=npu-proxy

@@ -1,0 +1,27 @@
+Source: npu-proxy
+Section: utils
+Priority: optional
+Maintainer: MrFixit96 <mrfixit96@users.noreply.github.com>
+Build-Depends: debhelper-compat (= 13), python3, python3-pip, python3-venv
+Standards-Version: 4.6.2
+Homepage: https://github.com/MrFixit96/npu-proxy
+Vcs-Browser: https://github.com/MrFixit96/npu-proxy
+Vcs-Git: https://github.com/MrFixit96/npu-proxy.git
+Rules-Requires-Root: no
+
+Package: npu-proxy
+Architecture: amd64
+Depends: ${misc:Depends}, python3 (>= 3.10), python3-pip, python3-venv
+Recommends: intel-npu-driver
+Description: Ollama/OpenAI-compatible Intel NPU inference server
+ NPU Proxy enables Intel NPU hardware acceleration for local LLM inference.
+ It provides Ollama-compatible and OpenAI-compatible REST APIs, allowing
+ Claude Code, Ollama clients, and any OpenAI SDK application to use Intel
+ NPU hardware—including from WSL2 Linux applications.
+ .
+ Features:
+  - Ollama API Compatible (/api/generate, /api/chat, /api/embed)
+  - OpenAI API Compatible (/v1/chat/completions, /v1/embeddings)
+  - Intel NPU Acceleration via OpenVINO GenAI
+  - Real-Time SSE Streaming
+  - Automatic NPU→GPU→CPU fallback

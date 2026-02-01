@@ -1,0 +1,54 @@
+#!/bin/bash
+# Post-installation script for npu-proxy
+
+set -e
+
+case "$1" in
+    configure)
+        # Create npu-proxy user if it doesn't exist
+        if ! getent passwd npu-proxy > /dev/null 2>&1; then
+            adduser --system --group --no-create-home --home /var/lib/npu-proxy npu-proxy
+        fi
+        
+        # Create model cache directory
+        mkdir -p /var/lib/npu-proxy/models
+        chown -R npu-proxy:npu-proxy /var/lib/npu-proxy
+        
+        # Create log directory
+        mkdir -p /var/log/npu-proxy
+        chown -R npu-proxy:npu-proxy /var/log/npu-proxy
+        
+        # Install Python dependencies in virtual environment
+        if [ ! -d /opt/npu-proxy/venv ]; then
+            mkdir -p /opt/npu-proxy
+            python3 -m venv /opt/npu-proxy/venv
+            /opt/npu-proxy/venv/bin/pip install --upgrade pip
+            /opt/npu-proxy/venv/bin/pip install npu-proxy
+        fi
+        
+        # Reload systemd
+        systemctl daemon-reload
+        
+        echo ""
+        echo "NPU Proxy installed successfully!"
+        echo ""
+        echo "To start the service:"
+        echo "  sudo systemctl start npu-proxy"
+        echo ""
+        echo "To enable at boot:"
+        echo "  sudo systemctl enable npu-proxy"
+        echo ""
+        ;;
+    
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+    
+    *)
+        echo "postinst called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

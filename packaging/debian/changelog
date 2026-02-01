@@ -1,0 +1,10 @@
+npu-proxy (0.1.0-1) unstable; urgency=medium
+
+  * Initial release.
+  * Ollama-compatible API proxy for Intel NPU inference
+  * OpenAI-compatible endpoints (/v1/chat/completions, /v1/embeddings)
+  * Context-aware routing (NPU→GPU→CPU)
+  * Real-time SSE streaming
+  * Prometheus metrics endpoint
+
+ -- MrFixit96 <mrfixit96@users.noreply.github.com>  Sat, 01 Feb 2026 17:00:00 -0600

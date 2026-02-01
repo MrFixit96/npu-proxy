@@ -1,0 +1,31 @@
+#!/bin/bash
+# Post-removal script for npu-proxy
+
+set -e
+
+case "$1" in
+    purge)
+        # Remove user and group
+        if getent passwd npu-proxy > /dev/null 2>&1; then
+            deluser --system npu-proxy || true
+        fi
+        
+        # Remove directories
+        rm -rf /var/lib/npu-proxy
+        rm -rf /var/log/npu-proxy
+        rm -rf /opt/npu-proxy
+        rm -rf /etc/default/npu-proxy
+        ;;
+    
+    remove|upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+        ;;
+    
+    *)
+        echo "postrm called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

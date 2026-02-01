@@ -1,0 +1,43 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
+
+PackageIdentifier: MrFixit96.NPUProxy
+PackageVersion: 0.1.0
+PackageLocale: en-US
+Publisher: MrFixit96
+PublisherUrl: https://github.com/MrFixit96
+PublisherSupportUrl: https://github.com/MrFixit96/npu-proxy/issues
+Author: MrFixit96
+PackageName: NPU Proxy
+PackageUrl: https://github.com/MrFixit96/npu-proxy
+License: MIT
+LicenseUrl: https://github.com/MrFixit96/npu-proxy/blob/master/LICENSE
+Copyright: Copyright (c) 2024-2026 NPU Proxy Contributors
+ShortDescription: Ollama/OpenAI-compatible Intel NPU inference server using OpenVINO
+Description: |
+  NPU Proxy enables Intel NPU hardware acceleration for local LLM inference.
+  It provides Ollama-compatible and OpenAI-compatible REST APIs, allowing
+  Claude Code, Ollama clients, and any OpenAI SDK application to use Intel
+  NPU hardware—including from WSL2 Linux applications.
+  
+  Features:
+  - Ollama API Compatible (/api/generate, /api/chat, /api/embed)
+  - OpenAI API Compatible (/v1/chat/completions, /v1/embeddings)
+  - Intel NPU Acceleration via OpenVINO GenAI
+  - Real-Time SSE Streaming
+  - WSL2 Bridge for Linux applications
+  - Automatic NPU→GPU→CPU fallback
+Moniker: npu-proxy
+Tags:
+  - ai
+  - inference
+  - intel
+  - llm
+  - machine-learning
+  - npu
+  - ollama
+  - openai
+  - openvino
+  - proxy
+ReleaseNotesUrl: https://github.com/MrFixit96/npu-proxy/blob/master/CHANGELOG.md
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0

@@ -1,0 +1,30 @@
+#!/bin/bash
+# Pre-removal script for npu-proxy
+
+set -e
+
+case "$1" in
+    remove|upgrade|deconfigure)
+        # Stop service if running
+        if systemctl is-active --quiet npu-proxy; then
+            systemctl stop npu-proxy
+        fi
+        
+        # Disable service
+        if systemctl is-enabled --quiet npu-proxy 2>/dev/null; then
+            systemctl disable npu-proxy
+        fi
+        ;;
+    
+    failed-upgrade)
+        ;;
+    
+    *)
+        echo "prerm called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

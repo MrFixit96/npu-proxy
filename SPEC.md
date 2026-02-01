@@ -155,12 +155,22 @@ NPU (preferred) → GPU (fallback) → CPU (always available)
 
 **Tests**: 300 passing | **Coverage**: ~95%
 
+### Native OS Packaging (Implemented)
+
+| Component | Platform | Status | Files |
+|-----------|----------|--------|-------|
+| systemd service | Linux | ✅ Complete | `packaging/npu-proxy.service` |
+| Install script | Linux | ✅ Complete | `scripts/install_linux.sh` |
+| Uninstall script | Linux | ✅ Complete | `scripts/uninstall_linux.sh` |
+| PyInstaller build | Windows | ✅ Complete | `scripts/build_windows.ps1`, `npu_proxy.pyinstaller.spec` |
+| CLI entry point | All | ✅ Complete | `npu_proxy/cli.py` |
+
 ### Planned Features
 
 | Feature | Priority | Status |
 |---------|----------|--------|
-| WinGet Package | HIGH | 🔲 Planned |
-| Debian/apt Package | HIGH | 🔲 Planned |
+| WinGet Package | HIGH | ✅ Complete |
+| Debian/apt Package | HIGH | ✅ Complete |
 | Vision Model Support (VLMPipeline) | MEDIUM | 🔲 Planned |
 | Multi-Model Concurrent Inference | LOW | 🔲 Research |
 
