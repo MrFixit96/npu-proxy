@@ -362,7 +362,7 @@ NPU Proxy is designed for full Ollama API compatibility. It works with:
 
 **Gracefully ignored:** `mirostat`, `min_p`, `typical_p`, `tfs_z` (not available in OpenVINO)
 
-See [docs/OLLAMA_COMPATIBILITY.md](docs/OLLAMA_COMPATIBILITY.md) for complete details.
+See [docs/api/OLLAMA_API.md](docs/api/OLLAMA_API.md) for complete details.
 
 ---
 
@@ -504,7 +504,7 @@ Download embedding models using:
 python scripts/download_model.py download bge-small
 ```
 
-See [docs/EMBEDDINGS.md](docs/EMBEDDINGS.md) for full documentation.
+See [docs/api/EMBEDDINGS.md](docs/api/EMBEDDINGS.md) for full documentation.
 
 ---
 
@@ -672,7 +672,7 @@ python scripts/benchmark.py compare NPU CPU GPU
 python scripts/benchmark.py run --output results.json
 ```
 
-See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for detailed documentation.
+See [docs/guides/BENCHMARKS.md](docs/guides/BENCHMARKS.md) for detailed documentation.
 
 ---
 
@@ -711,7 +711,18 @@ for chunk in stream:
     print(chunk.choices[0].delta.content or "", end="", flush=True)
 ```
 
-See [docs/STREAMING.md](docs/STREAMING.md) for architecture details and troubleshooting.
+See [docs/api/STREAMING.md](docs/api/STREAMING.md) for architecture details and troubleshooting.
+
+---
+
+## Documentation
+
+- **[SPEC.md](SPEC.md)** - Complete technical specification
+- **[CHANGELOG.md](CHANGELOG.md)** - Version history
+- **[docs/](docs/README.md)** - Full documentation index
+  - [Guides](docs/guides/) - User guides and tutorials
+  - [API Reference](docs/api/) - Endpoint documentation
+  - [Research](docs/research/) - Design decisions and patterns
 
 ---
 
@@ -723,11 +734,9 @@ MIT License - See [LICENSE](LICENSE) for details.
 
 ## Contributing
 
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Write tests for new functionality
-4. Ensure all tests pass (`pytest tests/ -v`)
-5. Submit a Pull Request
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+
+This is a personal project - I check issues and PRs occasionally. Forks are encouraged!
 
 ---
 
