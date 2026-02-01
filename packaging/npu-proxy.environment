@@ -1,0 +1,23 @@
+# NPU Proxy configuration
+# Copy this file to /etc/npu-proxy/environment
+
+# Server binding
+NPU_PROXY_HOST=127.0.0.1
+NPU_PROXY_PORT=8080
+
+# Device selection (AUTO, NPU, GPU, CPU)
+NPU_PROXY_DEVICE=AUTO
+
+# Token limit for context-aware routing
+NPU_PROXY_TOKEN_LIMIT=1800
+
+# Enable real inference (set to 1 to enable)
+NPU_PROXY_REAL_INFERENCE=1
+
+# Embedding model configuration
+NPU_PROXY_EMBEDDING_DEVICE=CPU
+NPU_PROXY_EMBEDDING_MODEL=BAAI/bge-small-en-v1.5
+
+# Timeouts (seconds)
+NPU_PROXY_INFERENCE_TIMEOUT=180
+NPU_PROXY_LOAD_TIMEOUT=300

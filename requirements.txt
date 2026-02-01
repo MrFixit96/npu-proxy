@@ -1,0 +1,19 @@
+# NPU Proxy Dependencies
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+openvino>=2025.0.0
+openvino-genai>=2025.0.0
+orjson>=3.9.0
+sse-starlette>=2.0.0
+pydantic>=2.5.0
+httpx>=0.26.0
+huggingface_hub>=0.20.0
+
+# Model Export (for downloading/converting models)
+optimum-intel[openvino]>=1.15.0
+sentence-transformers>=2.2.0
+
+# Development
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+pytest-cov>=4.1.0

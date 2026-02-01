@@ -1,0 +1,47 @@
+[Unit]
+Description=NPU Proxy - Ollama-compatible API for Intel NPU inference
+Documentation=https://github.com/user/npu-proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=npu-proxy
+Group=npu-proxy
+WorkingDirectory=/var/lib/npu-proxy
+
+# Environment configuration
+Environment=NPU_PROXY_HOST=127.0.0.1
+Environment=NPU_PROXY_PORT=8080
+Environment=NPU_PROXY_DEVICE=AUTO
+Environment=NPU_PROXY_TOKEN_LIMIT=1800
+Environment=NPU_PROXY_REAL_INFERENCE=1
+
+# Load environment from file if present
+EnvironmentFile=-/etc/npu-proxy/environment
+
+# Start the service
+ExecStart=/usr/bin/npu-proxy --host $NPU_PROXY_HOST --port $NPU_PROXY_PORT
+
+# Restart policy
+Restart=on-failure
+RestartSec=5
+StartLimitBurst=3
+StartLimitInterval=60
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=false
+# Allow access to Intel NPU device
+DeviceAllow=/dev/accel* rw
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=npu-proxy
+
+[Install]
+WantedBy=multi-user.target
