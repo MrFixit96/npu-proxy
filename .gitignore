@@ -49,7 +49,7 @@ Thumbs.db
 
 # Models cache (large files)
 .cache/
-models/
+/models/
 
 # Logs
 *.log
