@@ -46,6 +46,8 @@ Example:
     True
 """
 from fastapi import FastAPI
+
+from npu_proxy import __version__
 from npu_proxy.api import health, models, chat, embeddings, ollama, metrics
 
 # Create the main FastAPI application instance.
@@ -53,7 +55,7 @@ from npu_proxy.api import health, models, chat, embeddings, ollama, metrics
 app = FastAPI(
     title="NPU Proxy",
     description="Ollama-compatible API proxy for Intel NPU inference via OpenVINO",
-    version="0.1.0",
+    version=__version__,
 )
 
 # Register API routers in dependency order.

@@ -47,6 +47,7 @@ from starlette.responses import Response
 from pydantic import BaseModel, Field
 from typing import Optional
 
+from npu_proxy import OLLAMA_VERSION
 from npu_proxy.routing.context_router import get_context_router, RoutingResult
 from npu_proxy.metrics import record_routing_decision
 
@@ -376,9 +377,9 @@ async def get_version():
     Example:
         >>> response = client.get("/api/version")
         >>> print(response.json()["version"])
-        0.1.0-npu-proxy
+        0.2.0-npu-proxy
     """
-    return VersionResponse(version="0.1.0-npu-proxy")
+    return VersionResponse(version=OLLAMA_VERSION)
 
 
 @router.post("/show", response_model=ShowResponse)

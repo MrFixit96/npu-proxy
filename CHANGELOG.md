@@ -5,6 +5,17 @@ All notable changes to NPU Proxy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - Unreleased
+
+### Changed
+
+- Centralized runtime version reporting across the CLI, FastAPI app, health endpoint, and Ollama compatibility surface.
+- Upgraded the project dependency floor to the current FastAPI, OpenVINO, Hugging Face Hub, Optimum Intel, and test-tooling lines.
+- Updated Hugging Face Hub integration to the latest compatible pre-1.0 Hub line and switched documentation from `huggingface-cli` to `hf`.
+- Refreshed the documented Windows, WSL 2, and Intel NPU support baseline for modern OpenVINO releases.
+
+---
+
 ## [0.1.0] - 2026-02-01
 
 ### Added
@@ -49,12 +60,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - 300+ unit tests
 - Native OS packaging (systemd, Windows scripts)
 
----
-
-## [Unreleased]
-
-### Planned
-
-- WinGet package for Windows
-- Debian/apt package for Linux
-- Vision model support (VLMPipeline)

@@ -1,6 +1,7 @@
 """Tests for health endpoint - TDD Phase 1.1"""
 import pytest
 from httpx import AsyncClient, ASGITransport
+from npu_proxy import __version__
 from npu_proxy.main import app
 
 
@@ -33,3 +34,13 @@ async def test_health_includes_npu_status():
     data = response.json()
     assert "npu_available" in data
     assert isinstance(data["npu_available"], bool)
+
+
+@pytest.mark.asyncio
+async def test_health_reports_package_version():
+    """GET /health should report the shared package version."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/health")
+    data = response.json()
+    assert data["version"] == __version__

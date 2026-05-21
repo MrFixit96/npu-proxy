@@ -40,6 +40,8 @@ import logging
 import os
 import sys
 
+from npu_proxy import __version__
+
 # Configure logging before imports to catch early errors
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -51,23 +53,17 @@ logger = logging.getLogger("npu-proxy")
 def get_version() -> str:
     """Get the installed package version.
 
-    Retrieves the version from package metadata using importlib.metadata.
-    Falls back to a hardcoded version if metadata is unavailable (e.g.,
-    when running from source without installation).
+    Returns the shared package version used across the CLI, API, and docs.
 
     Returns:
-        str: The semantic version string (e.g., "0.1.0").
+        str: The semantic version string (e.g., "0.2.0").
 
     Example:
         >>> version = get_version()
         >>> print(f"Running NPU Proxy v{version}")
-        Running NPU Proxy v0.1.0
+        Running NPU Proxy v0.2.0
     """
-    try:
-        from importlib.metadata import version
-        return version("npu-proxy")
-    except Exception:
-        return "0.1.0"
+    return __version__
 
 
 def parse_args(args: list[str] | None = None) -> argparse.Namespace:

@@ -38,8 +38,12 @@ import hashlib
 from pathlib import Path
 from typing import Callable, Generator
 
-from huggingface_hub import snapshot_download, hf_hub_download, HfApi
-from huggingface_hub.utils import HfHubHTTPError
+from huggingface_hub import HfApi, hf_hub_download, snapshot_download
+
+try:
+    from huggingface_hub import HfHubHTTPError
+except ImportError:
+    from huggingface_hub.utils import HfHubHTTPError
 
 from npu_proxy.models.mapper import resolve_model_repo
 
@@ -99,7 +103,7 @@ def download_model(
     Cache Behavior:
         - Creates model_dir if it doesn't exist
         - Downloads to model_dir/{local_name}/
-        - Uses huggingface_hub caching with symlinks disabled
+        - Uses Hugging Face Hub local-dir downloads
         - Re-downloads if openvino_model.xml is missing
 
     Example:
@@ -130,11 +134,10 @@ def download_model(
         # Ensure model directory exists
         model_dir.mkdir(parents=True, exist_ok=True)
 
-        # Download model snapshot from HuggingFace
+        # Download model snapshot from Hugging Face Hub.
         path = snapshot_download(
             repo_id=repo_id,
             local_dir=local_dir,
-            local_dir_use_symlinks=False,
         )
 
         # Verify openvino_model.xml exists
@@ -236,11 +239,13 @@ def get_download_progress(
 
     try:
         api = HfApi()
+        siblings = []
 
         # Get repo info to list files
         try:
             repo_info = api.repo_info(repo_id=repo_id, repo_type="model")
-            files = [f.rfilename for f in repo_info.siblings] if repo_info.siblings else []
+            siblings = repo_info.siblings or []
+            files = [f.rfilename for f in siblings]
         except Exception:
             files = REQUIRED_FILES
 
@@ -248,8 +253,8 @@ def get_download_progress(
         completed_size = 0
 
         # Calculate total size from repo info
-        if repo_info.siblings:
-            total_size = sum(f.size or 0 for f in repo_info.siblings)
+        if siblings:
+            total_size = sum(f.size or 0 for f in siblings)
 
         for filename in files:
             # Generate a digest-like identifier
@@ -257,11 +262,10 @@ def get_download_progress(
 
             # Get file size if available
             file_size = 0
-            if repo_info.siblings:
-                for f in repo_info.siblings:
-                    if f.rfilename == filename:
-                        file_size = f.size or 0
-                        break
+            for f in siblings:
+                if f.rfilename == filename:
+                    file_size = f.size or 0
+                    break
 
             yield {
                 "status": f"pulling {filename}",
@@ -276,7 +280,6 @@ def get_download_progress(
                     repo_id=repo_id,
                     filename=filename,
                     local_dir=local_dir,
-                    local_dir_use_symlinks=False,
                 )
 
                 completed_size += file_size

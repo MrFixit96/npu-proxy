@@ -137,3 +137,27 @@ class TestGetDownloadProgress:
 
         status_values = [s.get("status") for s in statuses]
         assert "success" in status_values
+
+    @patch("npu_proxy.models.downloader.HfApi")
+    @patch("npu_proxy.models.downloader.hf_hub_download")
+    def test_download_progress_falls_back_when_repo_info_fails(
+        self, mock_download, mock_api_class, tmp_path: Path
+    ):
+        """Generator should still complete when repo metadata lookup fails."""
+        mock_api = MagicMock()
+        mock_api_class.return_value = mock_api
+        mock_api.repo_info.side_effect = RuntimeError("metadata lookup failed")
+
+        def create_required_files(*args, **kwargs):
+            filename = kwargs["filename"]
+            target = tmp_path / filename
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.touch()
+            return str(target)
+
+        mock_download.side_effect = create_required_files
+
+        statuses = list(get_download_progress("test-repo/model", tmp_path))
+
+        assert statuses[0]["status"] == "pulling manifest"
+        assert statuses[-1]["status"] == "success"

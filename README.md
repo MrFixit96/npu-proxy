@@ -40,10 +40,10 @@ Enables Claude Code, Ollama clients, and any OpenAI-compatible application to us
 
 | Requirement | Version | Notes |
 |-------------|---------|-------|
-| Python | 3.10+ | 3.12 recommended |
-| Windows | 11 23H2+ | With latest NPU drivers |
-| Intel NPU | Meteor Lake, Lunar Lake, or Arrow Lake | Core Ultra series |
-| OpenVINO | 2025.0+ | With NPU plugin |
+| Python | 3.10+ | 3.12+ recommended |
+| Windows | 11 24H2+ | Keep current Intel NPU drivers installed |
+| Intel NPU | Core Ultra Series 1/2/3 and newer Intel NPU hosts validated by OpenVINO | Intel-only path (for example Meteor Lake, Lunar Lake / 200V, Arrow Lake, newer Series 3) |
+| OpenVINO | 2026.1+ | Match the OpenVINO and OpenVINO GenAI package line |
 
 ### Installation
 
@@ -64,7 +64,7 @@ python -c "import openvino as ov; print('NPU available:', 'NPU' in ov.Core().ava
 ```powershell
 # TinyLlama 1.1B INT4 (recommended for NPU - ~640MB)
 pip install huggingface-hub
-huggingface-cli download OpenVINO/TinyLlama-1.1B-Chat-v1.0-int4-ov --local-dir ~/.cache/npu-proxy/models/tinyllama-1.1b-chat-int4-ov
+hf download OpenVINO/TinyLlama-1.1B-Chat-v1.0-int4-ov --local-dir ~/.cache/npu-proxy/models/tinyllama-1.1b-chat-int4-ov
 ```
 
 ### Start the Server
@@ -114,6 +114,10 @@ ollama ps
 ### WSL2 / Linux
 
 ```bash
+# Install or refresh WSL 2 on the Windows host if needed:
+#   wsl --install
+#   wsl --update
+#
 # Get Windows host IP (WSL2 gateway)
 WINDOWS_HOST=$(ip route show | grep default | awk '{print $3}')
 export OLLAMA_HOST="http://${WINDOWS_HOST}:11435"
@@ -588,7 +592,7 @@ python -c "import openvino as ov; print(ov.Core().available_devices)"
 
 # If NPU not listed:
 # 1. Update Intel NPU drivers from Intel Download Center
-# 2. Ensure Windows 11 23H2 or later
+# 2. Ensure Windows 11 24H2 or later
 # 3. Check Device Manager for "Intel AI Boost" or "NPU"
 ```
 

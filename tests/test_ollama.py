@@ -1,6 +1,7 @@
 """Tests for Ollama-compatible endpoints - TDD Phase 1.7-2.0"""
 import pytest
 from httpx import AsyncClient, ASGITransport
+from npu_proxy import OLLAMA_VERSION
 from npu_proxy.main import app
 
 
@@ -42,6 +43,16 @@ async def test_version_returns_version_field():
     data = response.json()
     assert "version" in data
     assert "npu-proxy" in data["version"]
+
+
+@pytest.mark.asyncio
+async def test_version_matches_shared_runtime_version():
+    """GET /api/version should use the shared runtime version."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/api/version")
+    data = response.json()
+    assert data["version"] == OLLAMA_VERSION
 
 
 @pytest.mark.asyncio

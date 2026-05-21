@@ -36,7 +36,7 @@ The .deb file will be created in `dist/`.
 ## Installing the Package
 
 ```bash
-sudo dpkg -i dist/npu-proxy_0.1.0-1_amd64.deb
+sudo dpkg -i dist/npu-proxy_0.2.0-1_amd64.deb
 
 # Install dependencies if needed
 sudo apt-get install -f

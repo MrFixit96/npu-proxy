@@ -1,3 +1,11 @@
+npu-proxy (0.2.0-1) unstable; urgency=medium
+
+  * Start 0.2.0 development line.
+  * Update dependency baselines to the current FastAPI, OpenVINO, and Hugging Face package lines.
+  * Refresh Windows 11 / WSL 2 / Intel NPU support guidance.
+
+ -- MrFixit96 <mrfixit96@users.noreply.github.com>  Wed, 20 May 2026 21:55:00 -0500
+
 npu-proxy (0.1.0-1) unstable; urgency=medium
 
   * Initial release.

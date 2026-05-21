@@ -28,6 +28,7 @@ Load Balancer Health Checks:
 from fastapi import APIRouter
 import openvino as ov
 
+from npu_proxy import __version__
 from npu_proxy.inference.engine import is_model_loaded, get_loaded_models
 from npu_proxy.inference.embedding_engine import get_embedding_engine
 
@@ -113,7 +114,7 @@ async def health() -> dict:
         engines (dict): Status of inference engines:
             - ``llm``: LLM engine status object
             - ``embedding``: Embedding engine status object
-        version (str): API version string (e.g., ``'0.1.0'``)
+        version (str): API version string (e.g., ``'0.2.0'``)
         npu_available (bool): Whether Intel NPU device is detected
         gpu_available (bool): Whether Intel GPU device is detected
         cpu_available (bool): Whether CPU is available (always True)
@@ -155,12 +156,12 @@ async def health() -> dict:
                         "model": "all-MiniLM-L6-v2"
                     }
                 },
-                "version": "0.1.0",
+                "version": "0.2.0",
                 "npu_available": true,
                 "gpu_available": true,
                 "cpu_available": true,
                 "devices": ["CPU", "GPU", "NPU"],
-                "openvino_version": "2024.0.0"
+                "openvino_version": "2026.1.0"
             }
     """
     core = get_ov_core()
@@ -210,7 +211,7 @@ async def health() -> dict:
                 "model": embedding_model,
             },
         },
-        "version": "0.1.0",
+        "version": __version__,
         # Maintain backward compatibility
         "npu_available": "NPU" in devices,
         "gpu_available": "GPU" in devices,

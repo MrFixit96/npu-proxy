@@ -8,11 +8,11 @@ Enable **Ollama-compatible** and **OpenAI-compatible** local LLM inference using
 
 ## 2. Environment Context
 
-- **OS:** Windows 11 (23H2+) with NPU drivers, Linux (native NPU driver support)
-- **CPU:** Intel Core Ultra (Meteor Lake, Lunar Lake, Arrow Lake) with integrated NPU
+- **OS:** Windows 11 (24H2+) with current Intel NPU drivers, Linux clients over WSL 2 / native host support
+- **CPU:** Intel Core Ultra Series 1/2/3 and newer Intel NPU hosts validated by OpenVINO
 - **NPU:** Intel AI Boost (verified working)
 - **GPU:** Intel Arc Graphics (optional, used as fallback)
-- **Runtime:** Python 3.12+, OpenVINO GenAI 2025.x
+- **Runtime:** Python 3.12+, OpenVINO GenAI 2026.1.x
 - **Framework:** FastAPI + Uvicorn (async HTTP server)
 
 ## 3. Problem Statement
