@@ -1,8 +1,8 @@
 # yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
 
 PackageIdentifier: MrFixit96.NPUProxy
-PackageVersion: 0.1.0
-MinimumOSVersion: 10.0.22000.0
+PackageVersion: 0.2.0
+MinimumOSVersion: 10.0.26100.0
 Platform:
   - Windows.Desktop
 InstallModes:
@@ -12,12 +12,12 @@ InstallModes:
 UpgradeBehavior: install
 Commands:
   - npu-proxy
-ReleaseDate: 2026-02-01
+ReleaseDate: 2026-05-21
 Installers:
   - Architecture: x64
     InstallerType: exe
-    InstallerUrl: https://github.com/MrFixit96/npu-proxy/releases/download/v0.1.0/npu-proxy-0.1.0-win64.exe
-    InstallerSha256: # TODO: Add SHA256 after building release
+    InstallerUrl: https://github.com/MrFixit96/npu-proxy/releases/download/v0.2.0/npu-proxy-0.2.0-win64.exe
+    InstallerSha256: 7BC424262B614852CD9550F2C4A3D508E1B0AB33438FD2D1F6A1BEC78CA48036
     InstallerSwitches:
       Silent: /S
       SilentWithProgress: /S

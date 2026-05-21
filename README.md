@@ -93,6 +93,39 @@ Invoke-RestMethod http://localhost:11435/health
 # devices       : {CPU, GPU.0, GPU.1, NPU}
 ```
 
+### Certify Real NPU Inference
+
+Use the hardware certification script to prove the live proxy is serving a real request on the Intel NPU with **no fallback**:
+
+```powershell
+python .\scripts\certify_npu.py --output .\artifacts\npu-certification.json
+```
+
+The certification run:
+
+1. Starts NPU Proxy through the real CLI entrypoint with `--device NPU --real-inference`
+2. Sends a real `/api/generate` request against the live server
+3. Verifies `OpenVINO` sees the NPU
+4. Verifies `/health` reports the LLM engine as loaded on `NPU`
+5. Verifies `/health/devices` reports `active_device == NPU` and `used_fallback == false`
+
+It exits `0` only when the software completes a real hardware-backed inference on the NPU. The JSON report captures the OpenVINO version, visible devices, active device, fallback status, and timing.
+
+This certification targets the **real LLM serving path** used by NPU Proxy. It does not certify the embedding fallback path, because model support can differ by workload even on the same hardware.
+
+Example successful run on the current Intel NPU host:
+
+```text
+Certified: YES
+Requested device: NPU
+Active device: NPU
+Fallback used: False
+LLM status: loaded
+NPU visible: True
+NPU name: Intel(R) AI Boost
+Model: tinyllama-1.1b-chat-int4-ov
+```
+
 ---
 
 ## Using with Ollama CLI

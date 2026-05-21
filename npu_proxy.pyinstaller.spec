@@ -2,7 +2,7 @@
 """
 PyInstaller spec file for NPU Proxy.
 
-Build with: pyinstaller npu_proxy.spec
+Build with: pyinstaller npu_proxy.pyinstaller.spec
 
 This creates a standalone executable that includes:
 - OpenVINO runtime
@@ -12,6 +12,7 @@ This creates a standalone executable that includes:
 
 import sys
 from pathlib import Path
+from PyInstaller.utils.hooks import collect_submodules, collect_data_files
 
 # Get the project root
 PROJ_ROOT = Path(SPECPATH)
@@ -19,14 +20,27 @@ PROJ_ROOT = Path(SPECPATH)
 # Analysis configuration
 block_cipher = None
 
+try:
+    openvino_hiddenimports = collect_submodules('openvino') + collect_submodules('openvino_genai')
+except Exception as e:
+    print(f"Warning: Could not collect OpenVINO submodules: {e}")
+    openvino_hiddenimports = []
+
+try:
+    openvino_datas = (
+        collect_data_files('openvino', include_py_files=False)
+        + collect_data_files('openvino_genai', include_py_files=False)
+    )
+except Exception as e:
+    print(f"Warning: Could not collect OpenVINO data files: {e}")
+    openvino_datas = []
+
 # Collect all npu_proxy package files
 a = Analysis(
     ['npu_proxy/cli.py'],
     pathex=[str(PROJ_ROOT)],
     binaries=[],
-    datas=[
-        # Include any data files (e.g., default configs)
-    ],
+    datas=openvino_datas,
     hiddenimports=[
         # FastAPI and dependencies
         'fastapi',
@@ -55,14 +69,11 @@ a = Analysis(
         
         # OpenVINO - critical for NPU support
         'openvino',
-        'openvino.runtime',
         'openvino_genai',
-        
-        # Prometheus metrics (optional)
-        'prometheus_client',
-        
+
         # NPU Proxy modules
         'npu_proxy',
+        'npu_proxy.hardware_certification',
         'npu_proxy.main',
         'npu_proxy.api',
         'npu_proxy.api.chat',
@@ -83,7 +94,7 @@ a = Analysis(
         'npu_proxy.routing',
         'npu_proxy.routing.context_router',
         'npu_proxy.metrics',
-    ],
+    ] + openvino_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -106,29 +117,12 @@ a = Analysis(
     noarchive=False,
 )
 
-# Collect OpenVINO submodules
-from PyInstaller.utils.hooks import collect_submodules, collect_data_files
-
-try:
-    a.hiddenimports += collect_submodules('openvino')
-    a.hiddenimports += collect_submodules('openvino_genai')
-except Exception as e:
-    print(f"Warning: Could not collect OpenVINO submodules: {e}")
-
-# Collect OpenVINO data files (runtime libraries)
-try:
-    a.datas += collect_data_files('openvino', include_py_files=False)
-    a.datas += collect_data_files('openvino_genai', include_py_files=False)
-except Exception as e:
-    print(f"Warning: Could not collect OpenVINO data files: {e}")
-
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
 exe = EXE(
     pyz,
     a.scripts,
     a.binaries,
-    a.zipfiles,
     a.datas,
     [],
     name='npu-proxy',

@@ -36,7 +36,7 @@ try {
     
     # Run PyInstaller
     Write-Host "Running PyInstaller..." -ForegroundColor Cyan
-    pyinstaller npu_proxy.spec --noconfirm
+    pyinstaller npu_proxy.pyinstaller.spec --noconfirm
     
     if (Test-Path "dist/npu-proxy.exe") {
         $size = (Get-Item "dist/npu-proxy.exe").Length / 1MB

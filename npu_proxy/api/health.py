@@ -175,10 +175,10 @@ async def health() -> dict:
         try:
             loaded = get_loaded_models()
             for name, engine in loaded.items():
-                info = engine.get_engine_info()
+                info = engine.get_device_info()
                 llm_status = "loaded"
-                llm_device = info.get("device", "unknown")
-                llm_model = info.get("model_name", name)
+                llm_device = info.get("actual_device", "unknown")
+                llm_model = getattr(engine, "model_name", name)
                 break
         except Exception:
             llm_status = "error"
