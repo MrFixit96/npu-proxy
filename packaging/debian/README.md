@@ -19,12 +19,12 @@ This directory contains the Debian packaging files for npu-proxy.
 Install build dependencies:
 
 ```bash
-sudo apt-get install build-essential debhelper devscripts python3-all dh-python
+sudo apt-get install build-essential debhelper devscripts python3-all dh-python python3-build
 ```
 
 ## Building the Package
 
-From the repository root:
+From a native Linux filesystem such as your WSL home directory (not `/mnt/c/...`), run:
 
 ```bash
 chmod +x packaging/debian/build.sh
@@ -33,10 +33,15 @@ chmod +x packaging/debian/build.sh
 
 The .deb file will be created in `dist/`.
 
+The package bundles the `npu-proxy` application wheel plus a Debian-specific
+constraints file, then installs the validated Python dependency set into
+`/opt/npu-proxy/venv` during `dpkg -i`. First-time installation still requires
+network access to download those pinned dependencies.
+
 ## Installing the Package
 
 ```bash
-sudo dpkg -i dist/npu-proxy_0.2.0-1_amd64.deb
+sudo dpkg -i dist/npu-proxy_0.2.0-2_amd64.deb
 
 # Install dependencies if needed
 sudo apt-get install -f
@@ -87,6 +92,8 @@ After installation:
 
 ```
 /opt/npu-proxy/venv/     # Python virtual environment
+/usr/share/npu-proxy/wheels/  # Bundled application wheel installed into the service venv
+/usr/share/npu-proxy/constraints.txt  # Pinned runtime dependency set used at install time
 /var/lib/npu-proxy/      # Model cache and data
 /var/log/npu-proxy/      # Log files
 /etc/default/npu-proxy   # Configuration

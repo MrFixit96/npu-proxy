@@ -18,10 +18,17 @@ echo "Build directory: $BUILD_DIR"
 
 # Copy source
 mkdir -p "$PACKAGE_DIR"
-cp -r "$REPO_ROOT"/* "$PACKAGE_DIR/"
+tar \
+    --exclude='.git' \
+    --exclude='dist' \
+    --exclude='build' \
+    --exclude='.pytest_cache' \
+    --exclude='__pycache__' \
+    -C "$REPO_ROOT" -cf - . | tar -C "$PACKAGE_DIR" -xf -
 
 # Copy debian directory to source root (required by dpkg-buildpackage)
 cp -r "$REPO_ROOT/packaging/debian" "$PACKAGE_DIR/"
+chmod 755 "$PACKAGE_DIR/debian/rules" "$PACKAGE_DIR/debian/postinst" "$PACKAGE_DIR/debian/prerm" "$PACKAGE_DIR/debian/postrm"
 
 # Build package
 cd "$PACKAGE_DIR"

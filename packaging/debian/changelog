@@ -1,3 +1,12 @@
+npu-proxy (0.2.0-2) unstable; urgency=medium
+
+  * Bundle the packaged npu-proxy wheel plus Debian install constraints so the
+    service seeds the exact app version and validated dependency set.
+  * Align the systemd unit with /etc/default/npu-proxy and the packaged
+    virtualenv entrypoint.
+
+ -- MrFixit96 <mrfixit96@users.noreply.github.com>  Thu, 21 May 2026 12:17:00 -0500
+
 npu-proxy (0.2.0-1) unstable; urgency=medium
 
   * Start 0.2.0 development line.
@@ -15,4 +24,4 @@ npu-proxy (0.1.0-1) unstable; urgency=medium
   * Real-time SSE streaming
   * Prometheus metrics endpoint
 
- -- MrFixit96 <mrfixit96@users.noreply.github.com>  Sat, 01 Feb 2026 17:00:00 -0600
+ -- MrFixit96 <mrfixit96@users.noreply.github.com>  Sun, 01 Feb 2026 17:00:00 -0600

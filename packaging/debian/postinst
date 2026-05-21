@@ -5,6 +5,11 @@ set -e
 
 case "$1" in
     configure)
+        PACKAGE_VERSION="$(dpkg-query -W -f='${Version}' npu-proxy 2>/dev/null | sed 's/-[^-]*$//')"
+        WHEELHOUSE="/usr/share/npu-proxy/wheels"
+        CONSTRAINTS_FILE="/usr/share/npu-proxy/constraints.txt"
+        APP_WHEEL="$(find "$WHEELHOUSE" -maxdepth 1 -name "npu_proxy-${PACKAGE_VERSION}-*.whl" | head -n 1)"
+
         # Create npu-proxy user if it doesn't exist
         if ! getent passwd npu-proxy > /dev/null 2>&1; then
             adduser --system --group --no-create-home --home /var/lib/npu-proxy npu-proxy
@@ -18,13 +23,15 @@ case "$1" in
         mkdir -p /var/log/npu-proxy
         chown -R npu-proxy:npu-proxy /var/log/npu-proxy
         
-        # Install Python dependencies in virtual environment
-        if [ ! -d /opt/npu-proxy/venv ]; then
-            mkdir -p /opt/npu-proxy
-            python3 -m venv /opt/npu-proxy/venv
-            /opt/npu-proxy/venv/bin/pip install --upgrade pip
-            /opt/npu-proxy/venv/bin/pip install npu-proxy
+        # Install the packaged runtime into a dedicated virtual environment
+        mkdir -p /opt/npu-proxy
+        python3 -m venv /opt/npu-proxy/venv
+        /opt/npu-proxy/venv/bin/python -m ensurepip --upgrade
+        if [ -z "$APP_WHEEL" ]; then
+            echo "Unable to find the packaged npu-proxy wheel for version $PACKAGE_VERSION" >&2
+            exit 1
         fi
+        /opt/npu-proxy/venv/bin/python -m pip install --constraint "$CONSTRAINTS_FILE" --force-reinstall --upgrade "$APP_WHEEL"
         
         # Reload systemd
         systemctl daemon-reload

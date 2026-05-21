@@ -14,7 +14,6 @@ case "$1" in
         rm -rf /var/lib/npu-proxy
         rm -rf /var/log/npu-proxy
         rm -rf /opt/npu-proxy
-        rm -rf /etc/default/npu-proxy
         ;;
     
     remove|upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
