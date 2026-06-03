@@ -1,105 +1,70 @@
-"""Model search utilities for finding OpenVINO-compatible models.
+"""Model search utilities for finding OpenVINO-compatible models."""
 
-This module provides functionality to search, filter, and retrieve metadata
-for OpenVINO-optimized models from the HuggingFace Hub. It supports searching
-by model name, filtering by quantization type and model family, and sorting
-by popularity or recency.
+from __future__ import annotations
 
-The module integrates with the HuggingFace Hub API via the `huggingface_hub`
-package. Results are cached using LRU caching for improved performance on
-repeated queries.
-
-External API Integration:
-    - HuggingFace Hub API: https://huggingface.co/docs/huggingface_hub
-    - Uses `huggingface_hub.list_models()` for search queries
-    - Uses `huggingface_hub.HfApi.model_info()` for detailed model metadata
-    - Filters by the 'openvino' tag to find compatible models
-
-Supported Model Types:
-    - LLM: Language models (Llama, Phi, Qwen, Mistral, etc.)
-    - Embedding: Text embedding models (BGE, E5, MiniLM, etc.)
-    - Vision: Vision models (ViT, CLIP, LLaVA, etc.)
-
-Quantization Formats:
-    - INT4: 4-bit integer quantization (best for NPU)
-    - INT8: 8-bit integer quantization
-    - FP16: Half-precision floating point
-    - FP32: Full-precision floating point
-    - BF16: Brain floating point 16
-
-Example:
-    >>> from npu_proxy.models.search import search_openvino_models
-    >>> models, count = search_openvino_models("llama", limit=5)
-    >>> models[0].id
-    'OpenVINO/Llama-2-7B-chat-int4-ov'
-    >>> models[0].quantization
-    'INT4'
-
-    >>> from npu_proxy.models.search import get_model_details
-    >>> model = get_model_details("OpenVINO/phi-2-int4-ov")
-    >>> model.parameters
-    '2B'
-
-Note:
-    The `huggingface_hub` package is optional. If not installed, all search
-    functions will return empty results and `HF_AVAILABLE` will be False.
-"""
-
-import re
+import logging
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Optional
+from typing import Callable, Optional, TypeVar
+
+from npu_proxy.models.metadata import (
+    MODEL_TYPE_KEYWORDS,
+    detect_architecture,
+    detect_format,
+    detect_model_metadata,
+    detect_model_type,
+    detect_quantization,
+    detect_parameters,
+)
+
+logger = logging.getLogger(__name__)
+HF_TIMEOUT_SECONDS = 10.0
+MAX_QUERY_LENGTH = 200
+MAX_SEARCH_LIMIT = 100
+T = TypeVar("T")
 
 try:
     from huggingface_hub import HfApi, list_models
-    from huggingface_hub.utils import HfHubHTTPError
+    from huggingface_hub.utils import HFValidationError, HfHubHTTPError, RepositoryNotFoundError
+
+    try:
+        from requests import RequestException
+    except ImportError:  # pragma: no cover - requests is a HF dependency in normal installs
+        RequestException = OSError  # type: ignore[assignment]
+
     HF_AVAILABLE = True
 except ImportError:
     HF_AVAILABLE = False
 
+    class HfHubHTTPError(Exception):
+        pass
 
-# Architecture patterns for extraction
-ARCHITECTURE_PATTERNS = {
-    r'\bllama\b': 'LLaMA',
-    r'\bphi\b': 'Phi',
-    r'\bqwen\b': 'Qwen',
-    r'\bmistral\b': 'Mistral',
-    r'\bgemma\b': 'Gemma',
-    r'\bfalcon\b': 'Falcon',
-    r'\bmpt\b': 'MPT',
-    r'\bopt\b': 'OPT',
-    r'\bgpt-?neo': 'GPT-Neo',
-    r'\bgpt-?j\b': 'GPT-J',
-    r'\bbloom\b': 'BLOOM',
-    r'\bstarcoder\b': 'StarCoder',
-    r'\bcodellama\b': 'CodeLLaMA',
-    r'\btinyllama\b': 'TinyLLaMA',
-    r'\bvicuna\b': 'Vicuna',
-    r'\balpaca\b': 'Alpaca',
-    r'\bzephyr\b': 'Zephyr',
-    r'\borca\b': 'Orca',
-    r'\bneuralchat\b': 'NeuralChat',
-    r'\bdolly\b': 'Dolly',
-    r'\bred.?pajama\b': 'RedPajama',
-    r'\byi\b': 'Yi',
-    r'\bdeepseek\b': 'DeepSeek',
-    r'\bchat.?glm\b': 'ChatGLM',
-    r'\bbaichuan\b': 'Baichuan',
-    r'\binternlm\b': 'InternLM',
-}
+    class HFValidationError(ValueError):
+        pass
 
-# Model type keywords for filtering
-MODEL_TYPE_KEYWORDS = {
-    'llm': ['llama', 'phi', 'qwen', 'mistral', 'gemma', 'falcon', 'gpt', 'chat', 
-            'instruct', 'coder', 'bloom', 'opt', 'mpt', 'yi', 'deepseek', 'zephyr'],
-    'embedding': ['embedding', 'bge', 'e5', 'gte', 'sentence', 'bert', 'minilm'],
-    'vision': ['vision', 'vit', 'clip', 'image', 'llava', 'blip', 'sam'],
-}
+    class RepositoryNotFoundError(HfHubHTTPError):
+        pass
+
+    class RequestException(OSError):
+        pass
+
+
+_EXPECTED_HF_ERRORS = (
+    HfHubHTTPError,
+    HFValidationError,
+    RepositoryNotFoundError,
+    RequestException,
+    OSError,
+    TimeoutError,
+    FutureTimeoutError,
+)
 
 
 @dataclass
 class SearchResult:
     """Represents a search result for an OpenVINO model."""
+
     id: str
     name: str
     author: str
@@ -111,205 +76,96 @@ class SearchResult:
     architecture: str
 
 
+def _run_with_timeout(func: Callable[[], T]) -> T:
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(func)
+    try:
+        return future.result(timeout=HF_TIMEOUT_SECONDS)
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
 def extract_quantization(text: str) -> str:
-    """Extract quantization type from a model name or ID string.
-
-    Parses the model name to identify the quantization format used.
-    Supports common notations like 'int4', 'INT8', 'fp16', 'F32', etc.
-
-    Args:
-        text: Model name or ID string to parse (e.g., "llama-2-7b-int4-ov").
-
-    Returns:
-        Uppercase quantization string (e.g., "INT4", "FP16") or empty string
-        if no quantization format is detected.
-
-    Example:
-        >>> extract_quantization("OpenVINO/phi-2-int4-ov")
-        'INT4'
-        >>> extract_quantization("model-fp16")
-        'FP16'
-        >>> extract_quantization("some-model")
-        ''
-    """
-    text_lower = text.lower()
-    
-    # Check for INT4 variants
-    if re.search(r'\bint4\b', text_lower) or re.search(r'\bi4\b', text_lower):
-        return 'INT4'
-    
-    # Check for INT8 variants
-    if re.search(r'\bint8\b', text_lower) or re.search(r'\bi8\b', text_lower):
-        return 'INT8'
-    
-    # Check for FP16 variants
-    if re.search(r'\bfp16\b', text_lower) or re.search(r'\bf16\b', text_lower):
-        return 'FP16'
-    
-    # Check for FP32 variants
-    if re.search(r'\bfp32\b', text_lower) or re.search(r'\bf32\b', text_lower):
-        return 'FP32'
-    
-    # Check for BF16 variants
-    if re.search(r'\bbf16\b', text_lower):
-        return 'BF16'
-    
-    return ''
+    """Extract quantization type from a model name or ID string."""
+    return detect_quantization(text)
 
 
 def extract_parameters(text: str) -> str:
-    """Extract parameter count from a model name or ID string.
-
-    Parses the model name to identify the parameter count. Supports
-    patterns like '7B', '1.1B', '350M', '125M', etc.
-
-    Args:
-        text: Model name or ID string to parse (e.g., "llama-2-7b-chat").
-
-    Returns:
-        Parameter count string with unit (e.g., "7B", "350M") or empty
-        string if no parameter count is detected.
-
-    Example:
-        >>> extract_parameters("OpenVINO/Llama-2-7B-chat-int4-ov")
-        '7B'
-        >>> extract_parameters("TinyLlama-1.1B-Chat")
-        '1.1B'
-        >>> extract_parameters("all-MiniLM-L6-v2")
-        ''
-    """
-    # Match patterns like: 7B, 7b, 1.1B, 0.5B, 70B, 1B, 2B, 13B, etc.
-    match = re.search(r'(\d+\.?\d*)\s*[Bb]\b', text)
-    if match:
-        param_num = match.group(1)
-        return f'{param_num}B'
-    
-    # Match patterns like: 350M, 125M, etc.
-    match = re.search(r'(\d+)\s*[Mm]\b', text)
-    if match:
-        return f'{match.group(1)}M'
-    
-    return ''
+    """Extract parameter count from a model name or ID string."""
+    return detect_parameters(text)
 
 
 def extract_architecture(text: str) -> str:
-    """Extract model architecture family from a model name or ID string.
-
-    Parses the model name to identify the base architecture. Uses pattern
-    matching against known architecture names defined in ARCHITECTURE_PATTERNS.
-
-    Args:
-        text: Model name or ID string to parse (e.g., "llama-2-7b-chat").
-
-    Returns:
-        Architecture name (e.g., "LLaMA", "Phi", "Mistral") or empty string
-        if no known architecture is detected.
-
-    Example:
-        >>> extract_architecture("OpenVINO/Llama-2-7B-chat-int4-ov")
-        'LLaMA'
-        >>> extract_architecture("phi-2-int4-ov")
-        'Phi'
-        >>> extract_architecture("unknown-model")
-        ''
-    """
-    text_lower = text.lower()
-    
-    for pattern, arch in ARCHITECTURE_PATTERNS.items():
-        if re.search(pattern, text_lower):
-            return arch
-    
-    return ''
+    """Extract model architecture family from a model name or ID string."""
+    return detect_architecture(text)
 
 
 def extract_model_metadata(model_id: str) -> dict:
-    """
-    Extract metadata from a model ID/name.
-    
-    Args:
-        model_id: The HuggingFace model ID or name
-        
-    Returns:
-        Dictionary with quantization, parameters, and architecture fields
-    """
+    """Extract legacy search metadata fields from a model ID/name."""
+    metadata = detect_model_metadata(model_id)
     return {
-        'quantization': extract_quantization(model_id),
-        'parameters': extract_parameters(model_id),
-        'architecture': extract_architecture(model_id),
+        "quantization": metadata["quantization"],
+        "parameters": metadata["parameters"],
+        "architecture": metadata["architecture"],
     }
 
 
 def is_openvino_compatible(repo_id: str) -> bool:
-    """
-    Check if a HuggingFace repository is OpenVINO compatible.
-    
-    Args:
-        repo_id: The HuggingFace repository ID (e.g., "OpenVINO/phi-2-int4-ov")
-        
-    Returns:
-        True if the model is OpenVINO compatible, False otherwise
-    """
+    """Check if a HuggingFace repository is OpenVINO compatible."""
     if not HF_AVAILABLE:
         return False
-    
+
     try:
         api = HfApi()
-        model_info = api.model_info(repo_id)
-        
-        # Check if author is OpenVINO
-        if model_info.author and model_info.author.lower() == 'openvino':
+        model_info = api.model_info(repo_id, timeout=HF_TIMEOUT_SECONDS)
+
+        if model_info.author and model_info.author.lower() == "openvino":
             return True
-        
-        # Check if model has openvino tag
+
+        if detect_format(repo_id) == "openvino-ir":
+            return True
+
         if model_info.tags:
             for tag in model_info.tags:
-                if 'openvino' in tag.lower():
+                if "openvino" in tag.lower():
                     return True
-        
+
         return False
-        
-    except Exception:
+    except _EXPECTED_HF_ERRORS:
+        logger.warning("Failed to check OpenVINO compatibility for %r", repo_id, exc_info=True)
         return False
 
 
 def _matches_model_type(model_id: str, model_type: str) -> bool:
-    """Check if a model matches the specified type filter.
-
-    Uses keyword matching against MODEL_TYPE_KEYWORDS to determine if a
-    model belongs to the specified category (llm, embedding, or vision).
-
-    Args:
-        model_id: HuggingFace model ID to check.
-        model_type: Type filter - "all", "llm", "embedding", or "vision".
-
-    Returns:
-        True if the model matches the type filter or if filter is "all".
-    """
-    if model_type == 'all' or not model_type:
+    if model_type == "all" or not model_type:
         return True
-    
-    model_id_lower = model_id.lower()
-    keywords = MODEL_TYPE_KEYWORDS.get(model_type.lower(), [])
-    
-    return any(kw in model_id_lower for kw in keywords)
+
+    detected_type = detect_model_type(model_id)
+    if detected_type:
+        return detected_type == model_type.lower()
+
+    keywords = MODEL_TYPE_KEYWORDS.get(model_type.lower(), ())
+    lowered = model_id.lower()
+    return any(keyword in lowered for keyword in keywords)
 
 
-def _matches_quantization_filter(quant: str, filter_quant: str) -> bool:
-    """Check if a model's quantization matches the filter.
-
-    Performs case-insensitive comparison of quantization strings.
-
-    Args:
-        quant: Model's quantization type (e.g., "INT4").
-        filter_quant: Filter value to match against.
-
-    Returns:
-        True if quantization matches filter or if filter is empty.
-    """
-    if not filter_quant:
+def _matches_quantization_filter(quantization: str, filter_quantization: str) -> bool:
+    if not filter_quantization:
         return True
-    
-    return quant.lower() == filter_quant.lower()
+
+    actual = (quantization or "").upper()
+    expected = filter_quantization.upper()
+    if actual == expected:
+        return True
+
+    if expected.startswith("INT") and actual.startswith("Q"):
+        return actual[1:2] == expected[-1:]
+
+    return False
+
+
+def _normalize_search_query(query: str) -> str:
+    return str(query or "").strip()[:MAX_QUERY_LENGTH]
 
 
 @lru_cache(maxsize=128)
@@ -320,87 +176,80 @@ def _cached_search(
     quantization: str,
     min_downloads: int,
 ) -> tuple[list[dict], int]:
-    """
-    Cached search implementation.
-    
-    Returns raw dicts to allow lru_cache (dataclasses aren't hashable by default).
-    """
     if not HF_AVAILABLE:
         return [], 0
-    
+
     try:
-        # Map sort parameter to HuggingFace API sort options
         sort_mapping = {
-            'popular': 'downloads',
-            'newest': 'lastModified',
-            'downloads': 'downloads',
-            'likes': 'likes',
+            "popular": "downloads",
+            "newest": "lastModified",
+            "downloads": "downloads",
+            "likes": "likes",
         }
-        hf_sort = sort_mapping.get(sort.lower(), 'downloads')
-        
-        # Build search parameters
+        hf_sort = sort_mapping.get(sort.lower(), "downloads")
+
         search_kwargs = {
-            'filter': 'openvino',
-            'sort': hf_sort,
+            "filter": "openvino",
+            "sort": hf_sort,
         }
-        
-        if query:
-            search_kwargs['search'] = query
-        
-        # Fetch enough to account for filtering
-        fetch_limit = 500
-        
-        # Get models from HuggingFace
-        models = list(list_models(**search_kwargs, limit=fetch_limit))
-        
-        # Process and filter results
+        normalized_query = _normalize_search_query(query)
+        if normalized_query:
+            search_kwargs["search"] = normalized_query
+
+        models = _run_with_timeout(lambda: list(list_models(**search_kwargs, limit=500)))
         results: list[dict] = []
-        
+
         for model in models:
-            model_id = model.id or ''
-            
-            # Extract metadata
-            metadata = extract_model_metadata(model_id)
-            
-            # Apply filters
+            model_id = model.id or ""
+            metadata = detect_model_metadata(model_id)
+
             if not _matches_model_type(model_id, model_type):
                 continue
-            
-            if not _matches_quantization_filter(metadata['quantization'], quantization):
+            if not _matches_quantization_filter(metadata["quantization"], quantization):
                 continue
-            
+
             downloads = model.downloads or 0
             if downloads < min_downloads:
                 continue
-            
-            # Parse last modified date
-            last_modified = ''
+
+            last_modified = ""
             if model.last_modified:
                 try:
                     last_modified = model.last_modified.isoformat()
                 except (AttributeError, ValueError):
                     last_modified = str(model.last_modified)
-            
-            # Extract display name from model ID
-            name = model_id.split('/')[-1] if '/' in model_id else model_id
-            
-            result = {
-                'id': model_id,
-                'name': name,
-                'author': model.author or '',
-                'downloads': downloads,
-                'likes': model.likes or 0,
-                'last_modified': last_modified,
-                'quantization': metadata['quantization'],
-                'parameters': metadata['parameters'],
-                'architecture': metadata['architecture'],
-            }
-            results.append(result)
-        
+
+            name = model_id.split("/")[-1] if "/" in model_id else model_id
+            results.append(
+                {
+                    "id": model_id,
+                    "name": name,
+                    "author": model.author or "",
+                    "downloads": downloads,
+                    "likes": model.likes or 0,
+                    "last_modified": last_modified,
+                    "quantization": metadata["quantization"],
+                    "parameters": metadata["parameters"],
+                    "architecture": metadata["architecture"],
+                }
+            )
+
         return results, len(results)
-        
-    except Exception:
+    except _EXPECTED_HF_ERRORS:
+        logger.warning("Hugging Face OpenVINO search failed", exc_info=True)
         return [], 0
+
+
+def _clamp_pagination(limit: int, offset: int) -> tuple[int, int]:
+    try:
+        limit_int = int(limit)
+    except (TypeError, ValueError):
+        limit_int = 20
+    try:
+        offset_int = int(offset)
+    except (TypeError, ValueError):
+        offset_int = 0
+    return max(1, min(limit_int, MAX_SEARCH_LIMIT)), max(0, offset_int)
 
 
 def search_openvino_models(
@@ -412,74 +261,45 @@ def search_openvino_models(
     quantization: str = "",
     min_downloads: int = 0,
 ) -> tuple[list[SearchResult], int]:
-    """
-    Search HuggingFace for OpenVINO-compatible models.
-    
-    Args:
-        query: Search query string
-        sort: Sort order - "popular", "newest", "downloads", "likes"
-        limit: Maximum number of results to return
-        offset: Number of results to skip (for pagination)
-        model_type: Filter by type - "all", "llm", "embedding", "vision"
-        quantization: Filter by quantization - "int4", "int8", "fp16"
-        min_downloads: Minimum number of downloads required
-        
-    Returns:
-        Tuple of (list of SearchResult, total count matching filters)
-    """
-    # Use cached search for the heavy lifting
+    """Search HuggingFace for OpenVINO-compatible models."""
+    limit, offset = _clamp_pagination(limit, offset)
+    min_downloads = max(0, int(min_downloads or 0))
     cached_results, total = _cached_search(
-        query, sort, model_type, quantization, min_downloads
+        _normalize_search_query(query), sort, model_type, quantization, min_downloads
     )
-    
-    # Apply pagination
-    paginated = cached_results[offset:offset + limit]
-    
-    # Convert dicts to SearchResult objects
-    results = [SearchResult(**r) for r in paginated]
-    
-    return results, total
+    paginated = cached_results[offset : offset + limit]
+    return [SearchResult(**result) for result in paginated], total
 
 
 def get_model_details(repo_id: str) -> Optional[SearchResult]:
-    """
-    Get detailed information for a specific model.
-    
-    Args:
-        repo_id: The HuggingFace repository ID
-        
-    Returns:
-        SearchResult with model details, or None if not found
-    """
+    """Get detailed information for a specific model."""
     if not HF_AVAILABLE:
         return None
-    
+
     try:
         api = HfApi()
-        model = api.model_info(repo_id)
-        
-        metadata = extract_model_metadata(repo_id)
-        
-        last_modified = ''
+        model = api.model_info(repo_id, timeout=HF_TIMEOUT_SECONDS)
+        metadata = detect_model_metadata(repo_id)
+
+        last_modified = ""
         if model.last_modified:
             try:
                 last_modified = model.last_modified.isoformat()
             except (AttributeError, ValueError):
                 last_modified = str(model.last_modified)
-        
-        name = repo_id.split('/')[-1] if '/' in repo_id else repo_id
-        
+
+        name = repo_id.split("/")[-1] if "/" in repo_id else repo_id
         return SearchResult(
             id=repo_id,
             name=name,
-            author=model.author or '',
+            author=model.author or "",
             downloads=model.downloads or 0,
             likes=model.likes or 0,
             last_modified=last_modified,
-            quantization=metadata['quantization'],
-            parameters=metadata['parameters'],
-            architecture=metadata['architecture'],
+            quantization=metadata["quantization"],
+            parameters=metadata["parameters"],
+            architecture=metadata["architecture"],
         )
-        
-    except Exception:
+    except _EXPECTED_HF_ERRORS:
+        logger.warning("Failed to fetch model details for %r", repo_id, exc_info=True)
         return None

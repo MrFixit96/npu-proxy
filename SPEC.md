@@ -1,479 +1,344 @@
-# SPEC: NPU Proxy - Intel NPU Inference Server
+# NPU Proxy Specification
 
-## 1. Objective
+This file is a **released-truth snapshot** for the current repository state. It intentionally avoids planned or speculative features.
 
-Enable **Ollama-compatible** and **OpenAI-compatible** local LLM inference using **Intel NPU** (Neural Processing Unit) hardware via OpenVINO GenAI. The solution provides a FastAPI-based proxy that bridges modern AI client interfaces with Intel's NPU, GPU, and CPU devices.
+## Objective
 
-**Primary Use Case**: Allow WSL2 Linux applications (like Claude Code) to access Windows-hosted Intel NPU hardware for efficient on-device AI inference.
+Expose local OpenVINO-backed inference through:
 
-## 2. Environment Context
+- **OpenAI-style endpoints** for chat, embeddings, and model listing
+- **Ollama-style endpoints** for generate, chat, embeddings, model download, tags, and model discovery
 
-- **OS:** Windows 11 (24H2+) with current Intel NPU drivers, Linux clients over WSL 2 / native host support
-- **CPU:** Intel Core Ultra Series 1/2/3 and newer Intel NPU hosts validated by OpenVINO
-- **NPU:** Intel AI Boost (verified working)
-- **GPU:** Intel Arc Graphics (optional, used as fallback)
-- **Runtime:** Python 3.12+, OpenVINO GenAI 2026.1.x
-- **Framework:** FastAPI + Uvicorn (async HTTP server)
+The primary documented deployment model is a native, local, single-user developer-workstation process. It binds to loopback by default and has no authentication by design. It is not specified as a shared production proxy.
 
-## 3. Problem Statement
+## Validation snapshot behind this release-truth pass
 
-### The Challenge
+- Mock mode is the default unless real inference is explicitly enabled.
+- The authoritative default bind is `127.0.0.1:8080` for the CLI/config layer.
+- Host-header allow-listing rejects disallowed Host headers with HTTP 421.
+- `/api/tags` is implemented and `/api/show` returns real registry-backed metadata.
+- Generation responses expose stop/length finish reasons.
+- Embedding validation rejects invalid inputs before engine execution and limits batches to 128 inputs.
+- `sentence-transformers/all-MiniLM-L6-v2` validated on NPU on the validation workstation via a static-shape embedding profile.
+- `BAAI/bge-small-en-v1.5` on NPU did **not** validate on that workstation because the Intel NPU plugin failed with `check_sdpa_nodes(model)`.
 
-1. **WSL2 NPU Gap**: Intel NPU hardware is not accessible from WSL2 Linux distributions
-   - GPU-PV (paravirtualization) exists for GPUs but not for NPUs
-   - Microsoft's `dxgkrnl` lacks NPU device passthrough
-   - Intel has acknowledged the request (GitHub #56) but provided no timeline after 14+ months
+## Current top-level architecture
 
-2. **Client Compatibility**: Modern AI tools (Claude Code, Continue, Cursor) expect Ollama or OpenAI APIs
-   - No direct OpenVINO integration in these clients
-   - Need API translation layer
-
-3. **NPU Complexity**: Intel NPU has unique constraints not present in GPU/CPU
-   - Static tensor shapes required
-   - Limited context length (~1800-2000 tokens practical max)
-   - Long cold start (80-130s model compilation)
-
-### The Solution
-
-A user-space HTTP proxy running on Windows host that:
-- Exposes Ollama-compatible and OpenAI-compatible REST APIs
-- Routes inference requests to Intel NPU via OpenVINO GenAI
-- Bridges WSL2 applications via TCP networking
-- Provides automatic device fallback (NPU → GPU → CPU)
-
-## 4. Architecture
-
-### High-Level System Diagram
-
-```
-┌───────────────────────────────────────────────────────────────────────────────┐
-│                              CLIENT LAYER                                      │
-├───────────────────┬──────────────────────┬────────────────────────────────────┤
-│   Claude Code     │     Ollama CLI       │     OpenAI SDK (Python/JS/etc)     │
-│   (WSL2/Win)      │     (any OS)         │                                    │
-└─────────┬─────────┴──────────┬───────────┴───────────────┬────────────────────┘
-          │                    │                           │
-          └────────────────────┼───────────────────────────┘
-                               │ HTTP (port 11435)
-                               ▼
-┌───────────────────────────────────────────────────────────────────────────────┐
-│                            NPU PROXY SERVER                                    │
-│  ┌─────────────────────────────────────────────────────────────────────────┐  │
-│  │                         FastAPI Application                              │  │
-│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌──────────────┐    │  │
-│  │  │ /v1/chat/   │  │ /v1/        │  │ /api/       │  │ /health      │    │  │
-│  │  │ completions │  │ embeddings  │  │ generate    │  │ /metrics     │    │  │
-│  │  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘  └──────────────┘    │  │
-│  └─────────┼────────────────┼────────────────┼─────────────────────────────┘  │
-│            │                │                │                                 │
-│  ┌─────────▼────────────────▼────────────────▼─────────────────────────────┐  │
-│  │                    Context-Aware Router                                  │  │
-│  │            (Routes by token count to optimal device)                     │  │
-│  └─────────────────────────────┬───────────────────────────────────────────┘  │
-│                                │                                               │
-│  ┌─────────────────────────────▼───────────────────────────────────────────┐  │
-│  │                      Inference Layer                                     │  │
-│  │  ┌──────────────────────┐    ┌──────────────────────────────────────┐   │  │
-│  │  │   InferenceEngine    │    │        EmbeddingEngine               │   │  │
-│  │  │   (LLMPipeline)      │    │     (TextEmbeddingPipeline)          │   │  │
-│  │  └──────────┬───────────┘    └──────────────────────────────────────┘   │  │
-│  └─────────────┼───────────────────────────────────────────────────────────┘  │
-│                │                                                               │
-│  ┌─────────────▼───────────────────────────────────────────────────────────┐  │
-│  │                     OpenVINO GenAI Runtime                               │  │
-│  └─────────────┬───────────────────────────────────────────────────────────┘  │
-└────────────────┼───────────────────────────────────────────────────────────────┘
-                 │
-┌────────────────▼───────────────────────────────────────────────────────────────┐
-│                           HARDWARE LAYER                                        │
-│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐                 │
-│  │      NPU        │  │      GPU        │  │      CPU        │                 │
-│  │  (Primary)      │  │   (Fallback 1)  │  │   (Fallback 2)  │                 │
-│  │ Meteor/Lunar/   │  │   Intel iGPU    │  │   x86-64        │                 │
-│  │  Arrow Lake     │  │   or dGPU       │  │                 │                 │
-│  └─────────────────┘  └─────────────────┘  └─────────────────┘                 │
-└────────────────────────────────────────────────────────────────────────────────┘
+```text
+Client (Ollama/OpenAI SDK/Claude Code)
+        |
+        v
+FastAPI app (npu_proxy.main:app)
+        |
+        +-- OpenAI routes: /v1/models, /v1/chat/completions, /v1/embeddings
+        +-- Ollama routes: /api/tags, /api/generate, /api/chat, /api/embed, /api/pull, ...
+        +-- Health/metrics routes: /health, /health/devices, /metrics
+        |
+        v
+OpenVINO-backed engines, or mock responses when real inference is disabled
 ```
 
-### Device Fallback Chain
+## Implemented HTTP surface
 
-```
-NPU (preferred) → GPU (fallback) → CPU (always available)
-```
+### OpenAI-compatible routes
 
-**Fallback Triggers**:
-1. Device unavailable in OpenVINO Core
-2. Model load failure on device
-3. Context exceeds NPU token limit (via Context-Aware Routing)
+| Method | Path | Current behavior |
+|---|---|---|
+| GET | `/v1/models` | Returns built-in registry models plus scanned local models |
+| POST | `/v1/chat/completions` | OpenAI chat format; streaming uses SSE |
+| POST | `/v1/embeddings` | OpenAI embeddings format |
 
-### Context-Aware Routing
+`/v1/chat/completions` returns `choices[].finish_reason` in non-streaming responses and on the final streaming delta chunk. Values are `"stop"` for natural completion and `"length"` when the effective max output token limit is reached.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Incoming Request                              │
-└─────────────────────────────────┬───────────────────────────────┘
-                                  │
-                                  ▼
-                     ┌────────────────────────┐
-                     │  Count Message Tokens  │
-                     │  (Fast regex ~95% acc) │
-                     └────────────┬───────────┘
-                                  │
-                 ┌────────────────┼────────────────┐
-                 │                │                │
-         tokens ≤ 1800    1800 < tokens    tokens > limit
-                 │          ≤ limit               │
-                 ▼                │                ▼
-         ┌───────────┐    ┌──────▼──────┐   ┌──────────┐
-         │    NPU    │    │    GPU      │   │ Reject   │
-         │ (optimal) │    │ (fallback)  │   │ (error)  │
-         └───────────┘    └─────────────┘   └──────────┘
-```
+### Ollama-compatible routes
 
-## 5. Implementation Status
+| Method | Path | Current behavior |
+|---|---|---|
+| GET | `/api/tags` | Lists locally available models in Ollama tags format |
+| POST | `/api/generate` | Non-streaming JSON or streaming NDJSON chunks |
+| POST | `/api/chat` | Non-streaming JSON or streaming NDJSON chunks |
+| POST | `/api/embed` | Current Ollama embedding format |
+| POST | `/api/embeddings` | Legacy single-embedding format |
+| GET | `/api/ps` | Running-model status |
+| POST | `/api/show` | Registry-backed model metadata, parameters, template, and modelfile |
+| GET | `/api/version` | Returns the NPU Proxy Ollama-compatible version string |
+| POST | `/api/pull` | Downloads OpenVINO model files from Hugging Face |
+| GET | `/api/search` | Search/filter OpenVINO-compatible Hugging Face models |
+| GET | `/api/models/known` | Lists static short-name mappings |
 
-### Current Features (Implemented)
+Ollama generate/chat final responses and final NDJSON frames include `done: true` and `done_reason` (`"stop"` or `"length"`).
 
-| Feature | Status | Files |
-|---------|--------|-------|
-| OpenAI Chat API (`/v1/chat/completions`) | ✅ Complete | `npu_proxy/api/chat.py` |
-| OpenAI Embeddings (`/v1/embeddings`) | ✅ Complete | `npu_proxy/api/embeddings.py` |
-| OpenAI Models (`/v1/models`) | ✅ Complete | `npu_proxy/api/models.py` |
-| Ollama Generate (`/api/generate`) | ✅ Complete | `npu_proxy/api/ollama.py` |
-| Ollama Chat (`/api/chat`) | ✅ Complete | `npu_proxy/api/ollama.py` |
-| Ollama Embed (`/api/embed`) | ✅ Complete | `npu_proxy/api/ollama.py` |
-| Ollama Pull (`/api/pull`) | ✅ Complete | `npu_proxy/api/ollama.py` |
-| Ollama Tags (`/api/tags`) | ✅ Complete | `npu_proxy/api/ollama.py` |
-| SSE Streaming | ✅ Complete | `npu_proxy/inference/streaming.py` |
-| Context-Aware Routing | ✅ Complete | `npu_proxy/routing/context_router.py` |
-| Device Fallback Chain | ✅ Complete | `npu_proxy/inference/engine.py` |
-| Prometheus Metrics | ✅ Complete | `npu_proxy/metrics.py` |
-| Health Checks | ✅ Complete | `npu_proxy/api/health.py` |
-| Model Registry | ✅ Complete | `npu_proxy/models/registry.py` |
-| HuggingFace Download | ✅ Complete | `npu_proxy/models/downloader.py` |
-| Parameter Mapping | ✅ Complete | `npu_proxy/models/parameter_mapper.py` |
+### System routes
 
-**Tests**: 300 passing | **Coverage**: ~95%
+| Method | Path | Current behavior |
+|---|---|---|
+| GET | `/health` | Observational service summary with engine/device details |
+| GET | `/health/liveness` | Cheap process-up probe |
+| GET | `/health/readiness` | Observational warmed-runtime readiness gate |
+| GET | `/health/devices` | Returns available devices, active device, fallback chain |
+| GET | `/metrics` | Prometheus text format when metrics support is available |
 
-### Native OS Packaging (Implemented)
+## Startup and configuration
 
-| Component | Platform | Status | Files |
-|-----------|----------|--------|-------|
-| systemd service | Linux | ✅ Complete | `packaging/npu-proxy.service` |
-| Install script | Linux | ✅ Complete | `scripts/install_linux.sh` |
-| Uninstall script | Linux | ✅ Complete | `scripts/uninstall_linux.sh` |
-| PyInstaller build | Windows | ✅ Complete | `scripts/build_windows.ps1`, `npu_proxy.pyinstaller.spec` |
-| CLI entry point | All | ✅ Complete | `npu_proxy/cli.py` |
+### Entry points
 
-### Planned Features
+- `npu-proxy` → `npu_proxy.cli:main`
+- `python -m uvicorn npu_proxy.main:app --host 127.0.0.1 --port 8080`
+- `.\scripts\start-server.ps1`
 
-| Feature | Priority | Status |
-|---------|----------|--------|
-| WinGet Package | HIGH | ✅ Complete |
-| Debian/apt Package | HIGH | ✅ Complete |
-| Vision Model Support (VLMPipeline) | MEDIUM | 🔲 Planned |
-| Multi-Model Concurrent Inference | LOW | 🔲 Research |
+### Current startup defaults
 
-## 6. NPU Constraints and Limitations
+| Path | Host | Port | Notes |
+|---|---|---|---|
+| `npu-proxy` CLI/config | `127.0.0.1` | `8080` | Default local developer bind |
+| `scripts\start-server.ps1` | `127.0.0.1` | `11435` | Launcher default; `0.0.0.0` requires `-ListenAll` or `NPU_PROXY_LISTEN_ALL=true` |
 
-### Context Length Limits
+### CLI flags
 
-| Constraint | Value | Source |
-|------------|-------|--------|
-| **Default NPU context** | 1024 tokens | OpenVINO GenAI NPU defaults |
-| **Extended context** | Up to 4096 tokens | Via `MAX_PROMPT_LEN` config |
-| **Practical maximum** | ~1800-2000 tokens | Empirical testing (Issue #3161) |
+| Flag | Default | Notes |
+|---|---|---|
+| `--host` | `127.0.0.1` | Bind address |
+| `--port`, `-p` | `8080` | Bind port |
+| `--workers`, `-w` | `1` | Uvicorn worker processes |
+| `--reload` | off | Development auto-reload |
+| `--allowed-hosts` | loopback/test clients | Comma-separated Host-header allow-list |
+| `--device`, `-d` | `AUTO` parser default; effective runtime default `NPU` | `NPU`, `GPU`, `CPU`, or `AUTO`; routing remains advisory |
+| `--token-limit` | `1800` | Advisory context-routing threshold |
+| `--compile-cache-dir` | unset | Optional OpenVINO compile cache directory |
+| `--compile-cache-mode` | runtime default | `OPTIMIZE_SIZE` or `OPTIMIZE_SPEED` |
+| `--prefix-cache-mode` | `auto` | `auto`, `on`, or `off` |
+| `--real-inference` | off | Enable real model inference; otherwise mock mode |
+| `--log-level`, `-l` | `info` | `debug`, `info`, `warning`, `error`, or `critical` |
+| `--log-file` | unset | Log to file instead of stdout |
+| `--version`, `-v` | n/a | Print version and exit |
 
-**Why Context is Limited**:
-- NPU memory is constrained (2-4GB depending on model)
-- Static KV-cache shapes must be compiled at model load time
-- Longer contexts require more memory for attention computation
+### Bootstrap and LLM environment variables
 
-### Memory Constraints
+| Variable | Default | Notes |
+|---|---|---|
+| `NPU_PROXY_HOST` | `127.0.0.1` | Bind address |
+| `NPU_PROXY_PORT` | `8080` | Bind port |
+| `NPU_PROXY_DEVICE` | `NPU` effective runtime default | LLM device; CLI also accepts `AUTO` |
+| `NPU_PROXY_TOKEN_LIMIT` | `1800` | Advisory context-routing threshold |
+| `NPU_PROXY_REAL_INFERENCE` | `0` | Set `1` to enable real inference |
+| `NPU_PROXY_INFERENCE_TIMEOUT` | `180` | LLM timeout seconds |
+| `NPU_PROXY_MAX_PROMPT_LEN` | `4096` | LLM prompt limit |
+| `NPU_PROXY_COMPILE_CACHE_DIR` | unset | Optional OpenVINO compile cache directory |
+| `NPU_PROXY_COMPILE_CACHE_MODE` | runtime default | `OPTIMIZE_SIZE` or `OPTIMIZE_SPEED` |
+| `NPU_PROXY_PREFIX_CACHE_MODE` | `auto` | Prefix cache mode |
+| `NPU_PROXY_LLM_BACKEND` | `openvino` | `openvino` or alpha `llama_cpp` |
+| `NPU_PROXY_ENABLE_ALPHA_BACKENDS` | `0` | Required to opt into alpha backends |
+| `NPU_PROXY_LLAMACPP_MODEL_PATH` | unset | Local `.gguf` path for alpha `llama.cpp` backend |
+| `NPU_PROXY_ALLOWED_HOSTS` | loopback/test clients | Comma-separated Host-header allow-list |
+| `NPU_PROXY_PREFERRED_DEVICE` | `NPU` | Advisory context-router preference |
+| `NPU_PROXY_FALLBACK_DEVICE` | auto | Advisory context-router fallback override |
 
-| Constraint | Value | Notes |
-|------------|-------|-------|
-| **NPU Memory** | 2-4 GB | Shared with system memory |
-| **Concurrent Models** | 1 | Only ONE LLM model at a time |
-| **Model Swap** | Not supported | Must restart server to change |
+Invalid `TOKEN_LIMIT`, `PREFERRED_DEVICE`, and `FALLBACK_DEVICE` values warn and fall back to defaults in request-time routing paths; explicit startup validation can still fail for invalid bootstrap settings.
 
-### Model Compilation Time
+### Other runtime environment variables
 
-| Phase | Time | Notes |
-|-------|------|-------|
-| **Cold start (first load)** | 80-130 seconds | Model compilation to NPU kernels |
-| **Warm start (cached)** | 5-8 seconds | Using cached compiled model |
-| **Inference latency** | 1-4 seconds | After model is loaded |
-
-**Mitigation**: NPU warmup on startup (`engine.warmup(warmup_tokens=16)`)
-
-### NPU vs GPU vs CPU Comparison
-
-| Characteristic | NPU | GPU | CPU |
-|----------------|-----|-----|-----|
-| **Cold Start** | 80-130s | 20-30s | 5-10s |
-| **Inference Speed** | Moderate | Fast | Slow |
-| **Power Efficiency** | Excellent | Moderate | Poor |
-| **Memory Limit** | 2-4GB | 4-8GB+ | System RAM |
-| **Concurrent Models** | 1 | 1-2 | Multiple |
-| **Dynamic Shapes** | ❌ | ✅ | ✅ |
-| **Long Context** | Limited | ✅ | ✅ |
-
-## 7. API Reference
-
-### OpenAI-Compatible Endpoints
-
-| Method | Path | Description | Streaming |
-|--------|------|-------------|-----------|
-| POST | `/v1/chat/completions` | Chat completion | ✅ SSE |
-| POST | `/v1/embeddings` | Generate embeddings | ❌ |
-| GET | `/v1/models` | List available models | ❌ |
-
-### Ollama-Compatible Endpoints
-
-| Method | Path | Description | Streaming |
-|--------|------|-------------|-----------|
-| POST | `/api/generate` | Raw text generation | ✅ SSE |
-| POST | `/api/chat` | Chat completion | ✅ SSE |
-| POST | `/api/embed` | Batch embeddings | ❌ |
-| POST | `/api/embeddings` | Single embedding (legacy) | ❌ |
-| GET | `/api/ps` | List running models | ❌ |
-| POST | `/api/show` | Show model details | ❌ |
-| POST | `/api/pull` | Download model | ✅ Progress |
-| GET | `/api/tags` | List models | ❌ |
-| GET | `/api/version` | Version info | ❌ |
-
-### System Endpoints
-
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/health` | Health check with NPU status |
-| GET | `/health/devices` | Detailed device information |
-| GET | `/metrics` | Prometheus metrics |
-
-### Response Headers
-
-| Header | Description |
-|--------|-------------|
-| `X-Request-ID` | Unique request identifier (req_<24-char-hex>) |
-| `X-NPU-Proxy-Device` | Device used (NPU/GPU/CPU) |
-| `X-NPU-Proxy-Route-Reason` | Why device was selected |
-| `X-NPU-Proxy-Token-Count` | Token count for routing decision |
-
-## 8. Configuration Reference
-
-### Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `NPU_PROXY_HOST` | `0.0.0.0` | Server bind address |
-| `NPU_PROXY_PORT` | `11435` | Server port (matches Ollama) |
-| `NPU_PROXY_DEVICE` | `NPU` | Preferred device (NPU, GPU, CPU) |
-| `NPU_PROXY_FALLBACK_DEVICE` | (auto) | Override fallback device selection |
-| `NPU_PROXY_REAL_INFERENCE` | `0` | Enable real inference (`1`) or mock (`0`) |
-| `NPU_PROXY_MODEL_PATH` | `~/.cache/npu-proxy/models` | Model cache directory |
-| `NPU_PROXY_INFERENCE_TIMEOUT` | `180` | Inference timeout in seconds |
-| `NPU_PROXY_MAX_PROMPT_LEN` | `4096` | Maximum prompt length for NPU |
-| `NPU_PROXY_TOKEN_LIMIT` | `1800` | Token threshold for NPU routing |
+| Variable | Default | Notes |
+|---|---|---|
+| `NPU_PROXY_MODEL_DIR` | `~/.cache/npu-proxy/models` | Model/tokenizer lookup root |
+| `NPU_PROXY_DISABLE_CHAT_TEMPLATES` | unset | Truthy value forces legacy chat formatting |
 | `NPU_PROXY_EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | Default embedding model |
-| `NPU_PROXY_EMBEDDING_DEVICE` | `CPU` | Device for embeddings |
-| `NPU_PROXY_EMBEDDING_CACHE_SIZE` | `1000` | LRU cache size for embeddings |
-| `NPU_PROXY_LOG_LEVEL` | `INFO` | Logging verbosity |
+| `NPU_PROXY_EMBEDDING_DEVICE` | `CPU` | Default embedding device |
+| `NPU_PROXY_LOAD_TIMEOUT` | `300` | Embedding load timeout seconds |
+| `NPU_PROXY_EMBED_TIMEOUT` | `60` | Embedding inference timeout seconds |
+| `NPU_PROXY_EMBEDDING_CACHE_SIZE` | `1024` | Embedding cache size |
+| `NPU_PROXY_EMBEDDING_FALLBACK_MODE` | disabled | Set `hash` only for explicit operator fallback tests |
+| `NPU_PROXY_EMBEDDING_UNAVAILABLE_COOLDOWN` | `30` | Cooldown seconds after embedding load failures |
+| `NPU_PROXY_LISTEN_ALL` | unset | `scripts\start-server.ps1` opt-in for `0.0.0.0` |
 
-### Example Configuration
+## Security model
 
-```powershell
-# Windows - Production configuration
-$env:NPU_PROXY_REAL_INFERENCE = "1"
-$env:NPU_PROXY_DEVICE = "NPU"
-$env:NPU_PROXY_INFERENCE_TIMEOUT = "300"
+NPU Proxy is intentionally local-first:
 
-# Start server
-npu-proxy --host 0.0.0.0 --port 11435
+- default host is `127.0.0.1`
+- there is no authentication or API-key enforcement by design
+- it should not be exposed as a shared production proxy
+
+Implemented hardening:
+
+- `npu_proxy.main` enforces a Host-header allow-list for every request
+- disallowed Host headers receive HTTP `421` with body `Host header not allowed`
+- the default allow-list covers loopback and test clients: `localhost`, `127.0.0.1`, `::1`, `[::1]`, `testserver`, `test`
+- configure the allow-list with `NPU_PROXY_ALLOWED_HOSTS` or `--allowed-hosts`
+- binding a non-loopback address logs a warning that remote clients must be represented in the allow-list
+- `scripts\start-server.ps1` only chooses `0.0.0.0` with explicit `-ListenAll` or `NPU_PROXY_LISTEN_ALL=true`
+- model registry names are slug-validated, resolved paths are confined to the configured model directory, and tokenizer paths are guarded against traversal
+- API errors are sanitized so clients do not receive internal exception details or stack traces
+
+## Runtime behavior
+
+### Chat and generate
+
+- `/v1/chat/completions` supports OpenAI-style non-streaming and SSE streaming responses
+- `/v1/chat/completions` attempts tokenizer chat-template rendering when a model tokenizer exposes one, and falls back to the legacy role-prefixed formatter otherwise
+- `/api/generate` and `/api/chat` return non-streaming JSON or stream newline-delimited JSON chunks
+- `/api/chat` uses the same shared chat-template rendering path as `/v1/chat/completions`, with legacy formatting as the fallback when tokenizer templates are unavailable
+- real streaming is backed by `npu_proxy.inference.streaming.AsyncTokenStream`
+- cancellation is cooperative at token boundaries; a native OpenVINO call already in flight may finish its current token
+- `top_p` and timeout settings are forwarded into engine generation paths
+- mock mode yields canned responses unless real inference is enabled
+
+### Finish reasons
+
+- OpenAI non-streaming returns `choices[0].finish_reason`
+- OpenAI streaming sets `finish_reason` on the final delta chunk
+- Ollama final responses/final NDJSON frames include `done_reason` with `done: true`
+- values are `"stop"` or `"length"`; native backend reasons are preferred when available, otherwise the service compares emitted completion tokens to the effective max output token limit
+
+### Routing
+
+`npu_proxy.routing.context_router.ContextRouter` selects:
+
+- preferred device when token counts stay within `NPU_PROXY_TOKEN_LIMIT`
+- fallback device when they exceed the limit
+
+Default fallback chain reported by `/health/devices` is:
+
+```text
+NPU -> GPU -> CPU
 ```
 
-```bash
-# WSL2 - Client configuration
-WINDOWS_HOST=$(ip route show | grep default | awk '{print $3}')
-export OLLAMA_HOST="http://${WINDOWS_HOST}:11435"
+Current released-truth note:
 
-# Use with Claude Code or other Ollama clients
-claude --chat
-```
+- the router computes a preferred or fallback device classification
+- the real LLM execution path still uses the active runtime/engine state rather than guaranteed per-request device switching
+- therefore current routing information should be interpreted as **advisory classification**, not proof of independently switched execution per request
+- `devices.get_available_devices()` returns `['CPU']` in mock mode and degrades to `['CPU']` with a warning if OpenVINO import/Core initialization fails in real-inference mode
 
-## 9. Deployment
+### LLM engine lifecycle
 
-### Critical Constraint: Host-Only Deployment
+- `get_llm_engine()` is a singleton
+- default model path is `~/.cache/npu-proxy/models/tinyllama-1.1b-chat-int4-ov`
+- if that directory is missing in real inference mode, requests fail rather than auto-download
+- default LLM device is `NPU`
+- default LLM timeout is 180 seconds
+- compile-cache and prefix-cache controls are implemented and surfaced through CLI/env configuration and health endpoints
+- the repository includes an alpha `llama.cpp` backend seam for local `.gguf` files, but it is feature-gated, CPU-only, and source-install only because `llama-cpp-python` is not in the default project dependencies
 
-> ⚠️ **NPU Proxy MUST run as a native host service.**
-> Intel NPU drivers cannot be containerized (no Docker, no Kubernetes).
-> WSL2 workloads connect via HTTP bridge to Windows host.
+### Embedding engine lifecycle and validation
 
-### Windows Deployment
+Current truth that matters for users:
 
-```powershell
-# Install from source
-pip install -e .
+- the service caches embedding engines by resolved model and device
+- `NPU_PROXY_EMBEDDING_MODEL` and `NPU_PROXY_EMBEDDING_DEVICE` define the default embedding model and device
+- request `model` fields and device overrides can switch to another cached engine when a runtime-ready export exists
+- unavailable real embeddings fail by default instead of returning success-shaped fallback vectors
+- the documented default embedding device remains `CPU`
+- `all-minilm-l6-v2` is validated on NPU here via a static-shape profile
+- `bge-small` on NPU still failed inside the Intel NPU plugin with `check_sdpa_nodes(model)`
 
-# Run as Windows Service (planned)
-# winget install npu-proxy
+Embedding inputs are validated before hitting the engine:
 
-# Start server
-npu-proxy --host 0.0.0.0 --port 11435
-```
+| Condition | HTTP status | Code | Message |
+|---|---:|---|---|
+| Empty input list | 400 | `empty_input` | `Embedding input must contain at least one item` |
+| Batch size greater than 128 | 413 | `embedding_batch_too_large` | `Embedding input batch is too large` |
+| Empty or whitespace-only text | 400 | `empty_input` | `Embedding input text must not be empty` |
+| Oversized text | 413 | `embedding_input_too_large` | `Embedding input text is too large` |
 
-### Linux Deployment (systemd)
+Successful embedding responses carry an `x-request-id` header and return exactly one finite, correctly dimensioned vector per input. OpenAI-compatible errors use the OpenAI error envelope; Ollama-compatible embedding routes use their own detail envelope.
 
-```bash
-# Install
-sudo ./scripts/install_linux.sh
+## Model sources
 
-# Enable and start
-sudo systemctl enable npu-proxy
-sudo systemctl start npu-proxy
+### Built-in model registry
 
-# Check status
-sudo systemctl status npu-proxy
-```
+The current built-in registry includes:
 
-## 10. Performance Benchmarks
+- LLM IDs: `tinyllama-1.1b-chat-int4-ov`, `mistral-7b-int4-ov`, `granite-4-micro-ov`, `phi-2-int4-ov`
+- Embedding IDs: `all-minilm-l6-v2`, `bge-small`, `e5-large`, `qwen3-embedding-0.6b-int4-ov`, `qwen3-embedding-8b-int4-ov`
 
-**Test System**: Intel Core Ultra 7 155H (Meteor Lake), 32GB RAM, Windows 11 23H2
+`/v1/models` combines those entries with any additional locally scanned model directories. `/api/tags` exposes locally available models in Ollama's tags shape. `/api/show` returns metadata from the registry/local model scan rather than placeholder-only data.
 
-### Inference Latency (TinyLlama 1.1B INT4)
+### Short-name pull mappings
 
-| Device | Avg Latency | Tokens/sec |
-|--------|-------------|------------|
-| NPU | 4.03s | ~5 tok/s |
-| GPU | 2.25s | ~9 tok/s |
-| CPU | 8.5s | ~2.4 tok/s |
+`/api/pull` and `/api/models/known` currently support static mappings such as:
 
-### Cold Start Performance
+- `tinyllama`, `tinyllama:fp16`, `phi-2`, `phi-3`, `llama2`, `llama2:13b`, `llama3.2`, `mistral`, `qwen2`, `gemma`
+- `bge-small`, `bge-base`, `bge-large`, `e5-small`, `e5-large`, `all-minilm`, `nomic-embed-text`
 
-| Model | Device | Load Time |
-|-------|--------|-----------|
-| TinyLlama 1.1B INT4 | NPU | 8.12s (cached) |
-| TinyLlama 1.1B INT4 | GPU | 21.96s |
-| TinyLlama 1.1B INT4 | CPU | 5.2s |
+Downloads enforce Hugging Face allow-patterns and a size cap; full-snapshot download is opt-in. Conversion runs in a timeout-safe child process and publishes via atomic temporary-directory rename.
 
-### Embedding Performance (BGE-Small)
+## Packaging artifacts in this repo
 
-| Device | Single Query | Batch (3 docs) |
-|--------|--------------|----------------|
-| CPU | ~28ms | ~25ms |
-| NPU | ~35ms | ~30ms |
+### Windows
 
-## 11. Model Compatibility Matrix
+- `scripts\build_windows.ps1` builds `dist\npu-proxy.exe`
+- `npu_proxy.pyinstaller.spec` defines the PyInstaller build
+- `packaging\winget\*.yaml` contains WinGet manifest files for version `0.2.0`
+- those packaging artifacts target the default OpenVINO runtime path, not the alpha GGUF experiment path
 
-| Model | Type | NPU | GPU | CPU | Notes |
-|-------|------|-----|-----|-----|-------|
-| TinyLlama 1.1B INT4 | LLM | ✅ | ✅ | ✅ | Recommended for NPU |
-| Phi-2 2.7B INT4 | LLM | ✅ | ✅ | ✅ | Good balance |
-| Mistral 7B INT4 | LLM | ⚠️ | ✅ | ✅ | May exceed NPU memory |
-| LLaMA-2 7B INT4 | LLM | ⚠️ | ✅ | ✅ | May exceed NPU memory |
-| Granite 4 Micro | LLM | ✅ | ✅ | ✅ | 1B FP32 model |
-| BGE-Small | Embedding | ✅ | ✅ | ✅ | 384 dimensions |
-| BGE-Base | Embedding | ✅ | ✅ | ✅ | 768 dimensions |
-| All-MiniLM-L6-v2 | Embedding | ✅ | ✅ | ✅ | Lightweight |
+### Linux / Debian
 
-**Legend**: ✅ Supported | ⚠️ May work with limitations | ❌ Not recommended
+- `packaging\npu-proxy.service` is the systemd unit
+- `packaging\npu-proxy.environment` is the packaged environment template
+- `packaging\debian\` contains Debian packaging files
+- `packaging\debian\build.sh` copies resulting `.deb` files into `dist\`
+- the packaged path documents the default OpenVINO runtime; the alpha GGUF backend is not packaged as a first-class install target
 
-## 12. Prometheus Metrics
+## Health and status semantics
 
-```
-# Counter: Total requests by endpoint and status
-npu_proxy_requests_total{endpoint="/v1/chat/completions", status="200"}
+### `/health`
 
-# Histogram: Inference latency
-npu_proxy_inference_duration_seconds{model="tinyllama", device="NPU"}
+Current top-level response includes:
 
-# Histogram: Time to first token (critical SLO)
-npu_proxy_time_to_first_token_seconds{model="tinyllama"}
+- `status`
+- `engines`
+- `version`
+- `npu_available`
+- `gpu_available`
+- `cpu_available`
+- `devices`
+- `openvino_version`
+- `messages`
 
-# Histogram: Inter-token latency
-npu_proxy_inter_token_latency_seconds{model="tinyllama"}
+Current contract:
 
-# Gauge: Tokens per second (real-time throughput)
-npu_proxy_tokens_per_second{model="tinyllama"}
+- `/health` is **observational only**
+- it does **not** auto-load LLM or embedding models
+- it reports not-loaded state explicitly in engine messages
 
-# Gauge: Currently loaded models
-npu_proxy_loaded_models{model="tinyllama"}
+### `/health/liveness`
 
-# Counter: Tokens generated
-npu_proxy_tokens_generated_total{model="tinyllama"}
-```
+Current response includes:
 
-## 13. References
+- `status = "alive"`
+- `alive = true`
+- `version`
 
-### Official Documentation
+### `/health/readiness`
 
-| Resource | URL |
-|----------|-----|
-| OpenVINO GenAI NPU Guide | https://docs.openvino.ai/2024/learn-openvino/llm_inference_guide/genai-guide-npu.html |
-| OpenVINO GenAI GitHub | https://github.com/openvinotoolkit/openvino.genai |
-| Intel NPU Driver (Linux) | https://github.com/intel/linux-npu-driver |
-| OpenVINO Toolkit | https://github.com/openvinotoolkit/openvino |
+Current behavior:
 
-### API Compatibility References
+- returns readiness for warmed runtime state
+- is observational only
+- returns explicit reasons when the configured LLM or embedding model is not loaded
+- uses HTTP `503` when the service is alive but not ready to serve warmed traffic
 
-| Resource | URL |
-|----------|-----|
-| Ollama API Docs | https://github.com/ollama/ollama/blob/main/docs/api.md |
-| OpenAI API Reference | https://platform.openai.com/docs/api-reference |
+### `/health/devices`
 
-### Research & Implementation References
+Current response includes:
 
-| Resource | URL | Usage |
-|----------|-----|-------|
-| vLLM | https://github.com/vllm-project/vllm | Metrics patterns, TTFT/TPOT |
-| FastEmbed | https://github.com/qdrant/fastembed | Embedding optimization |
-| TGI | https://github.com/huggingface/text-generation-inference | Streaming patterns |
-| tiktoken | https://github.com/openai/tiktoken | Token counting accuracy |
+- `available_devices`
+- `active_device`
+- `device_info`
+- `fallback_chain`
 
-## 14. Project Structure
+## Known operational constraints
 
-```
-npu-proxy/
-├── npu_proxy/
-│   ├── api/
-│   │   ├── chat.py           # OpenAI chat endpoint
-│   │   ├── embeddings.py     # OpenAI embeddings endpoint
-│   │   ├── health.py         # Health checks
-│   │   ├── metrics.py        # Prometheus endpoint
-│   │   ├── models.py         # Model listing
-│   │   └── ollama.py         # Ollama-compatible endpoints
-│   ├── inference/
-│   │   ├── engine.py         # LLM inference engine
-│   │   ├── embedding_engine.py # Embedding engine
-│   │   ├── streaming.py      # AsyncTokenStream
-│   │   └── tokenizer.py      # Token counting
-│   ├── models/
-│   │   ├── registry.py       # Model catalog
-│   │   ├── downloader.py     # HuggingFace download
-│   │   ├── converter.py      # Model conversion
-│   │   ├── mapper.py         # Name resolution
-│   │   ├── parameter_mapper.py # Param translation
-│   │   └── ollama_defaults.py # Default values
-│   ├── routing/
-│   │   └── context_router.py # Context-aware routing
-│   ├── main.py               # FastAPI app
-│   ├── metrics.py            # Prometheus metrics
-│   └── cli.py                # CLI entry point
-├── tests/                    # 300+ test files
-├── scripts/                  # Build and launch scripts
-├── packaging/                # systemd service files
-├── docs/                     # Additional documentation
-├── pyproject.toml            # Project metadata
-├── requirements.txt          # Dependencies
-└── LICENSE                   # MIT License
-```
+- Native host deployment is the documented path
+- Real inference requires local model directories to exist first
+- Mock mode is the default
+- OpenAI streaming and Ollama streaming use different wire formats
+- Routing is advisory only in this release; per-request LLM device switching is not implemented
+- The repository contains packaging assets and manifests, but this spec only claims what exists in-tree
 
-## 15. GitHub Repository
+## Related docs
 
-**Public Repository**: https://github.com/MrFixit96/npu-proxy
-
----
-
-*Document Version*: 1.0.0  
-*Last Updated*: February 2026  
-*Status*: Production Ready
+- [README.md](README.md)
+- [docs/api/OLLAMA_API.md](docs/api/OLLAMA_API.md)
+- [docs/api/EMBEDDINGS.md](docs/api/EMBEDDINGS.md)
+- [docs/api/STREAMING.md](docs/api/STREAMING.md)

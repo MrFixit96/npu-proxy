@@ -1,199 +1,254 @@
-"""Token counting utilities with configurable precision levels.
+"""Tokenizer-backed token counting helpers."""
 
-This module provides token counting functionality for text processing,
-supporting multiple precision modes to balance accuracy vs performance:
+from __future__ import annotations
 
-- **FAST**: Character-ratio estimation (~4 chars/token), ~85% accurate, 20x faster
-- **APPROXIMATE**: Regex-based BPE approximation, ~95% accurate (default)
-- **EXACT**: Full tokenizer (requires model), 100% accurate
-
-For most routing and context-window decisions, APPROXIMATE is sufficient.
-Use EXACT only when billing accuracy or strict token limits are critical.
-
-Example:
-    >>> from npu_proxy.inference.tokenizer import count_tokens, TokenCountPrecision
-    >>> text = "Hello, how are you today?"
-    >>> count_tokens(text)  # Default: APPROXIMATE
-    6
-    >>> count_tokens(text, precision=TokenCountPrecision.FAST)
-    6
-"""
-
+import logging
+import os
 import re
+from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
+from functools import lru_cache
+from pathlib import Path
+from typing import Any, Optional
+
+from npu_proxy.models.registry import DEFAULT_MODEL_DIR
+
+logger = logging.getLogger(__name__)
 
 
 class TokenCountPrecision(Enum):
-    """Precision levels for token counting.
-
-    Attributes:
-        FAST: Character-ratio estimation (~4 chars/token).
-            Accuracy: ~85%, Performance: 20x faster than APPROXIMATE.
-            Best for: Quick estimates, high-volume processing.
-        APPROXIMATE: Regex-based BPE approximation.
-            Accuracy: ~95%, Performance: Baseline.
-            Best for: Context routing, general-purpose counting.
-        EXACT: Full tokenizer using the model's actual tokenization.
-            Accuracy: 100%, Performance: Slowest (requires model).
-            Best for: Billing, strict limit enforcement.
-    """
+    """Precision levels for token counting."""
 
     FAST = "fast"
     APPROXIMATE = "approximate"
     EXACT = "exact"
 
 
-# Regex pattern approximating BPE tokenization behavior.
-# Splits on whitespace, punctuation, contractions, and number sequences.
+@dataclass(frozen=True)
+class TokenCountResult:
+    """Detailed token counting result."""
+
+    count: int
+    requested_precision: TokenCountPrecision
+    achieved_precision: TokenCountPrecision
+    model: str | None = None
+    tokenizer_backend: str | None = None
+    fallback_reason: str | None = None
+
+    @property
+    def exact(self) -> bool:
+        """Return True when exact tokenizer accounting was used."""
+
+        return self.achieved_precision == TokenCountPrecision.EXACT
+
+
 _TOKEN_PATTERN = re.compile(
     r"""
-    '[a-zA-Z]+        # Contractions like 's, 're, 'll
-    |[a-zA-Z]+        # Words
-    |[0-9]+           # Numbers
-    |[^\s\w]          # Punctuation and special chars
+    '[a-zA-Z]+
+    |[a-zA-Z]+
+    |[0-9]+
+    |[^\s\w]
 """,
     re.VERBOSE,
 )
-
-# Average characters per token for FAST estimation.
-# Empirically derived from English text on GPT-style tokenizers.
 _CHARS_PER_TOKEN = 4
+_TOKENIZER_FILES = (
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "config.json",
+)
 
 
 def _count_tokens_fast(text: str) -> int:
-    """Count tokens using character-ratio estimation.
+    """Estimate token count using a character ratio."""
 
-    Uses the heuristic of ~4 characters per token, which is reasonably
-    accurate for English text with GPT-style BPE tokenizers.
-
-    Args:
-        text: The text to estimate token count for.
-
-    Returns:
-        Estimated token count based on character length.
-
-    Note:
-        Accuracy is approximately 85% compared to exact tokenization.
-        Performance is ~20x faster than regex-based counting.
-    """
-    return len(text) // _CHARS_PER_TOKEN
+    return max(1, len(text) // _CHARS_PER_TOKEN) if text else 0
 
 
 def _count_tokens_regex(text: str) -> int:
-    """Count tokens using regex-based BPE approximation.
+    """Approximate token count using a regex split."""
 
-    Applies a regex pattern that mimics BPE tokenization by splitting
-    on word boundaries, contractions, numbers, and punctuation.
+    return len(_TOKEN_PATTERN.findall(text))
 
-    Args:
-        text: The text to count tokens in.
 
-    Returns:
-        Token count based on regex pattern matching.
+def _model_root() -> Path:
+    return Path(os.environ.get("NPU_PROXY_MODEL_DIR", DEFAULT_MODEL_DIR)).expanduser().resolve()
 
-    Note:
-        Accuracy is approximately 95% compared to exact tokenization.
-        This is the recommended default for most use cases.
+
+def _resolve_trusted_local_model_path(model_path: str | Path | None) -> Path | None:
+    """Resolve an operator-provided local tokenizer path.
+
+    This helper is intentionally separate from request-facing model-id
+    resolution: callers must only use it for trusted local configuration.
     """
-    tokens = _TOKEN_PATTERN.findall(text)
-    return len(tokens)
+    if not model_path:
+        return None
+    resolved = Path(model_path).expanduser().resolve()
+    return resolved if resolved.exists() else None
 
 
-def _count_tokens_exact(text: str) -> int:
-    """Count tokens using exact tokenization.
+def _resolve_model_path(model: str | None) -> Path | None:
+    """Resolve a request-facing model id under the configured model root."""
 
-    Placeholder for full tokenizer integration. Currently falls back
-    to regex-based counting until a model tokenizer is configured.
+    if not model:
+        return None
 
-    Args:
-        text: The text to tokenize exactly.
+    raw_model = str(model)
+    candidate = Path(raw_model)
+    if candidate.is_absolute() or ".." in candidate.parts:
+        logger.warning("Rejected unsafe tokenizer model id: %s", raw_model)
+        return None
 
-    Returns:
-        Exact token count (currently falls back to regex).
+    model_root = _model_root()
+    model_path = (model_root / raw_model).resolve()
+    try:
+        model_path.relative_to(model_root)
+    except ValueError:
+        logger.warning("Rejected tokenizer model id outside model root: %s", raw_model)
+        return None
+    return model_path if model_path.exists() else None
 
-    Todo:
-        Integrate with tiktoken or model-specific tokenizer for
-        true exact counting when model context is available.
-    """
-    # TODO: Integrate actual tokenizer (e.g., tiktoken) when available
-    return _count_tokens_regex(text)
+
+def _has_tokenizer_assets(model_path: Path | None) -> bool:
+    """Return True when a model directory looks tokenizer-capable."""
+
+    return bool(model_path and model_path.is_dir() and any((model_path / name).exists() for name in _TOKENIZER_FILES))
+
+
+@lru_cache(maxsize=8)
+def get_model_tokenizer(model: str | None) -> Any | None:
+    """Load and cache a local tokenizer for a model."""
+
+    model_path = _resolve_model_path(model)
+    if not _has_tokenizer_assets(model_path):
+        return None
+
+    try:
+        from transformers import AutoTokenizer
+    except Exception as exc:  # pragma: no cover - dependency failure is environment-specific
+        logger.debug("transformers unavailable for tokenizer loading: %s", exc)
+        return None
+
+    try:
+        return AutoTokenizer.from_pretrained(
+            str(model_path),
+            local_files_only=True,
+            trust_remote_code=False,
+            use_fast=True,
+        )
+    except Exception as exc:
+        logger.warning("Unable to load tokenizer for %s from %s: %s", model, model_path, exc)
+        return None
+
+
+def clear_tokenizer_cache() -> None:
+    """Clear the cached tokenizer instances."""
+
+    get_model_tokenizer.cache_clear()
+
+
+def _count_tokens_exact(text: str, model: str | None = None) -> int:
+    """Count tokens with the model tokenizer."""
+
+    tokenizer = get_model_tokenizer(model)
+    if tokenizer is None:
+        raise LookupError(f"No tokenizer available for model '{model}'")
+
+    encoded = tokenizer(
+        text,
+        add_special_tokens=False,
+        return_attention_mask=False,
+        return_token_type_ids=False,
+    )
+    input_ids = encoded["input_ids"]
+    if input_ids and isinstance(input_ids[0], list):
+        return len(input_ids[0])
+    return len(input_ids)
+
+
+def count_tokens_with_details(
+    text: str,
+    precision: TokenCountPrecision = TokenCountPrecision.APPROXIMATE,
+    model: str | None = None,
+) -> TokenCountResult:
+    """Count tokens and report how the count was produced."""
+
+    if not text or not text.strip():
+        return TokenCountResult(
+            count=0,
+            requested_precision=precision,
+            achieved_precision=precision,
+            model=model,
+        )
+
+    if precision == TokenCountPrecision.FAST:
+        return TokenCountResult(
+            count=_count_tokens_fast(text),
+            requested_precision=precision,
+            achieved_precision=TokenCountPrecision.FAST,
+            model=model,
+        )
+
+    if precision == TokenCountPrecision.EXACT:
+        try:
+            return TokenCountResult(
+                count=_count_tokens_exact(text, model=model),
+                requested_precision=precision,
+                achieved_precision=TokenCountPrecision.EXACT,
+                model=model,
+                tokenizer_backend="transformers",
+            )
+        except Exception as exc:
+            logger.warning("Exact token counting failed for model %s; using approximate count: %s", model, exc)
+            return TokenCountResult(
+                count=_count_tokens_regex(text),
+                requested_precision=precision,
+                achieved_precision=TokenCountPrecision.APPROXIMATE,
+                model=model,
+                fallback_reason=str(exc),
+            )
+
+    return TokenCountResult(
+        count=_count_tokens_regex(text),
+        requested_precision=precision,
+        achieved_precision=TokenCountPrecision.APPROXIMATE,
+        model=model,
+    )
+
+
+def count_tokens_best_effort(text: str, model: str | None = None) -> TokenCountResult:
+    """Prefer exact tokenizer counts and fall back safely when unavailable."""
+
+    return count_tokens_with_details(
+        text,
+        precision=TokenCountPrecision.EXACT,
+        model=model,
+    )
 
 
 def count_tokens(
     text: str,
     precision: TokenCountPrecision = TokenCountPrecision.APPROXIMATE,
+    model: str | None = None,
 ) -> int:
-    """Count tokens in text with configurable precision.
+    """Count tokens in text."""
 
-    Provides three precision levels to balance accuracy vs performance.
-    The default APPROXIMATE mode offers a good trade-off for most use cases.
-
-    Args:
-        text: Text to count tokens in.
-        precision: Counting precision level.
-            - FAST: Character ratio (4 chars/token), ~85% accurate, 20x faster
-            - APPROXIMATE: Regex-based, ~95% accurate (default)
-            - EXACT: Full tokenization, 100% accurate (requires model)
-
-    Returns:
-        Estimated or exact token count depending on precision level.
-
-    Examples:
-        >>> count_tokens("Hello, world!")
-        3
-        >>> count_tokens("Hello, world!", TokenCountPrecision.FAST)
-        3
-        >>> count_tokens("The quick brown fox", TokenCountPrecision.APPROXIMATE)
-        4
-
-    Note:
-        For context-aware routing, APPROXIMATE is sufficient.
-        Use EXACT only when billing or strict token limits matter.
-        Empty or whitespace-only strings return 0.
-    """
-    if not text or not text.strip():
-        return 0
-
-    if precision == TokenCountPrecision.FAST:
-        return _count_tokens_fast(text)
-    elif precision == TokenCountPrecision.EXACT:
-        return _count_tokens_exact(text)
-    else:
-        return _count_tokens_regex(text)
+    return count_tokens_with_details(text, precision=precision, model=model).count
 
 
 def count_tokens_safe(
     text: str,
     precision: TokenCountPrecision = TokenCountPrecision.APPROXIMATE,
     fallback_to_words: bool = True,
+    model: str | None = None,
 ) -> int:
-    """Count tokens with error handling and optional fallback.
+    """Count tokens with optional word-count fallback."""
 
-    Wraps count_tokens with exception handling. On error, can fall back
-    to simple word splitting as a last resort.
-
-    Args:
-        text: Text to count tokens in.
-        precision: Counting precision level (see count_tokens).
-        fallback_to_words: If True, falls back to word-split counting
-            on error. If False, re-raises the exception.
-
-    Returns:
-        Token count, or word count if fallback is triggered.
-
-    Raises:
-        Exception: Re-raised if counting fails and fallback_to_words is False.
-
-    Examples:
-        >>> count_tokens_safe("Hello world")
-        2
-        >>> count_tokens_safe("", fallback_to_words=True)
-        0
-    """
     try:
-        return count_tokens(text, precision=precision)
-    except Exception:
+        return count_tokens(text, precision=precision, model=model)
+    except Exception as exc:
+        logger.warning("Token counting failed; using word-count fallback: %s", exc)
         if fallback_to_words:
             return len(text.split()) if text else 0
         raise
@@ -202,44 +257,18 @@ def count_tokens_safe(
 def count_prompt_tokens(
     prompt: str,
     precision: TokenCountPrecision = TokenCountPrecision.APPROXIMATE,
+    model: Optional[str] = None,
 ) -> int:
-    """Count tokens in a prompt string.
+    """Count tokens in a prompt string."""
 
-    Convenience wrapper for count_tokens, semantically indicating
-    the text is a user/system prompt.
-
-    Args:
-        prompt: The prompt text to count tokens in.
-        precision: Counting precision level (see count_tokens).
-
-    Returns:
-        Token count for the prompt.
-
-    Examples:
-        >>> count_prompt_tokens("Summarize the following article:")
-        4
-    """
-    return count_tokens(prompt, precision=precision)
+    return count_tokens(prompt, precision=precision, model=model)
 
 
 def count_completion_tokens(
     completion: str,
     precision: TokenCountPrecision = TokenCountPrecision.APPROXIMATE,
+    model: Optional[str] = None,
 ) -> int:
-    """Count tokens in a completion/response string.
+    """Count tokens in generated completion text."""
 
-    Convenience wrapper for count_tokens, semantically indicating
-    the text is a model completion/response.
-
-    Args:
-        completion: The completion text to count tokens in.
-        precision: Counting precision level (see count_tokens).
-
-    Returns:
-        Token count for the completion.
-
-    Examples:
-        >>> count_completion_tokens("The answer is 42.")
-        5
-    """
-    return count_tokens(completion, precision=precision)
+    return count_tokens(completion, precision=precision, model=model)

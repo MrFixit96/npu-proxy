@@ -138,16 +138,42 @@ def test_live_server_reports_health_and_versions(live_server: str) -> None:
     """The deployed server should expose health and version endpoints."""
     with httpx.Client(base_url=live_server, timeout=5.0) as client:
         health = client.get("/health")
+        liveness = client.get("/health/liveness")
+        readiness = client.get("/health/readiness")
+        devices = client.get("/health/devices")
         version = client.get("/api/version")
 
     assert health.status_code == 200
     health_data = health.json()
-    assert health_data["status"] == "healthy"
+    assert health_data["status"] in {"healthy", "degraded"}
     assert isinstance(health_data["version"], str)
     assert health_data["version"]
     assert isinstance(health_data["devices"], list)
     assert isinstance(health_data["openvino_version"], str)
     assert health_data["openvino_version"]
+    assert isinstance(health_data["engines"]["llm"]["backend"], str)
+    assert "compile_cache_mode" in health_data["engines"]["llm"]
+    assert "runtime_features" in health_data["engines"]["llm"]
+    assert "message" in health_data["engines"]["llm"]
+    assert "message" in health_data["engines"]["embedding"]
+
+    assert liveness.status_code == 200
+    liveness_data = liveness.json()
+    assert liveness_data["status"] == "alive"
+    assert liveness_data["alive"] is True
+
+    assert readiness.status_code in {200, 503}
+    readiness_data = readiness.json()
+    assert isinstance(readiness_data["ready"], bool)
+    assert isinstance(readiness_data["reasons"], list)
+
+    assert devices.status_code == 200
+    devices_data = devices.json()
+    assert "active_backend" in devices_data
+    assert "llm" in devices_data
+    assert "embedding" in devices_data
+    assert "runtime_state" in devices_data["llm"]
+    assert "runtime_state" in devices_data["embedding"]
 
     assert version.status_code == 200
     version_data = version.json()

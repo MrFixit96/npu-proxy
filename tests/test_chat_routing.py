@@ -39,7 +39,7 @@ class TestChatEndpointRouting:
         assert "X-NPU-Proxy-Token-Count" in response.headers
     
     def test_short_prompt_routes_to_npu(self, client):
-        """Short prompts should route to NPU."""
+        """Short prompts should report the configured single-engine device."""
         with patch.dict(os.environ, {"NPU_PROXY_TOKEN_LIMIT": "1800"}):
             from npu_proxy.routing.context_router import reset_context_router
             reset_context_router()
@@ -51,10 +51,10 @@ class TestChatEndpointRouting:
         
         assert response.status_code == 200
         assert response.headers.get("X-NPU-Proxy-Device") == "NPU"
-        assert response.headers.get("X-NPU-Proxy-Route-Reason") == "within_npu_limit"
+        assert response.headers.get("X-NPU-Proxy-Route-Reason") == "single_engine_runtime"
     
     def test_long_prompt_routes_to_cpu(self, client):
-        """Long prompts should route to CPU."""
+        """Long prompts should not claim per-request fallback execution."""
         # Create a very long prompt that exceeds token limit
         long_content = "word " * 2000
         
@@ -68,8 +68,8 @@ class TestChatEndpointRouting:
             })
         
         assert response.status_code == 200
-        assert response.headers.get("X-NPU-Proxy-Device") == "CPU"
-        assert response.headers.get("X-NPU-Proxy-Route-Reason") == "prompt_exceeds_npu_limit"
+        assert response.headers.get("X-NPU-Proxy-Device") == "NPU"
+        assert response.headers.get("X-NPU-Proxy-Route-Reason") == "single_engine_runtime"
     
     def test_token_count_header_is_integer(self, client):
         """X-NPU-Proxy-Token-Count should be a valid integer."""
@@ -99,7 +99,7 @@ class TestOllamaEndpointRouting:
         assert "X-NPU-Proxy-Device" in response.headers
     
     def test_generate_long_prompt_routes_to_cpu(self, client):
-        """Long prompts in /api/generate should route to CPU."""
+        """Long prompts in /api/generate should report the singleton runtime device."""
         long_prompt = "word " * 2000
         
         with patch.dict(os.environ, {"NPU_PROXY_TOKEN_LIMIT": "1800"}):
@@ -113,7 +113,7 @@ class TestOllamaEndpointRouting:
             })
         
         assert response.status_code == 200
-        assert response.headers.get("X-NPU-Proxy-Device") == "CPU"
+        assert response.headers.get("X-NPU-Proxy-Device") == "NPU"
     
     def test_chat_api_includes_routing_headers(self, client):
         """Ollama /api/chat should include routing headers."""
@@ -131,7 +131,7 @@ class TestRoutingConfiguration:
     """Tests for routing configuration via environment variables."""
     
     def test_custom_token_limit(self):
-        """Custom token limit should be respected."""
+        """Custom token limits should not change the reported singleton runtime device."""
         # Set a very low limit before creating client
         with patch.dict(os.environ, {"NPU_PROXY_TOKEN_LIMIT": "10"}):
             from npu_proxy.routing.context_router import reset_context_router
@@ -146,10 +146,10 @@ class TestRoutingConfiguration:
             })
         
         assert response.status_code == 200
-        assert response.headers.get("X-NPU-Proxy-Device") == "CPU"
+        assert response.headers.get("X-NPU-Proxy-Device") == "NPU"
     
     def test_custom_fallback_device(self):
-        """Custom fallback device should be used."""
+        """Custom fallback device remains advisory until per-request routing is implemented."""
         with patch.dict(os.environ, {
             "NPU_PROXY_TOKEN_LIMIT": "10",
             "NPU_PROXY_FALLBACK_DEVICE": "GPU"
@@ -166,4 +166,21 @@ class TestRoutingConfiguration:
             })
         
         assert response.status_code == 200
+        assert response.headers.get("X-NPU-Proxy-Device") == "NPU"
+
+    def test_configured_device_controls_reported_single_engine_device(self):
+        """The reported device should follow the configured singleton runtime."""
+        with patch.dict(os.environ, {"NPU_PROXY_DEVICE": "GPU"}):
+            from npu_proxy.routing.context_router import reset_context_router
+            reset_context_router()
+            from npu_proxy.main import app
+            client = TestClient(app)
+
+            response = client.post("/v1/chat/completions", json={
+                "model": "tinyllama-1.1b-chat-int4-ov",
+                "messages": [{"role": "user", "content": "Hello!"}],
+            })
+
+        assert response.status_code == 200
         assert response.headers.get("X-NPU-Proxy-Device") == "GPU"
+        assert response.headers.get("X-NPU-Proxy-Route-Reason") == "single_engine_runtime"

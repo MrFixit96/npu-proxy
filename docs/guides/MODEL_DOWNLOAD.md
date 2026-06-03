@@ -1,138 +1,241 @@
-# Downloading and Setting Up Embedding Models
+# Model Download Guide
 
-## Overview
+This guide documents the **current** model-download behavior in this repository.
 
-The npu-proxy service requires embedding models to be downloaded and converted to OpenVINO IR format before use. This process prepares models for efficient inference on Intel NPU, GPU, or CPU devices. The conversion step is handled automatically by the download script, but manual conversion is also supported for advanced use cases.
+## Scope
 
-## Quick Start
+There are two separate model flows in-tree today:
 
-To download and convert the default embedding model (bge-small) with a single command:
+1. **LLM model directories** used by real chat/generate inference
+2. **Embedding model exports** used by the embedding engine
 
-```bash
-python scripts/download_model.py download bge-small
+## LLM models
+
+Real LLM inference expects a local OpenVINO model directory under:
+
+```text
+~/.cache/npu-proxy/models/<model-id>
 ```
 
-This command will:
-1. Download the model from HuggingFace
-2. Convert it to OpenVINO IR format
-3. Store it in the standard cache location
+The default model directory is:
 
-## Supported Models
-
-The following embedding models are currently supported:
-
-| Ollama Name | HuggingFace Repo | Dimensions |
-|-------------|------------------|------------|
-| bge-small | BAAI/bge-small-en-v1.5 | 384 |
-| bge-base | BAAI/bge-base-en-v1.5 | 768 |
-| bge-large | BAAI/bge-large-en-v1.5 | 1024 |
-| all-minilm | sentence-transformers/all-MiniLM-L6-v2 | 384 |
-| nomic-embed-text | nomic-ai/nomic-embed-text-v1.5 | 768 |
-
-The model name provided to npu-proxy should match the "Ollama Name" column. Each model offers different trade-offs between dimensionality, performance, and accuracy.
-
-## Manual Download
-
-For advanced users or custom model conversions, you can use the optimum-cli tool directly:
-
-```bash
-optimum-cli export openvino --task feature-extraction --model BAAI/bge-small-en-v1.5 ~/.cache/npu-proxy/models/embeddings/BAAI_bge-small-en-v1.5
+```text
+~/.cache/npu-proxy/models
 ```
 
-Replace the model repository path with your desired model from HuggingFace. The output directory structure should follow the pattern: `~/.cache/npu-proxy/models/embeddings/{MODEL_NAME}/`.
+The default LLM model ID is:
 
-## Storage Location
-
-Downloaded and converted embedding models are stored in:
-
-```
-~/.cache/npu-proxy/models/embeddings/
+```text
+tinyllama-1.1b-chat-int4-ov
 ```
 
-Each model is organized in its own subdirectory named after the HuggingFace repository path (with forward slashes converted to underscores). For example:
-- `BAAI_bge-small-en-v1.5/`
-- `BAAI_bge-base-en-v1.5/`
-- `sentence-transformers_all-MiniLM-L6-v2/`
+So the default model path used by the LLM engine is:
 
-This location can be overridden by setting the `NPU_PROXY_MODEL_CACHE_DIR` environment variable.
-
-## Environment Variables
-
-The following environment variables control embedding model behavior:
-
-### NPU_PROXY_EMBEDDING_MODEL
-
-Sets the default embedding model name. Must correspond to one of the supported model names listed above.
-
-```bash
-export NPU_PROXY_EMBEDDING_MODEL=bge-base
+```text
+~/.cache/npu-proxy/models/tinyllama-1.1b-chat-int4-ov
 ```
 
-### NPU_PROXY_EMBEDDING_DEVICE
+Example direct Hugging Face download:
 
-Specifies the device for embedding model inference. Supported values are:
-
-- `CPU` - Run on CPU (always available, slower inference)
-- `GPU` - Run on discrete GPU (if available)
-- `NPU` - Run on Intel NPU (if driver installed)
-
-```bash
-export NPU_PROXY_EMBEDDING_DEVICE=NPU
+```powershell
+pip install huggingface-hub
+hf download OpenVINO/TinyLlama-1.1B-Chat-v1.0-int4-ov --local-dir "$HOME\.cache\npu-proxy\models\tinyllama-1.1b-chat-int4-ov"
 ```
 
-If not set, the service will attempt to use NPU, then GPU, then fall back to CPU.
+You can also use the Ollama-compatible API while the proxy is running on its default loopback address:
+
+```powershell
+curl.exe -X POST http://127.0.0.1:8080/api/pull `
+  -H "Content-Type: application/json" `
+  -d '{"name":"tinyllama","stream":false}'
+```
+
+### Download safety limits
+
+The in-process downloader in `npu_proxy.models.downloader` uses `huggingface_hub` and does **not** pull arbitrary repository contents by default. It validates the Hugging Face manifest before downloading:
+
+- default downloads use Hugging Face `allow_patterns` built from the required OpenVINO files plus safe config/tokenizer patterns (`openvino_*.xml`, `openvino_*.bin`, `config.json`, tokenizer files, and related metadata)
+- each selected file is capped at 8 GiB
+- the selected download set is capped at 16 GiB total
+- the selected download set is capped at 64 files
+- unexpected unsafe filenames are rejected
+
+Full-snapshot download is opt-in in the Python API only:
+
+```python
+from npu_proxy.models.downloader import download_model
+
+result = download_model("tinyllama", full_snapshot=True)
+```
+
+The parameter name is `full_snapshot`. It defaults to `False`. The `/api/pull` endpoint and `get_download_progress()` use the safe allow-pattern workflow and do not expose a full-snapshot request flag.
+
+### Public vs private Hugging Face pulls
+
+`/api/pull` supports both:
+
+- **public repos** with no token
+- **private repos** with an explicit Hugging Face token
+
+For private repos, provide the token either in the request body or as a Bearer token header:
+
+```powershell
+curl.exe -X POST http://127.0.0.1:8080/api/pull `
+  -H "Content-Type: application/json" `
+  -H "Authorization: Bearer hf_xxx" `
+  -d '{"name":"your-org/private-model","stream":false}'
+```
+
+The service does **not** silently reuse ambient Hugging Face credentials for arbitrary user-selected pulls. That keeps the server from acting like a skeleton key for any repo the operator can access.
+
+### Validation note
+
+During this release pass, the real OpenVINO LLM path was certified successfully on Intel NPU for `/api/generate`. Compile cache benefit was also observed on the validation workstation, but cache settings do not change the on-disk model layout documented here.
+
+## Embedding models
+
+### Runtime expectation
+
+The embedding runtime looks for exported models at:
+
+```text
+~/.cache/npu-proxy/models/embeddings/<canonical-id-or-sanitized-repo>
+```
+
+Examples:
+
+```text
+~/.cache/npu-proxy/models/embeddings/all-minilm-l6-v2
+~/.cache/npu-proxy/models/embeddings/bge-small
+```
+
+Known registry-backed models use canonical runtime IDs such as `all-minilm-l6-v2` and `bge-small`. Direct or unknown repo IDs fall back to a sanitized repo-name directory such as `BAAI_bge-small-en-v1.5`, which is also still accepted as a legacy compatibility path.
+
+Current workstation truth: this path documents how the runtime finds an embedding export. `all-minilm-l6-v2` validated on `NPU` here via a static-shape profile, while `bge-small` on `NPU` still failed because the Intel NPU plugin raised `check_sdpa_nodes(model)`.
+
+### Reliable manual export path
+
+If you want the runtime to auto-detect an embedding model today, export directly into the runtime path:
+
+```powershell
+optimum-cli export openvino `
+  --task feature-extraction `
+  --model sentence-transformers/all-MiniLM-L6-v2 `
+  "$HOME\.cache\npu-proxy\models\embeddings\all-minilm-l6-v2"
+```
+
+For `bge-small`, the canonical runtime path is:
+
+```powershell
+optimum-cli export openvino `
+  --task feature-extraction `
+  --model BAAI/bge-small-en-v1.5 `
+  "$HOME\.cache\npu-proxy\models\embeddings\bge-small"
+```
+
+### Helper script
+
+This repository also includes:
+
+```powershell
+python scripts\download_model.py download all-minilm
+python scripts\download_model.py list
+python scripts\download_model.py info all-minilm
+```
+
+Current helper-script behavior:
+
+- supports `download`, `list`, and `info`
+- `download` accepts `--force`, `--revision`, and `--timeout-seconds`
+- resolves short aliases such as `bge-small`, `e5-large`, and `all-minilm`
+- exports via `optimum-cli export openvino --task feature-extraction`
+- uses `NPU_PROXY_DOWNLOAD_TIMEOUT` as the default timeout source when set, otherwise 3600 seconds
+- prints the cache path it used
+- writes Hugging Face source/revision metadata when available
+
+### Important truth note
+
+The helper script now resolves known embedding aliases into the same runtime cache path that the service probes, including canonical IDs such as `all-minilm-l6-v2`.
+
+### Validated NPU recipe
+
+On the validation workstation, the strongest first-class NPU embedding path is:
+
+```powershell
+python scripts\download_model.py download all-minilm
+$env:NPU_PROXY_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+$env:NPU_PROXY_EMBEDDING_DEVICE = "NPU"
+```
+
+Restart the service after changing the environment so the new defaults are loaded.
+
+## Alpha GGUF path (source installs only)
+
+This repository also contains an alpha-gated `llama.cpp` backend path for local `.gguf` files.
+
+Current truth:
+
+- it is **not** the default runtime path
+- it is **feature-gated**
+- it is currently **CPU-only**
+- it is **source-install only** because `llama-cpp-python` is not part of the default package dependencies or packaging assets
+
+If you are experimenting from a source checkout, the required opt-in variables are:
+
+```powershell
+$env:NPU_PROXY_LLM_BACKEND = "llama_cpp"
+$env:NPU_PROXY_ENABLE_ALPHA_BACKENDS = "1"
+$env:NPU_PROXY_DEVICE = "CPU"
+$env:NPU_PROXY_LLAMACPP_MODEL_PATH = "C:\path\to\model.gguf"
+```
+
+This guide does **not** claim that the alpha GGUF path is release-validated on the workstation used for this docs pass.
+
+## Supported helper aliases
+
+Current alias resolution in `scripts\download_model.py` supports aliases from `npu_proxy.models.mapper`, including:
+
+- `bge-small`
+- `bge-base`
+- `bge-large`
+- `e5-small`
+- `e5-large`
+- `all-minilm`
+- `nomic-embed-text`
+
+Direct Hugging Face repo IDs also work.
+
+## Embedding configuration
+
+| Variable | Default | Notes |
+|---|---|---|
+| `NPU_PROXY_EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | Configured embedding model repo |
+| `NPU_PROXY_EMBEDDING_DEVICE` | `CPU` | Current default device |
 
 ## Troubleshooting
 
-### "Model not found" Error
+### Real embedding model not picked up
 
-If you receive a "Model not found" error when starting the service:
+Check that the exported files exist in the runtime path the service expects:
 
-1. Verify the model has been downloaded:
-   ```bash
-   python scripts/download_model.py download bge-small
-   ```
-
-2. Check that the model exists in the cache directory:
-   ```bash
-   ls ~/.cache/npu-proxy/models/embeddings/
-   ```
-
-3. Ensure the model name in your configuration matches one of the supported models listed above.
-
-### "OpenVINO GenAI not available" Error
-
-This indicates that the openvino-genai library is not installed. Install it with:
-
-```bash
-pip install openvino-genai
+```text
+~/.cache/npu-proxy/models/embeddings/<canonical-id-or-sanitized-repo>/
+  openvino_model.xml
+  openvino_model.bin
 ```
 
-### NPU Device Not Detected
+### `optimum-cli` not found
 
-If the service cannot detect your Intel NPU:
+Install the exporter:
 
-1. Verify the Intel NPU driver is installed on your system.
-2. Check driver installation status:
-   ```bash
-   # On Linux
-   lsmod | grep vpu
-   
-   # On Windows
-   # Check Device Manager for Intel AI Boost Neural Processing Unit
-   ```
+```powershell
+pip install "optimum-intel[openvino]"
+```
 
-3. Set the device explicitly to CPU as a fallback:
-   ```bash
-   export NPU_PROXY_EMBEDDING_DEVICE=CPU
-   ```
+### Embedding requests fail by default
 
-4. If the driver is installed but still not detected, refer to the Intel NPU driver documentation for your operating system.
+The default behavior is now to fail embedding requests when the configured runtime-ready model is missing or unusable. Only set `NPU_PROXY_EMBEDDING_FALLBACK_MODE=hash` when you explicitly want deterministic hash fallback for operator testing or wiring checks. See [../api/EMBEDDINGS.md](../api/EMBEDDINGS.md) for the runtime behavior details.
 
-### Out of Memory Errors
+### NPU embedding export still does not validate
 
-If you encounter memory errors during model conversion or inference:
-
-1. Consider using a smaller model (bge-small or all-minilm) instead of larger variants
-2. Ensure sufficient free disk space (at least 1GB) for model downloads
-3. Run the download script on a machine with more available RAM if conversion fails
+If your export exists but NPU execution still fails, do not assume the export is release-ready. On the validation workstation for this docs pass, `all-minilm-l6-v2` worked on `NPU` via a static-shape profile, while `BAAI/bge-small-en-v1.5` on `NPU` still failed inside the Intel NPU plugin with `check_sdpa_nodes(model)`.

@@ -4,18 +4,39 @@
 #
 # Usage: sudo ./install_linux.sh
 #
-set -e
+set -euo pipefail
 
 # Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+RED='[0;31m'
+GREEN='[0;32m'
+YELLOW='[1;33m'
+NC='[0m' # No Color
 
-echo -e "${GREEN}Installing NPU Proxy...${NC}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+SERVICE_SOURCE="${PROJECT_ROOT}/packaging/npu-proxy.service"
+ENV_SOURCE="${PROJECT_ROOT}/packaging/npu-proxy.environment"
+
+require_file() {
+    local path="$1"
+    if [[ ! -f "${path}" ]]; then
+        echo -e "${RED}Required file not found: ${path}${NC}" >&2
+        exit 1
+    fi
+}
+
+require_file "${SERVICE_SOURCE}"
+require_file "${ENV_SOURCE}"
+
+if [[ ! -f "${PROJECT_ROOT}/pyproject.toml" ]]; then
+    echo -e "${RED}Project root is missing pyproject.toml: ${PROJECT_ROOT}${NC}" >&2
+    exit 1
+fi
+
+echo -e "${GREEN}Installing NPU Proxy from ${PROJECT_ROOT}...${NC}"
 
 # Check for root
-if [ "$EUID" -ne 0 ]; then
+if [[ "${EUID}" -ne 0 ]]; then
     echo -e "${RED}Please run as root (sudo)${NC}"
     exit 1
 fi
@@ -34,28 +55,23 @@ fi
 
 # Create directories
 echo "Creating directories..."
-mkdir -p /etc/npu-proxy
-mkdir -p /var/lib/npu-proxy
-mkdir -p /var/log/npu-proxy
-
-# Set ownership
-chown npu-proxy:npu-proxy /var/lib/npu-proxy
-chown npu-proxy:npu-proxy /var/log/npu-proxy
+install -d -m 0755 /etc/npu-proxy
+install -d -m 0755 -o npu-proxy -g npu-proxy /var/lib/npu-proxy
+install -d -m 0755 -o npu-proxy -g npu-proxy /var/log/npu-proxy
 
 # Install Python package
 echo "Installing Python package..."
-pip3 install --system .
+python3 -m pip install "${PROJECT_ROOT}"
 
 # Install systemd service
 echo "Installing systemd service..."
-cp packaging/npu-proxy.service /etc/systemd/system/
-chmod 644 /etc/systemd/system/npu-proxy.service
+install -m 0644 "${SERVICE_SOURCE}" /etc/systemd/system/npu-proxy.service
 
 # Install default environment file if not exists
-if [ ! -f /etc/npu-proxy/environment ]; then
-    cp packaging/npu-proxy.environment /etc/npu-proxy/environment
-    chmod 640 /etc/npu-proxy/environment
-    chown root:npu-proxy /etc/npu-proxy/environment
+if [[ ! -f /etc/npu-proxy/environment ]]; then
+    install -m 0640 -o root -g npu-proxy "${ENV_SOURCE}" /etc/npu-proxy/environment
+else
+    echo -e "${YELLOW}Existing /etc/npu-proxy/environment preserved.${NC}"
 fi
 
 # Reload systemd

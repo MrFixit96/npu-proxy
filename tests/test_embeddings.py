@@ -5,66 +5,51 @@ from npu_proxy.main import app
 
 
 @pytest.mark.asyncio
-async def test_embeddings_returns_200():
-    """POST /v1/embeddings should return 200 OK"""
+async def test_embeddings_returns_503_when_unavailable():
+    """POST /v1/embeddings should hard-fail when the real model is unavailable."""
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.post(
             "/v1/embeddings",
             json={
-                "model": "all-minilm-l6-v2",
+                "model": "org-test/unavailable-openai-embed",
                 "input": "Hello world",
             },
         )
-    assert response.status_code == 200
+    assert response.status_code == 503
 
 
 @pytest.mark.asyncio
-async def test_embeddings_returns_openai_format():
-    """Response should match OpenAI embeddings format"""
+async def test_embeddings_returns_error_detail_when_unavailable():
+    """Unavailable embeddings should use the structured error detail payload."""
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.post(
             "/v1/embeddings",
             json={
-                "model": "all-minilm-l6-v2",
+                "model": "org-test/unavailable-openai-embed-detail",
                 "input": "Test embedding",
             },
         )
     data = response.json()
-    
-    assert "object" in data
-    assert data["object"] == "list"
-    assert "data" in data
-    assert "model" in data
-    assert "usage" in data
-    
-    assert len(data["data"]) > 0
-    embedding = data["data"][0]
-    assert "object" in embedding
-    assert embedding["object"] == "embedding"
-    assert "embedding" in embedding
-    assert "index" in embedding
-    assert isinstance(embedding["embedding"], list)
+
+    assert response.status_code == 503
+    assert "error" in data
+    assert data["error"]["type"] == "service_unavailable_error"
+    assert data["error"]["code"] == "embedding_unavailable"
 
 
 @pytest.mark.asyncio
-async def test_embeddings_batch_input():
-    """Should handle batch input (list of strings)"""
+async def test_embeddings_batch_input_returns_503_when_unavailable():
+    """Batch embedding requests should also fail closed when real embeddings are unavailable."""
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.post(
             "/v1/embeddings",
             json={
-                "model": "all-minilm-l6-v2",
+                "model": "org-test/unavailable-openai-embed-batch",
                 "input": ["First text", "Second text", "Third text"],
             },
         )
-    data = response.json()
-    
-    assert response.status_code == 200
-    assert len(data["data"]) == 3
-    
-    for i, embedding in enumerate(data["data"]):
-        assert embedding["index"] == i
-        assert len(embedding["embedding"]) > 0
+
+    assert response.status_code == 503

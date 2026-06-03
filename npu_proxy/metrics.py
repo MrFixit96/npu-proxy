@@ -40,8 +40,10 @@ Attributes:
     _metrics_initialized (bool): Whether metrics have been lazily initialized.
 """
 
-import time
 import logging
+import re
+import threading
+import time
 from contextlib import contextmanager
 from functools import wraps
 from typing import Callable, Any, Optional
@@ -58,6 +60,31 @@ except ImportError:
 
 # Metric definitions (created lazily)
 _metrics_initialized = False
+_metrics_init_lock = threading.Lock()
+_LABEL_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
+_ALLOWED_DEVICES = {"npu", "gpu", "cpu", "auto", "unknown"}
+_ALLOWED_INFERENCE_TYPES = {"chat", "embeddings", "prompt", "completion"}
+_ALLOWED_ROUTING_REASONS = {
+    "within_npu_limit",
+    "prompt_exceeds_npu_limit",
+    "safe_retry",
+    "fallback",
+    "device_unavailable",
+    "model_affinity",
+    "load_balance",
+    "other",
+}
+_ALLOWED_ERROR_TYPES = {
+    "timeout",
+    "oom",
+    "invalid_request",
+    "model_error",
+    "backend_error",
+    "runtime_error",
+    "device_error",
+    "internal_error",
+    "other",
+}
 
 # Request metrics
 REQUEST_COUNT = None
@@ -82,6 +109,10 @@ ROUTING_DECISIONS = None
 MODEL_INFO = None
 MODEL_LOAD_TIME = None
 
+# Runtime feature metrics
+RUNTIME_FEATURE_STATE = None
+RUNTIME_FEATURE_DEGRADATIONS = None
+
 # Error metrics
 ERROR_COUNT = None
 
@@ -94,6 +125,21 @@ TPOT_BUCKETS = (0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0)
 QUEUE_TIME_BUCKETS = (0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0)
 
 
+def _bounded_label(value: str, *, allowed: set[str] | None = None, default: str = "other") -> str:
+    """Return a low-cardinality Prometheus label value."""
+    normalized = str(value or "").strip().lower()
+    if allowed is not None:
+        return normalized if normalized in allowed else default
+    return normalized if _LABEL_RE.fullmatch(normalized) else default
+
+
+def _short_label(value: str, *, default: str = "unknown", limit: int = 128) -> str:
+    normalized = str(value or "").strip()
+    if not normalized:
+        return default
+    return normalized[:limit]
+
+
 def _init_metrics() -> None:
     """Initialize Prometheus metrics using lazy initialization pattern.
 
@@ -101,130 +147,125 @@ def _init_metrics() -> None:
     Subsequent calls are no-ops. This pattern avoids import-time side effects
     and allows the module to be imported even when prometheus_client is not
     installed.
-
-    The function initializes the following metric categories:
-        - Request metrics (counts, latency, in-progress, queue time)
-        - Inference metrics (counts, latency, tokens)
-        - LLM streaming metrics (TTFT, TPOT, tokens/sec)
-        - Routing metrics (device selection decisions)
-        - Model metrics (info, load times)
-        - Error metrics (counts by type)
-
-    Note:
-        All histogram buckets are tuned for LLM inference workloads based on
-        observed patterns from vLLM and TGI production deployments.
-
-    Returns:
-        None
     """
     global _metrics_initialized
     global REQUEST_COUNT, REQUEST_LATENCY, REQUEST_IN_PROGRESS, QUEUE_TIME
     global INFERENCE_COUNT, INFERENCE_LATENCY, INFERENCE_TOKENS
     global TIME_TO_FIRST_TOKEN, INTER_TOKEN_LATENCY, TOKENS_PER_SECOND
-    global ROUTING_DECISIONS, MODEL_INFO, MODEL_LOAD_TIME, ERROR_COUNT
-    
+    global ROUTING_DECISIONS, MODEL_INFO, MODEL_LOAD_TIME
+    global RUNTIME_FEATURE_STATE, RUNTIME_FEATURE_DEGRADATIONS, ERROR_COUNT
+
     if _metrics_initialized or not PROMETHEUS_AVAILABLE:
         return
-    
-    from prometheus_client import Counter, Histogram, Gauge, Info
-    
-    # Request metrics
-    REQUEST_COUNT = Counter(
-        'npu_proxy_requests_total',
-        'Total number of API requests',
-        ['endpoint', 'method', 'status']
-    )
-    
-    REQUEST_LATENCY = Histogram(
-        'npu_proxy_request_latency_seconds',
-        'Request latency in seconds (end-to-end)',
-        ['endpoint'],
-        buckets=REQUEST_LATENCY_BUCKETS
-    )
-    
-    REQUEST_IN_PROGRESS = Gauge(
-        'npu_proxy_requests_in_progress',
-        'Number of requests currently being processed',
-        ['endpoint']
-    )
-    
-    QUEUE_TIME = Histogram(
-        'npu_proxy_queue_time_seconds',
-        'Time spent waiting in queue before processing begins',
-        ['endpoint'],
-        buckets=QUEUE_TIME_BUCKETS
-    )
-    
-    # Inference metrics
-    INFERENCE_COUNT = Counter(
-        'npu_proxy_inference_total',
-        'Total number of inference operations',
-        ['model', 'device', 'type']  # type: chat, embeddings
-    )
-    
-    INFERENCE_LATENCY = Histogram(
-        'npu_proxy_inference_latency_seconds',
-        'Total inference latency in seconds (includes all tokens)',
-        ['model', 'device'],
-        buckets=INFERENCE_LATENCY_BUCKETS
-    )
-    
-    INFERENCE_TOKENS = Counter(
-        'npu_proxy_inference_tokens_total',
-        'Total tokens processed',
-        ['model', 'type']  # type: prompt, completion
-    )
-    
-    # LLM-specific streaming metrics (vLLM/TGI inspired)
-    # These are critical SLOs for LLM inference quality
-    TIME_TO_FIRST_TOKEN = Histogram(
-        'npu_proxy_time_to_first_token_seconds',
-        'Time from request receipt to first token generation (TTFT) - critical UX metric',
-        ['model'],
-        buckets=TTFT_BUCKETS
-    )
-    
-    INTER_TOKEN_LATENCY = Histogram(
-        'npu_proxy_inter_token_latency_seconds',
-        'Time between consecutive tokens during streaming (TPOT/ITL)',
-        ['model'],
-        buckets=TPOT_BUCKETS
-    )
-    
-    TOKENS_PER_SECOND = Gauge(
-        'npu_proxy_tokens_per_second',
-        'Current token generation throughput rate',
-        ['model', 'device']
-    )
-    
-    # Routing metrics
-    ROUTING_DECISIONS = Counter(
-        'npu_proxy_routing_decisions_total',
-        'Routing decisions by device and reason',
-        ['device', 'reason']
-    )
-    
-    # Model metrics
-    MODEL_INFO = Info(
-        'npu_proxy_model',
-        'Information about loaded models'
-    )
-    
-    MODEL_LOAD_TIME = Gauge(
-        'npu_proxy_model_load_seconds',
-        'Time taken to load model in seconds',
-        ['model']
-    )
-    
-    # Error metrics
-    ERROR_COUNT = Counter(
-        'npu_proxy_errors_total',
-        'Total number of errors by endpoint and type',
-        ['endpoint', 'error_type']
-    )
-    
-    _metrics_initialized = True
-    logger.debug("Prometheus metrics initialized successfully")
+
+    with _metrics_init_lock:
+        if _metrics_initialized or not PROMETHEUS_AVAILABLE:
+            return
+
+        from prometheus_client import Counter, Histogram, Gauge, Info
+
+        REQUEST_COUNT = Counter(
+            'npu_proxy_requests_total',
+            'Total number of API requests',
+            ['endpoint', 'method', 'status']
+        )
+
+        REQUEST_LATENCY = Histogram(
+            'npu_proxy_request_latency_seconds',
+            'Request latency in seconds (end-to-end)',
+            ['endpoint'],
+            buckets=REQUEST_LATENCY_BUCKETS
+        )
+
+        REQUEST_IN_PROGRESS = Gauge(
+            'npu_proxy_requests_in_progress',
+            'Number of requests currently being processed',
+            ['endpoint']
+        )
+
+        QUEUE_TIME = Histogram(
+            'npu_proxy_queue_time_seconds',
+            'Time spent waiting in queue before processing begins',
+            ['endpoint'],
+            buckets=QUEUE_TIME_BUCKETS
+        )
+
+        INFERENCE_COUNT = Counter(
+            'npu_proxy_inference_total',
+            'Total number of inference operations',
+            ['model', 'device', 'type']
+        )
+
+        INFERENCE_LATENCY = Histogram(
+            'npu_proxy_inference_latency_seconds',
+            'Total inference latency in seconds (includes all tokens)',
+            ['model', 'device'],
+            buckets=INFERENCE_LATENCY_BUCKETS
+        )
+
+        INFERENCE_TOKENS = Counter(
+            'npu_proxy_inference_tokens_total',
+            'Total tokens processed',
+            ['model', 'type']
+        )
+
+        TIME_TO_FIRST_TOKEN = Histogram(
+            'npu_proxy_time_to_first_token_seconds',
+            'Time from request receipt to first token generation (TTFT) - critical UX metric',
+            ['model'],
+            buckets=TTFT_BUCKETS
+        )
+
+        INTER_TOKEN_LATENCY = Histogram(
+            'npu_proxy_inter_token_latency_seconds',
+            'Time between consecutive tokens during streaming (TPOT/ITL)',
+            ['model'],
+            buckets=TPOT_BUCKETS
+        )
+
+        TOKENS_PER_SECOND = Gauge(
+            'npu_proxy_tokens_per_second',
+            'Current token generation throughput rate',
+            ['model', 'device']
+        )
+
+        ROUTING_DECISIONS = Counter(
+            'npu_proxy_routing_decisions_total',
+            'Routing decisions by device and reason',
+            ['device', 'reason']
+        )
+
+        MODEL_INFO = Info(
+            'npu_proxy_model',
+            'Information about loaded models'
+        )
+
+        MODEL_LOAD_TIME = Gauge(
+            'npu_proxy_model_load_seconds',
+            'Time taken to load model in seconds',
+            ['model']
+        )
+
+        RUNTIME_FEATURE_STATE = Gauge(
+            'npu_proxy_runtime_feature_state',
+            'Runtime feature state for loaded models (1=enabled, 0=disabled)',
+            ['model', 'device', 'feature']
+        )
+
+        RUNTIME_FEATURE_DEGRADATIONS = Counter(
+            'npu_proxy_runtime_feature_degradations_total',
+            'Runtime feature degradations with safe fallback behavior',
+            ['model', 'device', 'feature', 'reason']
+        )
+
+        ERROR_COUNT = Counter(
+            'npu_proxy_errors_total',
+            'Total number of errors by endpoint and type',
+            ['endpoint', 'error_type']
+        )
+
+        _metrics_initialized = True
+        logger.debug("Prometheus metrics initialized successfully")
 
 
 def ensure_metrics() -> None:
@@ -296,7 +337,7 @@ def record_request(endpoint: str, method: str, status: int) -> None:
     """
     ensure_metrics()
     if PROMETHEUS_AVAILABLE and REQUEST_COUNT:
-        REQUEST_COUNT.labels(endpoint=endpoint, method=method, status=str(status)).inc()
+        REQUEST_COUNT.labels(endpoint=_short_label(endpoint), method=method.upper(), status=str(status)).inc()
 
 
 def record_queue_time(endpoint: str, queue_seconds: float) -> None:
@@ -316,7 +357,7 @@ def record_queue_time(endpoint: str, queue_seconds: float) -> None:
     """
     ensure_metrics()
     if PROMETHEUS_AVAILABLE and QUEUE_TIME:
-        QUEUE_TIME.labels(endpoint=endpoint).observe(queue_seconds)
+        QUEUE_TIME.labels(endpoint=_short_label(endpoint)).observe(queue_seconds)
 
 
 def record_inference(model: str, device: str, inference_type: str, latency: float) -> None:
@@ -340,9 +381,16 @@ def record_inference(model: str, device: str, inference_type: str, latency: floa
     if not PROMETHEUS_AVAILABLE:
         return
     if INFERENCE_COUNT:
-        INFERENCE_COUNT.labels(model=model, device=device, type=inference_type).inc()
+        INFERENCE_COUNT.labels(
+            model=_short_label(model),
+            device=_bounded_label(device, allowed=_ALLOWED_DEVICES, default="unknown"),
+            type=_bounded_label(inference_type, allowed=_ALLOWED_INFERENCE_TYPES),
+        ).inc()
     if INFERENCE_LATENCY:
-        INFERENCE_LATENCY.labels(model=model, device=device).observe(latency)
+        INFERENCE_LATENCY.labels(
+            model=_short_label(model),
+            device=_bounded_label(device, allowed=_ALLOWED_DEVICES, default="unknown"),
+        ).observe(latency)
 
 
 def record_tokens(model: str, prompt_tokens: int, completion_tokens: int) -> None:
@@ -362,8 +410,8 @@ def record_tokens(model: str, prompt_tokens: int, completion_tokens: int) -> Non
     ensure_metrics()
     if not PROMETHEUS_AVAILABLE or not INFERENCE_TOKENS:
         return
-    INFERENCE_TOKENS.labels(model=model, type="prompt").inc(prompt_tokens)
-    INFERENCE_TOKENS.labels(model=model, type="completion").inc(completion_tokens)
+    INFERENCE_TOKENS.labels(model=_short_label(model), type="prompt").inc(prompt_tokens)
+    INFERENCE_TOKENS.labels(model=_short_label(model), type="completion").inc(completion_tokens)
 
 
 def record_ttft(model: str, ttft_seconds: float) -> None:
@@ -391,7 +439,7 @@ def record_ttft(model: str, ttft_seconds: float) -> None:
     """
     ensure_metrics()
     if PROMETHEUS_AVAILABLE and TIME_TO_FIRST_TOKEN:
-        TIME_TO_FIRST_TOKEN.labels(model=model).observe(ttft_seconds)
+        TIME_TO_FIRST_TOKEN.labels(model=_short_label(model)).observe(ttft_seconds)
 
 
 def record_tpot(model: str, tpot_seconds: float) -> None:
@@ -420,7 +468,7 @@ def record_tpot(model: str, tpot_seconds: float) -> None:
     """
     ensure_metrics()
     if PROMETHEUS_AVAILABLE and INTER_TOKEN_LATENCY:
-        INTER_TOKEN_LATENCY.labels(model=model).observe(tpot_seconds)
+        INTER_TOKEN_LATENCY.labels(model=_short_label(model)).observe(tpot_seconds)
 
 
 def record_tokens_per_second(model: str, device: str, tokens_per_sec: float) -> None:
@@ -442,7 +490,10 @@ def record_tokens_per_second(model: str, device: str, tokens_per_sec: float) -> 
     """
     ensure_metrics()
     if PROMETHEUS_AVAILABLE and TOKENS_PER_SECOND:
-        TOKENS_PER_SECOND.labels(model=model, device=device).set(tokens_per_sec)
+        TOKENS_PER_SECOND.labels(
+            model=_short_label(model),
+            device=_bounded_label(device, allowed=_ALLOWED_DEVICES, default="unknown"),
+        ).set(tokens_per_sec)
 
 
 def record_routing_decision(device: str, reason: str) -> None:
@@ -462,7 +513,10 @@ def record_routing_decision(device: str, reason: str) -> None:
     """
     ensure_metrics()
     if PROMETHEUS_AVAILABLE and ROUTING_DECISIONS:
-        ROUTING_DECISIONS.labels(device=device, reason=reason).inc()
+        ROUTING_DECISIONS.labels(
+            device=_bounded_label(device, allowed=_ALLOWED_DEVICES, default="unknown"),
+            reason=_bounded_label(reason, allowed=_ALLOWED_ROUTING_REASONS),
+        ).inc()
 
 
 def record_error(endpoint: str, error_type: str) -> None:
@@ -484,7 +538,10 @@ def record_error(endpoint: str, error_type: str) -> None:
     """
     ensure_metrics()
     if PROMETHEUS_AVAILABLE and ERROR_COUNT:
-        ERROR_COUNT.labels(endpoint=endpoint, error_type=error_type).inc()
+        ERROR_COUNT.labels(
+            endpoint=_short_label(endpoint),
+            error_type=_bounded_label(error_type, allowed=_ALLOWED_ERROR_TYPES),
+        ).inc()
 
 
 def record_model_load_time(model: str, load_seconds: float) -> None:
@@ -504,7 +561,40 @@ def record_model_load_time(model: str, load_seconds: float) -> None:
     """
     ensure_metrics()
     if PROMETHEUS_AVAILABLE and MODEL_LOAD_TIME:
-        MODEL_LOAD_TIME.labels(model=model).set(load_seconds)
+        MODEL_LOAD_TIME.labels(model=_short_label(model)).set(load_seconds)
+
+
+def record_runtime_feature_state(
+    model: str,
+    device: str,
+    feature: str,
+    enabled: bool,
+) -> None:
+    """Record runtime feature state for a loaded model."""
+    ensure_metrics()
+    if PROMETHEUS_AVAILABLE and RUNTIME_FEATURE_STATE:
+        RUNTIME_FEATURE_STATE.labels(
+            model=_short_label(model),
+            device=_bounded_label(device, allowed=_ALLOWED_DEVICES, default="unknown"),
+            feature=_bounded_label(feature, default="unknown"),
+        ).set(1 if enabled else 0)
+
+
+def record_runtime_feature_degradation(
+    model: str,
+    device: str,
+    feature: str,
+    reason: str,
+) -> None:
+    """Record safe runtime feature degradation events."""
+    ensure_metrics()
+    if PROMETHEUS_AVAILABLE and RUNTIME_FEATURE_DEGRADATIONS:
+        RUNTIME_FEATURE_DEGRADATIONS.labels(
+            model=_short_label(model),
+            device=_bounded_label(device, allowed=_ALLOWED_DEVICES, default="unknown"),
+            feature=_bounded_label(feature, default="unknown"),
+            reason=_bounded_label(reason, allowed=_ALLOWED_ROUTING_REASONS),
+        ).inc()
 
 
 def get_metrics() -> bytes:

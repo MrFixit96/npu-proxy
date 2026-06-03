@@ -40,11 +40,21 @@ python -m venv .venv
 .venv\Scripts\activate  # Windows
 # or: source .venv/bin/activate  # Linux/macOS
 
-# Install in development mode
-pip install -e ".[dev]"
+# Install runtime and development/test dependencies
+pip install -r requirements.txt -r requirements-dev.txt
 
-# Run tests
-pytest
+# Run the fast test suite
+python -m pytest -m "not slow and not e2e"
+```
+
+The fast test suite is the default contributor check; it currently has 648 passing tests. Tests marked `slow` or `e2e` require real NPU/model hardware. Two OpenVINO SWIG `DeprecationWarning`s are expected and harmless.
+
+There is no configured lint or formatter command in this repository. Follow existing style and run the fast tests before opening a pull request.
+
+To build the Windows executable, create/use the virtual environment above, then run:
+
+```powershell
+.\scripts\build_windows.ps1
 ```
 
 ## Code Style
@@ -53,6 +63,7 @@ pytest
 - Add type hints to new functions
 - Include docstrings (Google style)
 - Run tests before submitting PRs
+- If behavior changes, update the release-truth docs in `README.md`, `SPEC.md`, and the relevant files under `docs/` and `packaging/`
 
 ## License
 

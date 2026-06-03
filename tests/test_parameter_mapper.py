@@ -27,6 +27,11 @@ class TestDirectMappings:
         assert result["max_new_tokens"] == 256
         assert "num_predict" not in result
 
+    @pytest.mark.parametrize("sentinel", [-1, -2])
+    def test_map_num_predict_allows_ollama_sentinels(self, sentinel):
+        result = map_parameters({"num_predict": sentinel})
+        assert result["max_new_tokens"] == sentinel
+
     def test_map_stop_renamed(self):
         result = map_parameters({"stop": ["END", "STOP"]})
         assert result["stop_strings"] == ["END", "STOP"]
@@ -59,6 +64,10 @@ class TestApproximateMappings:
     def test_explicit_repeat_penalty_not_overridden(self):
         result = map_parameters({"repeat_penalty": 1.3, "presence_penalty": 0.5})
         assert result["repetition_penalty"] == 1.3
+
+    def test_negative_penalties_clamp_derived_repetition_penalty(self):
+        result = map_parameters({"presence_penalty": -2.0, "frequency_penalty": -2.0})
+        assert result["repetition_penalty"] == 0.0
 
 
 class TestIgnoredParams:

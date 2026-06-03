@@ -35,6 +35,15 @@ except Exception as e:
     print(f"Warning: Could not collect OpenVINO data files: {e}")
     openvino_datas = []
 
+try:
+    npu_proxy_hiddenimports = collect_submodules(
+        'npu_proxy',
+        filter=lambda name: not (name.startswith('npu_proxy.tests') or name.startswith('tests')),
+    )
+except Exception as e:
+    print(f"Warning: Could not collect npu_proxy submodules: {e}")
+    npu_proxy_hiddenimports = ['npu_proxy']
+
 # Collect all npu_proxy package files
 a = Analysis(
     ['npu_proxy/cli.py'],
@@ -66,35 +75,9 @@ a = Analysis(
         'httpx',
         'anyio',
         'sniffio',
-        
-        # OpenVINO - critical for NPU support
         'openvino',
         'openvino_genai',
-
-        # NPU Proxy modules
-        'npu_proxy',
-        'npu_proxy.hardware_certification',
-        'npu_proxy.main',
-        'npu_proxy.api',
-        'npu_proxy.api.chat',
-        'npu_proxy.api.embeddings',
-        'npu_proxy.api.health',
-        'npu_proxy.api.models',
-        'npu_proxy.api.ollama',
-        'npu_proxy.api.metrics',
-        'npu_proxy.inference',
-        'npu_proxy.inference.engine',
-        'npu_proxy.inference.embedding_engine',
-        'npu_proxy.inference.streaming',
-        'npu_proxy.inference.tokenizer',
-        'npu_proxy.models',
-        'npu_proxy.models.registry',
-        'npu_proxy.models.ollama_defaults',
-        'npu_proxy.models.parameter_mapper',
-        'npu_proxy.routing',
-        'npu_proxy.routing.context_router',
-        'npu_proxy.metrics',
-    ] + openvino_hiddenimports,
+    ] + npu_proxy_hiddenimports + openvino_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

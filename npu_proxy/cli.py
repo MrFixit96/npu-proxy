@@ -20,7 +20,12 @@ Environment Variables:
     NPU_PROXY_PORT: Port number (default: 8080)
     NPU_PROXY_DEVICE: Inference device - NPU, GPU, CPU, or AUTO (default: AUTO)
     NPU_PROXY_TOKEN_LIMIT: Token limit for NPU context routing (default: 1800)
+    NPU_PROXY_COMPILE_CACHE_DIR: Optional OpenVINO compile cache directory
+    NPU_PROXY_COMPILE_CACHE_MODE: Optional compile cache mode
+        (OPTIMIZE_SIZE, OPTIMIZE_SPEED)
+    NPU_PROXY_PREFIX_CACHE_MODE: Prefix cache mode (auto, on, off)
     NPU_PROXY_REAL_INFERENCE: Enable real inference when set to "1" (default: 0)
+    NPU_PROXY_ALLOWED_HOSTS: Comma-separated Host-header allow-list
 
 Example:
     # Start server with real inference on NPU
@@ -41,6 +46,18 @@ import os
 import sys
 
 from npu_proxy import __version__
+from npu_proxy.config import (
+    DEFAULT_ALLOWED_HOSTS,
+    ENV_ALLOWED_HOSTS,
+    ProxyBootstrapConfig,
+    VALID_COMPILE_CACHE_MODES,
+    VALID_PREFIX_CACHE_MODES,
+    apply_proxy_bootstrap_config_to_env,
+    is_loopback_host,
+    load_cli_environment_defaults,
+    load_proxy_bootstrap_config,
+    normalize_allowed_hosts,
+)
 
 # Configure logging before imports to catch early errors
 logging.basicConfig(
@@ -48,7 +65,6 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger("npu-proxy")
-
 
 def get_version() -> str:
     """Get the installed package version.
@@ -64,7 +80,6 @@ def get_version() -> str:
         Running NPU Proxy v0.2.0
     """
     return __version__
-
 
 def parse_args(args: list[str] | None = None) -> argparse.Namespace:
     """Parse command line arguments into a configuration namespace.
@@ -86,6 +101,9 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
             - reload (bool): Enable auto-reload for development
             - device (str): Inference device - NPU, GPU, CPU, or AUTO
             - token_limit (int): Token limit for NPU routing (default: 1800)
+            - compile_cache_dir (str | None): Optional compile cache directory
+            - compile_cache_mode (str | None): Compile cache mode
+            - prefix_cache_mode (str): Prefix cache mode (auto, on, off)
             - real_inference (bool): Enable real model inference
             - log_level (str): Logging verbosity level
             - log_file (str | None): Optional log file path
@@ -102,6 +120,8 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         >>> args.real_inference
         True
     """
+    defaults = load_cli_environment_defaults()
+
     parser = argparse.ArgumentParser(
         prog="npu-proxy",
         description="Ollama-compatible API proxy for Intel NPU inference via OpenVINO",
@@ -117,7 +137,11 @@ Examples:
 Environment Variables:
   NPU_PROXY_DEVICE         Default device (NPU, GPU, CPU)
   NPU_PROXY_TOKEN_LIMIT    Token limit for NPU (default: 1800)
+  NPU_PROXY_COMPILE_CACHE_DIR  Compile cache directory
+  NPU_PROXY_COMPILE_CACHE_MODE Compile cache mode
+  NPU_PROXY_PREFIX_CACHE_MODE  Prefix cache mode (auto, on, off)
   NPU_PROXY_REAL_INFERENCE Enable real inference (1 to enable)
+  NPU_PROXY_ALLOWED_HOSTS  Comma-separated Host-header allow-list
         """,
     )
     
@@ -131,13 +155,13 @@ Environment Variables:
     server_group = parser.add_argument_group("Server Options")
     server_group.add_argument(
         "--host",
-        default=os.environ.get("NPU_PROXY_HOST", "127.0.0.1"),
+        default=defaults.host,
         help="Host to bind to (default: 127.0.0.1)",
     )
     server_group.add_argument(
         "--port", "-p",
         type=int,
-        default=int(os.environ.get("NPU_PROXY_PORT", "8080")),
+        default=defaults.port,
         help="Port to bind to (default: 8080)",
     )
     server_group.add_argument(
@@ -151,25 +175,47 @@ Environment Variables:
         action="store_true",
         help="Enable auto-reload for development",
     )
+    server_group.add_argument(
+        "--allowed-hosts",
+        default=",".join(defaults.allowed_hosts),
+        help="Comma-separated Host-header allow-list (default: localhost/loopback/test clients)",
+    )
     
     # Device options
     device_group = parser.add_argument_group("Device Options")
     device_group.add_argument(
         "--device", "-d",
         choices=["NPU", "GPU", "CPU", "AUTO"],
-        default=os.environ.get("NPU_PROXY_DEVICE", "AUTO"),
+        default=defaults.device,
         help="Inference device (default: AUTO, tries NPU first)",
     )
     device_group.add_argument(
         "--token-limit",
         type=int,
-        default=int(os.environ.get("NPU_PROXY_TOKEN_LIMIT", "1800")),
+        default=defaults.token_limit,
         help="Token limit for NPU context routing (default: 1800)",
+    )
+    device_group.add_argument(
+        "--compile-cache-dir",
+        default=defaults.compile_cache_dir,
+        help="Enable OpenVINO compile cache in this directory",
+    )
+    device_group.add_argument(
+        "--compile-cache-mode",
+        choices=list(VALID_COMPILE_CACHE_MODES),
+        default=defaults.compile_cache_mode,
+        help="Compile cache mode (default: OpenVINO runtime default)",
+    )
+    device_group.add_argument(
+        "--prefix-cache-mode",
+        choices=list(VALID_PREFIX_CACHE_MODES),
+        default=defaults.prefix_cache_mode,
+        help="Prefix cache mode: auto keeps runtime defaults",
     )
     device_group.add_argument(
         "--real-inference",
         action="store_true",
-        default=os.environ.get("NPU_PROXY_REAL_INFERENCE", "0") == "1",
+        default=defaults.real_inference,
         help="Enable real model inference (default: mock mode)",
     )
     
@@ -187,6 +233,29 @@ Environment Variables:
     )
     
     return parser.parse_args(args)
+
+
+def build_bootstrap_config(
+    args: argparse.Namespace,
+    env: dict[str, str] | None = None,
+) -> ProxyBootstrapConfig:
+    """Resolve CLI arguments into the authoritative bootstrap config."""
+    return load_proxy_bootstrap_config(
+        env=env,
+        host=args.host,
+        port=args.port,
+        workers=args.workers,
+        reload=args.reload,
+        token_limit=args.token_limit,
+        real_inference=args.real_inference,
+        log_level=args.log_level,
+        log_file=args.log_file,
+        allowed_hosts=args.allowed_hosts,
+        device=args.device,
+        compile_cache_dir=args.compile_cache_dir,
+        compile_cache_mode=args.compile_cache_mode,
+        prefix_cache_mode=args.prefix_cache_mode,
+    )
 
 
 def setup_logging(level: str, log_file: str | None = None) -> None:
@@ -229,7 +298,7 @@ def setup_logging(level: str, log_file: str | None = None) -> None:
     )
 
 
-def set_environment(args: argparse.Namespace) -> None:
+def set_environment(args: argparse.Namespace | ProxyBootstrapConfig) -> None:
     """Set environment variables from CLI arguments.
 
     Propagates CLI configuration to environment variables so that
@@ -240,6 +309,9 @@ def set_environment(args: argparse.Namespace) -> None:
     The following environment variables are set:
         - NPU_PROXY_DEVICE: Only set if device is not AUTO
         - NPU_PROXY_TOKEN_LIMIT: Always set from token_limit argument
+        - NPU_PROXY_COMPILE_CACHE_DIR: Set if compile_cache_dir is provided
+        - NPU_PROXY_COMPILE_CACHE_MODE: Set if compile_cache_mode is provided
+        - NPU_PROXY_PREFIX_CACHE_MODE: Always set from prefix_cache_mode
         - NPU_PROXY_REAL_INFERENCE: Set to "1" if real_inference is True
 
     Args:
@@ -254,16 +326,11 @@ def set_environment(args: argparse.Namespace) -> None:
         >>> os.environ.get('NPU_PROXY_REAL_INFERENCE')
         '1'
     """
-    if args.device != "AUTO":
-        os.environ["NPU_PROXY_DEVICE"] = args.device
-    
-    os.environ["NPU_PROXY_TOKEN_LIMIT"] = str(args.token_limit)
-    
-    if args.real_inference:
-        os.environ["NPU_PROXY_REAL_INFERENCE"] = "1"
+    config = args if isinstance(args, ProxyBootstrapConfig) else build_bootstrap_config(args)
+    apply_proxy_bootstrap_config_to_env(config)
 
 
-def run_server(args: argparse.Namespace) -> None:
+def run_server(args: argparse.Namespace | ProxyBootstrapConfig) -> None:
     """Start the uvicorn ASGI server with the FastAPI application.
 
     Launches the NPU Proxy server using uvicorn with configuration derived
@@ -294,19 +361,47 @@ def run_server(args: argparse.Namespace) -> None:
         >>> run_server(args)  # Blocks until shutdown
     """
     import uvicorn
-    
+
+    config = args if isinstance(args, ProxyBootstrapConfig) else build_bootstrap_config(args)
+
     logger.info(f"Starting NPU Proxy v{get_version()}")
-    logger.info(f"Binding to {args.host}:{args.port}")
-    logger.info(f"Device: {args.device}, Token limit: {args.token_limit}")
-    logger.info(f"Real inference: {'enabled' if args.real_inference else 'disabled (mock mode)'}")
-    
+    logger.info(f"Binding to {config.host}:{config.port}")
+    logger.info(f"Device: {config.llm.device}, Token limit: {config.token_limit}")
+    if config.llm.compile_cache_dir:
+        cache_mode = config.llm.compile_cache_mode or "runtime default"
+        logger.info(f"Compile cache: {config.llm.compile_cache_dir} ({cache_mode})")
+    else:
+        logger.info("Compile cache: disabled")
+    logger.info(f"Prefix cache mode: {config.llm.prefix_cache_mode}")
+    logger.info(
+        f"Real inference: {'enabled' if config.real_inference else 'disabled (mock mode)'}"
+    )
+    if (
+        not is_loopback_host(config.host)
+        and normalize_allowed_hosts(config.allowed_hosts) == normalize_allowed_hosts(DEFAULT_ALLOWED_HOSTS)
+    ):
+        logger.warning(
+            "Binding to non-loopback host %s without Host allow-list relaxation; "
+            "remote clients must use one of %s or set %s/--allowed-hosts.",
+            config.host,
+            ", ".join(config.allowed_hosts),
+            ENV_ALLOWED_HOSTS,
+        )
+
+    if config.reload or config.workers > 1:
+        app_target = "npu_proxy.main:app"
+    else:
+        from npu_proxy.main import create_app
+
+        app_target = create_app(config)
+
     uvicorn.run(
-        "npu_proxy.main:app",
-        host=args.host,
-        port=args.port,
-        workers=args.workers,
-        reload=args.reload,
-        log_level=args.log_level,
+        app_target,
+        host=config.host,
+        port=config.port,
+        workers=config.workers,
+        reload=config.reload,
+        log_level=config.log_level,
     )
 
 
@@ -342,15 +437,23 @@ def main(args: list[str] | None = None) -> int:
     """
     try:
         parsed = parse_args(args)
-        setup_logging(parsed.log_level, parsed.log_file)
-        set_environment(parsed)
-        run_server(parsed)
+        config = build_bootstrap_config(parsed)
+        setup_logging(config.log_level, config.log_file)
+
+        from npu_proxy.main import bootstrap_runtime
+
+        bootstrap_runtime(config)
+        set_environment(config)
+        run_server(config)
         return 0
     except KeyboardInterrupt:
         logger.info("Shutting down...")
         return 0
     except Exception as e:
-        logger.error(f"Fatal error: {e}")
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.exception("Fatal error")
+        else:
+            logger.error("Fatal error: %s", e)
         return 1
 
 

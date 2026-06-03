@@ -1,64 +1,57 @@
-# WinGet Package Submission Guide
+# WinGet manifest notes
 
-This directory contains the WinGet manifest files for submitting npu-proxy to the
-Windows Package Manager Community Repository.
+This directory contains the WinGet manifests that currently exist in-tree for version `0.2.0`.
 
 ## Files
 
-- `MrFixit96.NPUProxy.yaml` - Version manifest
-- `MrFixit96.NPUProxy.locale.en-US.yaml` - Localization manifest
-- `MrFixit96.NPUProxy.installer.yaml` - Installer manifest
+- `MrFixit96.NPUProxy.yaml`
+- `MrFixit96.NPUProxy.locale.en-US.yaml`
+- `MrFixit96.NPUProxy.installer.yaml`
 
-## Prerequisites
+## Current build artifact truth
 
-Before submitting:
+`.\scripts\build_windows.ps1` builds:
 
-1. **Create a GitHub Release** with the Windows executable:
-   ```powershell
-   # Build the executable
-   cd <repo-root>
-   .\scripts\build_windows.ps1
-   
-   # Create release on GitHub with the .exe
-   gh release create v0.2.0 dist/npu-proxy-0.2.0-win64.exe dist/SHA256SUMS.txt --title "v0.2.0" --notes "0.2.0 release"
-   ```
+```text
+dist\npu-proxy.exe
+```
 
-2. **Calculate SHA256** of the executable:
-   ```powershell
-   Get-FileHash dist\npu-proxy-0.2.0-win64.exe -Algorithm SHA256
-   ```
+The current installer manifest points at a release asset named:
 
-3. **Update the installer manifest** with the SHA256 hash.
+```text
+npu-proxy-0.2.0-win64.exe
+```
 
-## Submission Process
+So if you are publishing the current manifest set, you need to stage a release asset with that filename.
 
-1. Fork https://github.com/microsoft/winget-pkgs
+These manifests target the default OpenVINO runtime packaging path. The optional alpha `llama.cpp` GGUF experiment path is source-install only and is not represented in the WinGet package.
 
-2. Create the package directory:
-   ```
-   manifests/m/MrFixit96/NPUProxy/0.2.0/
-   ```
+After installing the packaged app, the validated NPU embedding path is still an explicit opt-in: export `all-minilm`, set `NPU_PROXY_EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2`, and set `NPU_PROXY_EMBEDDING_DEVICE=NPU`.
 
-3. Copy all three YAML files to that directory
-
-4. Validate the manifests:
-   ```powershell
-   winget validate manifests/m/MrFixit96/NPUProxy/0.2.0/
-   ```
-
-5. Submit a pull request to microsoft/winget-pkgs
-
-## Testing Locally
+## Typical workflow for the current manifests
 
 ```powershell
-# Install from local manifest
-winget install --manifest .\packaging\winget\
+.\scripts\build_windows.ps1
+Copy-Item dist\npu-proxy.exe dist\npu-proxy-0.2.0-win64.exe
+Get-FileHash dist\npu-proxy-0.2.0-win64.exe -Algorithm SHA256
+```
 
-# Verify installation
-npu-proxy --version
+Then update `MrFixit96.NPUProxy.installer.yaml` if the hash changed and publish the release asset referenced by its `InstallerUrl`.
+
+Example release command for the current manifest version:
+
+```powershell
+gh release create v0.2.0 dist\npu-proxy-0.2.0-win64.exe --title "v0.2.0" --notes "0.2.0 release"
+```
+
+## Local validation
+
+```powershell
+winget validate .\packaging\winget\
+winget install --manifest .\packaging\winget\
 ```
 
 ## References
 
-- [WinGet Manifest Schema](https://github.com/microsoft/winget-cli/blob/master/doc/ManifestSpecv1.6.md)
-- [WinGet-pkgs Contributing](https://github.com/microsoft/winget-pkgs/blob/master/CONTRIBUTING.md)
+- https://learn.microsoft.com/windows/package-manager/package/manifest
+- https://github.com/microsoft/winget-pkgs

@@ -11,6 +11,7 @@ requires-python = ">=3.10"
 dependencies = [
     "fastapi>=0.136.1,<1.0.0",
     "uvicorn[standard]>=0.47.0,<1.0.0",
+    # OpenVINO 2026.1 was the workstation-certified runtime baseline documented in README.md.
     "openvino>=2026.1.0,<2027.0.0",
     "openvino-genai>=2026.1.0.0,<2027.0.0",
     "openvino-tokenizers>=2026.1.0.0,<2027.0.0",
@@ -32,6 +33,7 @@ dev = [
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 addopts = "-v --tb=short"
 markers = [

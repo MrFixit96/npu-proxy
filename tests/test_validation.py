@@ -135,7 +135,11 @@ async def test_chat_invalid_model_returns_404():
             },
         )
     assert response.status_code == 404
-    assert "not found" in response.json()["detail"].lower()
+    body = response.json()
+    assert body["error"]["type"] == "invalid_request_error"
+    assert body["error"]["param"] == "model"
+    assert body["error"]["code"] == "model_not_found"
+    assert "not found" in body["error"]["message"].lower()
 
 
 @pytest.mark.asyncio

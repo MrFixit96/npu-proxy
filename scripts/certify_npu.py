@@ -8,7 +8,6 @@ import os
 import socket
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -19,7 +18,13 @@ from npu_proxy.hardware_certification import (
     evaluate_hardware_certification,
     format_certification_report,
 )
-from npu_proxy.inference.engine import DEFAULT_LLM_MODEL, DEFAULT_MODEL_DIR
+try:
+    from npu_proxy.inference.engine import DEFAULT_LLM_MODEL, DEFAULT_MODEL_DIR
+except Exception:
+    DEFAULT_LLM_MODEL = "tinyllama"
+    DEFAULT_MODEL_DIR = Path.home() / ".cache" / "npu-proxy" / "models"
+
+_DEVICE_CHOICES = ["NPU", "GPU", "CPU", "AUTO"]
 
 
 def _find_free_port() -> int:
@@ -39,6 +44,16 @@ def _tail_log(log_path: Path, max_lines: int = 80) -> str:
     if len(lines) <= max_lines:
         return "\n".join(lines)
     return "\n".join(lines[-max_lines:])
+
+
+def _get_certification_log_path(repo_root: Path, requested_device: str) -> Path:
+    log_dir = repo_root / "build" / "certification"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    safe_device = "".join(
+        char.lower() if char.isalnum() else "-"
+        for char in requested_device
+    ).strip("-") or "device"
+    return log_dir / f"certify-{safe_device}.log"
 
 
 def _wait_for_server(base_url: str, process: subprocess.Popen, log_path: Path, timeout: float) -> float:
@@ -68,7 +83,13 @@ def _wait_for_server(base_url: str, process: subprocess.Popen, log_path: Path, t
     )
 
 
-def _start_server(repo_root: Path, log_path: Path, port: int | None, startup_timeout: float) -> tuple[subprocess.Popen, str, float]:
+def _start_server(
+    repo_root: Path,
+    log_path: Path,
+    port: int | None,
+    startup_timeout: float,
+    requested_device: str,
+) -> tuple[subprocess.Popen, str, float]:
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
 
@@ -90,7 +111,7 @@ def _start_server(repo_root: Path, log_path: Path, port: int | None, startup_tim
                     "--port",
                     str(chosen_port),
                     "--device",
-                    "NPU",
+                    requested_device,
                     "--real-inference",
                     "--log-level",
                     "warning",
@@ -117,7 +138,56 @@ def _start_server(repo_root: Path, log_path: Path, port: int | None, startup_tim
     raise RuntimeError(str(last_error) if last_error else "Failed to start certification server.")
 
 
-def parse_args() -> argparse.Namespace:
+def _collect_observability_snapshots(
+    client: httpx.Client,
+    log_path: Path,
+) -> tuple[dict[str, object], dict[str, object]]:
+    health_response = client.get("/health")
+    devices_response = client.get("/health/devices")
+
+    if health_response.status_code != 200:
+        raise RuntimeError(
+            f"Unexpected /health response after certification: {health_response.status_code}\n"
+            f"Body: {health_response.text}\n"
+            f"Server log:\n{_tail_log(log_path)}"
+        )
+    if devices_response.status_code != 200:
+        raise RuntimeError(
+            f"Unexpected /health/devices response after certification: {devices_response.status_code}\n"
+            f"Body: {devices_response.text}\n"
+            f"Server log:\n{_tail_log(log_path)}"
+        )
+
+    return health_response.json(), devices_response.json()
+
+
+def _run_llm_workload(
+    client: httpx.Client,
+    args: argparse.Namespace,
+    log_path: Path,
+) -> tuple[dict[str, object], float]:
+    start = time.perf_counter()
+    generate_response = client.post(
+        "/api/generate",
+        json={
+            "model": args.model,
+            "prompt": args.prompt,
+            "stream": False,
+        },
+    )
+    inference_seconds = time.perf_counter() - start
+
+    if generate_response.status_code != 200:
+        raise RuntimeError(
+            f"Generate request failed with {generate_response.status_code}.\n"
+            f"Body: {generate_response.text}\n"
+            f"Server log:\n{_tail_log(log_path)}"
+        )
+
+    return generate_response.json(), inference_seconds
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Certify that NPU Proxy is performing real inference on the local Intel NPU.",
     )
@@ -140,6 +210,13 @@ def parse_args() -> argparse.Namespace:
         help="Model name to certify. Defaults to the repo's default LLM model.",
     )
     parser.add_argument(
+        "--device",
+        type=str.upper,
+        choices=_DEVICE_CHOICES,
+        default="NPU",
+        help="Requested LLM device for the temporary certification server (default: NPU).",
+    )
+    parser.add_argument(
         "--prompt",
         default="Reply with a short sentence confirming NPU certification.",
         help="Prompt used for the certification generation request.",
@@ -148,7 +225,7 @@ def parse_args() -> argparse.Namespace:
         "--output",
         help="Optional path to write the JSON certification report.",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main() -> int:
@@ -156,7 +233,7 @@ def main() -> int:
     repo_root = Path(__file__).resolve().parents[1]
     model_path = DEFAULT_MODEL_DIR / args.model
     runtime_details = collect_openvino_runtime_details()
-    log_path = Path(tempfile.gettempdir()) / "npu-proxy-certify.log"
+    log_path = _get_certification_log_path(repo_root, args.device)
 
     if not runtime_details["npu_visible"]:
         print("Certification failed: OpenVINO does not see an NPU on this host.", file=sys.stderr)
@@ -177,6 +254,7 @@ def main() -> int:
             log_path=log_path,
             port=args.port,
             startup_timeout=args.startup_timeout,
+            requested_device=args.device,
         )
 
         with httpx.Client(base_url=base_url, timeout=args.request_timeout) as client:
@@ -184,33 +262,15 @@ def main() -> int:
             if pre_health.status_code != 200:
                 raise RuntimeError(f"Unexpected /health response before certification: {pre_health.status_code}")
 
-            start = time.perf_counter()
-            generate_response = client.post(
-                "/api/generate",
-                json={
-                    "model": args.model,
-                    "prompt": args.prompt,
-                    "stream": False,
-                },
-            )
-            inference_seconds = time.perf_counter() - start
-
-            health_response = client.get("/health")
-            devices_response = client.get("/health/devices")
-
-        if generate_response.status_code != 200:
-            raise RuntimeError(
-                f"Generate request failed with {generate_response.status_code}.\n"
-                f"Body: {generate_response.text}\n"
-                f"Server log:\n{_tail_log(log_path)}"
-            )
+            generate_data, inference_seconds = _run_llm_workload(client, args, log_path)
+            health_data, devices_data = _collect_observability_snapshots(client, log_path)
 
         report = evaluate_hardware_certification(
             runtime_details=runtime_details,
-            health_data=health_response.json(),
-            devices_data=devices_response.json(),
-            generate_data=generate_response.json(),
-            requested_device="NPU",
+            health_data=health_data,
+            devices_data=devices_data,
+            generate_data=generate_data,
+            requested_device=args.device,
             model=args.model,
             startup_seconds=startup_seconds,
             inference_seconds=inference_seconds,
