@@ -1,56 +1,30 @@
-# NPU Proxy Documentation
+# Documentation Index
 
-Welcome to the NPU Proxy documentation. This index helps you find what you need.
+This index points to documentation for the current local developer-workstation version of NPU Proxy.
 
-## Quick Links
+## Core docs
 
-- **[README](../README.md)** - Project overview and quickstart
-- **[SPEC](../SPEC.md)** - Complete technical specification
-- **[CONTRIBUTING](../CONTRIBUTING.md)** - How to contribute
+- [README.md](../README.md) - project overview, quick start, and local `127.0.0.1:8080` usage
+- [SPEC.md](../SPEC.md) - current implementation snapshot and release-truth behavior
+- [CHANGELOG.md](../CHANGELOG.md) - released changes
 
----
+## API docs
 
-## Documentation Sections
+- [api/OLLAMA_API.md](api/OLLAMA_API.md) - Ollama-compatible endpoints, request/response shapes, and local-client notes
+- [api/EMBEDDINGS.md](api/EMBEDDINGS.md) - OpenAI/Ollama embedding endpoints, validation limits, and response behavior
+- [api/STREAMING.md](api/STREAMING.md) - OpenAI SSE and Ollama NDJSON streaming formats and cancellation notes
 
-### 📘 [Guides](guides/)
+## Guides
 
-User-focused documentation for getting started and using NPU Proxy.
+- [guides/MODEL_DOWNLOAD.md](guides/MODEL_DOWNLOAD.md) - Hugging Face/OpenVINO model download and conversion workflows
+- [guides/BENCHMARKS.md](guides/BENCHMARKS.md) - benchmark helper usage for local performance checks
 
-| Document | Description |
-|----------|-------------|
-| [MODEL_DOWNLOAD.md](guides/MODEL_DOWNLOAD.md) | How to download and set up models |
-| [BENCHMARKS.md](guides/BENCHMARKS.md) | Performance testing and benchmarking |
+## Development / reference
 
-### 📗 [API Reference](api/)
+- [development/CONVERTER_API.md](development/CONVERTER_API.md) - model converter API behavior and integration notes
 
-Detailed API documentation for all endpoints.
+## Research notes
 
-| Document | Description |
-|----------|-------------|
-| [OLLAMA_API.md](api/OLLAMA_API.md) | Ollama-compatible API endpoints and parameter mapping |
-| [EMBEDDINGS.md](api/EMBEDDINGS.md) | Text embeddings API usage |
-| [STREAMING.md](api/STREAMING.md) | Real-time SSE streaming architecture |
+- [research/](research/) - historical background material and exploratory notes; useful context, but not release commitments or current product behavior
 
-### 📙 [Development](development/)
-
-Documentation for contributors and developers.
-
-| Document | Description |
-|----------|-------------|
-| [CONVERTER_API.md](development/CONVERTER_API.md) | Model converter module API reference |
-
-### 📕 [Research](research/)
-
-Research notes and analysis that informed the implementation. These documents capture design decisions, alternatives considered, and patterns from other projects.
-
-| Document | Description |
-|----------|-------------|
-| [README.md](research/README.md) | Research index and context |
-
----
-
-## External Resources
-
-- **[OpenVINO GenAI Docs](https://docs.openvino.ai/2024/learn-openvino/llm_inference_guide/genai-guide-npu.html)** - Official NPU guide
-- **[Ollama API Docs](https://github.com/ollama/ollama/blob/main/docs/api.md)** - API compatibility reference
-- **[OpenAI API Reference](https://platform.openai.com/docs/api-reference)** - OpenAI format reference
+For shipped behavior and current validation truth, prefer the root `README.md`, `SPEC.md`, and the API/guide docs above.

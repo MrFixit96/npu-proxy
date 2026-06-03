@@ -17,15 +17,27 @@ Usage:
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 try:
-    from npu_proxy.models.mapper import OLLAMA_TO_HUGGINGFACE
+    from huggingface_hub import HfApi
+except ImportError:  # pragma: no cover - optional until download is invoked
+    HfApi = None
+
+try:
+    from npu_proxy.models.converter import REQUIRED_OPENVINO_FILES
+    from npu_proxy.models.downloader import DOWNLOAD_METADATA_FILE
+    from npu_proxy.models.mapper import OLLAMA_TO_HUGGINGFACE, resolve_model_repo
 except ImportError:
-    # Fallback mapping if import fails
+    REQUIRED_OPENVINO_FILES = ("openvino_model.xml", "openvino_model.bin")
+    DOWNLOAD_METADATA_FILE = ".npu_proxy_download.json"
+    resolve_model_repo = None
+
+    # Minimal fallback if package APIs are unavailable. Normal execution uses npu_proxy.models.mapper.
     OLLAMA_TO_HUGGINGFACE = {
         "bge-small": "BAAI/bge-small-en-v1.5",
         "bge-base": "BAAI/bge-base-en-v1.5",
@@ -34,6 +46,14 @@ except ImportError:
         "all-minilm": "sentence-transformers/all-MiniLM-L6-v2",
         "all-mpnet": "sentence-transformers/all-mpnet-base-v2",
     }
+
+
+def is_openvino_model(path: Path) -> bool:
+    """Return True when the export contains the required OpenVINO IR files."""
+    model_path = Path(path)
+    return model_path.is_dir() and all(
+        (model_path / file_name).exists() for file_name in REQUIRED_OPENVINO_FILES
+    )
 
 
 class ModelManager:
@@ -55,13 +75,21 @@ class ModelManager:
         Returns:
             HuggingFace repository name.
         """
+        if resolve_model_repo is not None:
+            resolved_repo = resolve_model_repo(model_name)
+            if resolved_repo is not None:
+                return resolved_repo[0]
+
         # If it already looks like a HuggingFace repo (contains /), return as-is
         if "/" in model_name:
             return model_name
 
-        # Try to resolve from Ollama mapping
+        # Fallback to the package-derived alias mapping when available.
         if model_name in OLLAMA_TO_HUGGINGFACE:
-            return OLLAMA_TO_HUGGINGFACE[model_name]
+            resolved = OLLAMA_TO_HUGGINGFACE[model_name]
+            if isinstance(resolved, tuple):
+                return resolved[0]
+            return resolved
 
         # If not found, assume it's a HuggingFace model name and return as-is
         return model_name
@@ -92,16 +120,38 @@ class ModelManager:
         Returns:
             Path to the model cache directory.
         """
+        try:
+            from npu_proxy.inference.embedding_config import (
+                is_known_embedding_model,
+                resolve_embedding_model_config,
+            )
+
+            if is_known_embedding_model(model_name):
+                return resolve_embedding_model_config(
+                    model_name,
+                    model_dir=self.cache_dir.parent,
+                ).canonical_path
+        except ImportError:
+            pass
+
         safe_name = self.get_safe_model_name(model_name)
         return self.cache_dir / safe_name
 
-    def download_model(self, model_name: str, force: bool = False) -> bool:
+    def download_model(
+        self,
+        model_name: str,
+        force: bool = False,
+        revision: Optional[str] = None,
+        timeout_seconds: int = 3600,
+    ) -> bool:
         """
         Download and export a model to OpenVINO format.
 
         Args:
             model_name: Model name in Ollama or HuggingFace format.
             force: Force re-download even if model exists.
+            revision: Optional Hugging Face revision/branch/tag/commit to export.
+            timeout_seconds: Maximum time to wait for optimum-cli before cleanup.
 
         Returns:
             True if successful, False otherwise.
@@ -112,13 +162,18 @@ class ModelManager:
 
         # Check if already downloaded
         if output_path.exists() and not force:
-            print(f"✓ Model '{model_name}' already cached at {output_path}")
-            return True
+            if is_openvino_model(output_path):
+                print(f"✓ Model '{model_name}' already cached at {output_path}")
+                return True
+            missing = ", ".join(self._missing_required_files(output_path))
+            print(
+                f"→ Re-exporting '{model_name}' because cached files are incomplete: {missing}"
+            )
+            self._remove_existing_cache(output_path)
 
         if output_path.exists() and force:
             print(f"→ Removing existing cache for '{model_name}'...")
-            import shutil
-            shutil.rmtree(output_path)
+            self._remove_existing_cache(output_path)
 
         print(f"→ Downloading and exporting '{model_name}' (HuggingFace: {hf_model})...")
         output_path.mkdir(parents=True, exist_ok=True)
@@ -129,12 +184,14 @@ class ModelManager:
                 "optimum-cli",
                 "export",
                 "openvino",
-                "--model_name_or_path",
+                "--model",
                 hf_model,
                 "--task",
                 "feature-extraction",
-                str(output_path),
             ]
+            if revision:
+                cmd.extend(["--revision", revision])
+            cmd.append(str(output_path))
 
             print(f"→ Running: {' '.join(cmd)}")
 
@@ -144,6 +201,7 @@ class ModelManager:
                 capture_output=True,
                 text=True,
                 check=False,
+                timeout=timeout_seconds,
             )
 
             if result.returncode != 0:
@@ -151,17 +209,44 @@ class ModelManager:
                 print(f"STDERR: {result.stderr}")
                 if result.stdout:
                     print(f"STDOUT: {result.stdout}")
+                self._cleanup_failed_export(output_path)
                 return False
+
+            if not is_openvino_model(output_path):
+                missing = ", ".join(self._missing_required_files(output_path))
+                print(
+                    "✗ Export completed but missing required OpenVINO files: "
+                    f"{missing or 'unknown'}"
+                )
+                self._cleanup_failed_export(output_path)
+                return False
+
+            commit_sha = self._resolve_commit_sha(hf_model, revision)
+            self._write_download_metadata(
+                output_path,
+                source_repo=hf_model,
+                requested_model=model_name,
+                revision=revision,
+                commit_sha=commit_sha,
+            )
 
             print(f"✓ Successfully exported '{model_name}' to OpenVINO format")
             print(f"  Location: {output_path}")
             return True
 
+        except subprocess.TimeoutExpired:
+            print(
+                f"✗ Export timed out after {timeout_seconds} seconds; removing partial output at {output_path}"
+            )
+            self._cleanup_failed_export(output_path)
+            return False
         except FileNotFoundError:
             print("✗ Error: optimum-cli not found. Install with: pip install optimum[openvino]")
+            self._cleanup_failed_export(output_path)
             return False
         except Exception as e:
             print(f"✗ Error during export: {e}")
+            self._cleanup_failed_export(output_path)
             return False
 
     def list_models(self) -> None:
@@ -172,19 +257,19 @@ class ModelManager:
 
         models = list(self.cache_dir.iterdir())
 
-        if not models:
+        valid_models = [model_path for model_path in models if is_openvino_model(model_path)]
+
+        if not valid_models:
             print("No cached models found.")
             return
 
         print(f"Cached embedding models in {self.cache_dir}:\n")
-        for model_path in sorted(models):
-            if model_path.is_dir():
-                # Convert safe name back to readable format
-                display_name = model_path.name.replace("--", "/").replace("-", ".")
-                size = self._get_dir_size(model_path)
-                print(f"  • {display_name}")
-                print(f"    Path: {model_path}")
-                print(f"    Size: {self._format_size(size)}\n")
+        for model_path in sorted(valid_models):
+            display_name = model_path.name
+            size = self._get_dir_size(model_path)
+            print(f"  • {display_name}")
+            print(f"    Path: {model_path}")
+            print(f"    Size: {self._format_size(size)}\n")
 
     def get_model_info(self, model_name: str) -> bool:
         """
@@ -201,6 +286,12 @@ class ModelManager:
 
         if not model_path.exists():
             print(f"✗ Model '{model_name}' not found in cache")
+            print(f"  Expected path: {model_path}")
+            return False
+        if not is_openvino_model(model_path):
+            missing = ", ".join(self._missing_required_files(model_path))
+            print(f"✗ Model '{model_name}' cache is incomplete")
+            print(f"  Missing files: {missing}")
             print(f"  Expected path: {model_path}")
             return False
 
@@ -250,6 +341,66 @@ class ModelManager:
             size /= 1024.0
         return f"{size:.1f} TB"
 
+    @staticmethod
+    def _missing_required_files(path: Path) -> list[str]:
+        """Return any missing OpenVINO IR files for the cache directory."""
+        return [
+            file_name
+            for file_name in REQUIRED_OPENVINO_FILES
+            if not (Path(path) / file_name).exists()
+        ]
+
+    @staticmethod
+    def _remove_existing_cache(path: Path) -> None:
+        """Remove an existing cache directory before re-exporting."""
+        shutil.rmtree(path)
+
+    @staticmethod
+    def _cleanup_failed_export(path: Path) -> None:
+        """Remove partial export output after a failed or timed-out conversion."""
+        if path.exists():
+            shutil.rmtree(path)
+
+    @staticmethod
+    def _resolve_commit_sha(repo_id: str, revision: Optional[str]) -> Optional[str]:
+        """Resolve a Hugging Face revision to a commit SHA when metadata is reachable."""
+        if HfApi is None:
+            print("⚠ huggingface_hub is unavailable; commit SHA was not recorded")
+            return None
+        try:
+            info = HfApi().repo_info(
+                repo_id=repo_id,
+                repo_type="model",
+                revision=revision,
+                timeout=10,
+            )
+        except Exception as exc:
+            print(f"⚠ Could not resolve Hugging Face commit SHA: {exc}")
+            return None
+        sha = getattr(info, "sha", None)
+        return sha if isinstance(sha, str) and sha else None
+
+    @staticmethod
+    def _write_download_metadata(
+        path: Path,
+        *,
+        source_repo: str,
+        requested_model: str,
+        revision: Optional[str],
+        commit_sha: Optional[str],
+    ) -> None:
+        """Persist source/revision metadata next to the exported model."""
+        metadata = {
+            "source_repo": source_repo,
+            "requested_model": requested_model,
+            "revision": revision or "main",
+            "commit_sha": commit_sha,
+        }
+        (path / DOWNLOAD_METADATA_FILE).write_text(
+            json.dumps(metadata, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
 
 def main():
     """Main entry point for the CLI tool."""
@@ -285,6 +436,16 @@ Examples:
         action="store_true",
         help="Force re-download even if model exists",
     )
+    download_parser.add_argument(
+        "--revision",
+        help="Hugging Face branch, tag, or commit SHA to export",
+    )
+    download_parser.add_argument(
+        "--timeout-seconds",
+        type=int,
+        default=int(os.environ.get("NPU_PROXY_DOWNLOAD_TIMEOUT", "3600")),
+        help="Maximum seconds to wait for optimum-cli export (default: 3600)",
+    )
 
     # List command
     subparsers.add_parser("list", help="List cached models")
@@ -303,7 +464,12 @@ Examples:
 
     try:
         if args.command == "download":
-            success = manager.download_model(args.model, force=args.force)
+            success = manager.download_model(
+                args.model,
+                force=args.force,
+                revision=args.revision,
+                timeout_seconds=args.timeout_seconds,
+            )
             return 0 if success else 1
 
         elif args.command == "list":

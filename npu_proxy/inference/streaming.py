@@ -6,21 +6,21 @@ It bridges synchronous callbacks from inference threads to async iteration for S
 
 Thread-Safety Model:
     The AsyncTokenStream is designed to handle cross-thread communication safely:
-    
+
     1. The inference thread calls callback() which uses asyncio.run_coroutine_threadsafe()
        to safely push tokens to the queue from a non-event-loop thread.
-    
+
     2. The event loop thread consumes tokens via async iteration (__aiter__).
-    
+
     3. The event loop must be set via set_loop() before any tokens are pushed to ensure
        cross-thread communication works correctly.
-    
+
     4. The complete() and error() methods use the same threadsafe mechanism to signal
        completion or errors from the inference thread.
-    
+
     5. Cancellation is supported via the cancel() method, which is thread-safe and
        signals the producer to stop while allowing buffered tokens to be consumed.
-    
+
     This design allows the inference engine (running in a thread pool) to communicate
     with the async HTTP response handler without explicit locks or queues on the
     application side.
@@ -41,57 +41,119 @@ Example:
 """
 
 import asyncio
-from typing import AsyncIterator
+import concurrent.futures
+import inspect
+import logging
+from collections.abc import AsyncIterator, Callable
+from typing import Any, Literal
 
 # Sentinel value to signal stream completion
 _SENTINEL: None = None
+logger = logging.getLogger(__name__)
+
+FinishReason = Literal["stop", "length"]
+
+
+def normalize_finish_reason(reason: Any) -> FinishReason | None:
+    """Normalize backend-specific stop reasons to API finish reasons."""
+    if reason is None:
+        return None
+    normalized = str(reason).strip().lower()
+    if not normalized:
+        return None
+    if any(marker in normalized for marker in ("length", "max", "limit")):
+        return "length"
+    if any(marker in normalized for marker in ("stop", "eos", "end")):
+        return "stop"
+    return None
+
+
+def determine_finish_reason(
+    *,
+    completion_tokens: int,
+    max_new_tokens: int | None,
+    native_finish_reason: Any = None,
+) -> FinishReason:
+    """Return length when output reached the effective token limit, else stop."""
+    native_reason = normalize_finish_reason(native_finish_reason)
+    if native_reason is not None:
+        return native_reason
+    if max_new_tokens is not None and max_new_tokens > 0 and completion_tokens >= max_new_tokens:
+        return "length"
+    return "stop"
+
+
+def _native_finish_reason_from_engine(engine: Any) -> FinishReason | None:
+    """Best-effort extraction of native backend stop metadata."""
+    for attr in ("last_finish_reason", "finish_reason", "stop_reason"):
+        reason = normalize_finish_reason(getattr(engine, attr, None))
+        if reason is not None:
+            return reason
+    get_device_info = getattr(engine, "get_device_info", None)
+    if callable(get_device_info):
+        try:
+            info = get_device_info()
+        except Exception:
+            return None
+        if isinstance(info, dict):
+            for key in ("finish_reason", "stop_reason", "last_finish_reason"):
+                reason = normalize_finish_reason(info.get(key))
+                if reason is not None:
+                    return reason
+            stats = info.get("last_generation_stats")
+            if isinstance(stats, dict):
+                for key in ("finish_reason", "stop_reason"):
+                    reason = normalize_finish_reason(stats.get(key))
+                    if reason is not None:
+                        return reason
+    return None
 
 
 class AsyncTokenStream:
     """Async iterator for streaming tokens from inference engine.
-    
+
     Uses asyncio.Queue to bridge sync callbacks from inference engines (like OpenVINO)
     to async iteration for SSE (Server-Sent Events) responses.
-    
+
     The stream is safe to use across thread boundaries:
     - Inference thread calls callback() to push tokens
     - Event loop thread consumes via async iteration
     - Cancellation can be requested from any thread via cancel()
-    
+
     Attributes:
         is_cancelled: Read-only property indicating if cancellation was requested.
         is_done: Read-only property indicating if the stream has completed.
-    
+
     Example:
         Basic streaming usage::
-        
+
             # In inference thread setup:
             stream = create_token_stream()
-            
+
             # In inference thread (e.g., OpenVINO callback):
             stream.callback("Hello")
             stream.callback(" ")
             stream.callback("world")
             stream.complete()
-            
+
             # In async handler:
             async for token in stream:
                 yield token
-        
+
         Cancellation example::
-        
+
             stream = create_token_stream()
             # ... start inference ...
-            
+
             # Cancel from another thread or task:
             stream.cancel()
-            
+
             # The async iteration will stop gracefully
     """
-    
+
     def __init__(self, timeout: float = 60.0, max_queue_size: int = 1000) -> None:
         """Initialize the token stream.
-        
+
         Args:
             timeout: Maximum seconds to wait for a token before raising TimeoutError.
                 Set to a value appropriate for your inference latency. Default is 60
@@ -99,7 +161,7 @@ class AsyncTokenStream:
             max_queue_size: Maximum tokens to buffer in the queue. Prevents unbounded
                 memory growth if consumer is slower than producer. Default 1000
                 provides ~4KB buffer for typical token sizes.
-        
+
         Raises:
             ValueError: If timeout is not positive or max_queue_size is not positive.
         """
@@ -107,7 +169,7 @@ class AsyncTokenStream:
             raise ValueError(f"timeout must be positive, got {timeout}")
         if max_queue_size <= 0:
             raise ValueError(f"max_queue_size must be positive, got {max_queue_size}")
-        
+
         self._queue: asyncio.Queue[str | None] = asyncio.Queue(maxsize=max_queue_size)
         self._loop: asyncio.AbstractEventLoop | None = None
         self._timeout: float = timeout
@@ -115,64 +177,77 @@ class AsyncTokenStream:
         self._done: bool = False
         self._cancelled: bool = False
         self._error: Exception | None = None
-    
+        self._finish_reason: FinishReason | None = None
+        self._completion_token_count: int = 0
+
     def set_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         """Set the event loop for cross-thread communication.
-        
+
         Must be called before the stream is used to ensure callbacks from
         inference threads can safely push tokens to the queue.
-        
+
         Args:
             loop: The asyncio event loop to use for queue communication.
-                Typically obtained via asyncio.get_event_loop() or
-                asyncio.get_running_loop().
-        
+                Typically obtained via asyncio.get_running_loop().
+
         Raises:
             TypeError: If loop is not an AbstractEventLoop.
-        
+
         Note:
             This is automatically called by create_token_stream(). Only call
             manually if you're constructing AsyncTokenStream directly.
         """
+        if not isinstance(loop, asyncio.AbstractEventLoop):
+            raise TypeError("loop must be an asyncio.AbstractEventLoop")
         self._loop = loop
-    
+
     @property
     def is_cancelled(self) -> bool:
         """Check if cancellation has been requested.
-        
+
         Returns:
             True if cancel() has been called, False otherwise.
         """
         return self._cancelled
-    
+
     @property
     def is_done(self) -> bool:
         """Check if the stream has completed.
-        
+
         Returns:
             True if the stream has finished (either completed normally,
             cancelled, or errored), False otherwise.
         """
         return self._done
-    
+
+    @property
+    def finish_reason(self) -> FinishReason | None:
+        """Normalized reason generation finished, when known."""
+        return self._finish_reason
+
+    @property
+    def completion_token_count(self) -> int:
+        """Number of completion tokens successfully queued."""
+        return self._completion_token_count
+
     def cancel(self) -> None:
         """Request cancellation of the stream.
-        
+
         Thread-safe method to signal the producer to stop. The stream will
         complete gracefully, allowing any in-flight operations to finish.
-        
+
         After calling cancel():
         - callback() will return True (stop signal) for subsequent calls
         - The async iterator will stop after processing any buffered tokens
         - is_cancelled property will return True
-        
+
         This method is idempotent; calling it multiple times has no additional
         effect after the first call.
-        
+
         Thread-Safety:
             Safe to call from any thread. Uses asyncio.run_coroutine_threadsafe()
             to push a sentinel value to unblock the consumer.
-        
+
         Example:
             >>> stream = create_token_stream()
             >>> # Start inference...
@@ -181,92 +256,148 @@ class AsyncTokenStream:
         """
         if self._cancelled:
             return  # Already cancelled, no-op
-        
+
         self._cancelled = True
         # Push sentinel to unblock consumer if waiting
         if self._loop is not None:
+            if not self._loop.is_running():
+                return
+            sentinel_coro = self._queue.put(_SENTINEL)
             try:
-                asyncio.run_coroutine_threadsafe(
-                    self._queue.put(_SENTINEL), self._loop
-                )
+                asyncio.run_coroutine_threadsafe(sentinel_coro, self._loop)
             except Exception:
+                sentinel_coro.close()
+                logger.debug("Failed to schedule stream cancellation sentinel", exc_info=True)
                 # Loop may be closed or unavailable; consumer will detect
                 # cancellation via _cancelled flag on next iteration
-                pass
-    
+
     def callback(self, token: str) -> bool:
         """Callback for inference engine - pushes token to queue.
-        
+
         This method is designed to be called from the inference thread
         (e.g., as a callback from OpenVINO's async inference).
-        
+
         Uses asyncio.run_coroutine_threadsafe() to safely push to the queue
         even though this method runs in a different thread than the event loop.
-        
+
         Args:
             token: The generated token to stream to the client.
-        
+
         Returns:
             bool: False to continue generation (normal case).
                 True to stop generation (if cancelled, queue failed, or no loop).
-        
+
         Thread-Safety:
             Safe to call from any thread. Uses asyncio.run_coroutine_threadsafe()
             to communicate with the event loop thread.
-        
+
         Example:
             >>> def on_token(token: str) -> bool:
             ...     return stream.callback(token)
             >>> # Pass on_token to your inference engine
         """
-        if self._cancelled:
-            return True  # Stop if cancelled
+        if self._cancelled or self._done:
+            return True  # Stop if cancelled or completed
         if self._loop is None:
+            self.error(RuntimeError("Token stream event loop is not initialized."))
             return True  # Stop if no loop set
+        if not self._loop.is_running():
+            self.error(RuntimeError("Token stream event loop is not running."))
+            return True
         try:
-            asyncio.run_coroutine_threadsafe(self._queue.put(token), self._loop)
-            return False  # Continue generation
-        except Exception:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if running_loop is self._loop:
+            try:
+                self._queue.put_nowait(token)
+                self._completion_token_count += 1
+                return self._cancelled
+            except asyncio.QueueFull as exc:
+                stream_error = RuntimeError("Token stream queue is full.")
+                stream_error.__cause__ = exc
+                self.error(stream_error)
+                return True
+        put_coro = self._queue.put(token)
+        try:
+            put_future = asyncio.run_coroutine_threadsafe(put_coro, self._loop)
+        except Exception as exc:
+            put_coro.close()
+            stream_error = RuntimeError("Failed to enqueue streamed token.")
+            stream_error.__cause__ = exc
+            self.error(stream_error)
             return True  # Stop on error
-    
+        try:
+            while True:
+                try:
+                    put_future.result(timeout=0.1)
+                    self._completion_token_count += 1
+                    return self._cancelled
+                except concurrent.futures.TimeoutError:
+                    if self._cancelled:
+                        put_future.cancel()
+                        return True
+        except concurrent.futures.CancelledError:
+            return True
+        except Exception as exc:
+            stream_error = RuntimeError("Failed to enqueue streamed token.")
+            stream_error.__cause__ = exc
+            self.error(stream_error)
+            return True  # Stop on error
+
     def try_push(self, token: str) -> bool:
         """Non-blocking push of a token to the queue.
-        
+
         Unlike callback(), this method returns immediately if the queue is full,
         providing explicit backpressure feedback to the producer.
-        
+
         Args:
             token: The generated token to stream to the client.
-        
+
         Returns:
             bool: True if the token was successfully queued, False if the queue
                 is full or the stream is cancelled/not initialized.
-        
+
         Thread-Safety:
             Safe to call from any thread.
-        
+
         Example:
             >>> if not stream.try_push(token):
             ...     # Queue full, apply backpressure
             ...     time.sleep(0.001)
         """
-        if self._cancelled or self._loop is None:
+        if self._cancelled or self._done or self._loop is None or not self._loop.is_running():
             return False
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if running_loop is self._loop:
+            try:
+                self._queue.put_nowait(token)
+                self._completion_token_count += 1
+                return True
+            except asyncio.QueueFull:
+                return False
         try:
             # Use put_nowait wrapped in threadsafe call
             future = asyncio.run_coroutine_threadsafe(
                 self._try_put(token), self._loop
             )
-            return future.result(timeout=0.1)
+            queued = future.result(timeout=0.1)
+            if queued:
+                self._completion_token_count += 1
+            return queued
         except Exception:
+            logger.debug("Failed to schedule non-blocking token push", exc_info=True)
             return False
-    
+
     async def _try_put(self, token: str) -> bool:
         """Internal async helper for non-blocking put.
-        
+
         Args:
             token: Token to push to queue.
-        
+
         Returns:
             bool: True if successful, False if queue is full.
         """
@@ -275,126 +406,142 @@ class AsyncTokenStream:
             return True
         except asyncio.QueueFull:
             return False
-    
-    def complete(self) -> None:
+
+    def complete(self, finish_reason: FinishReason | None = None) -> None:
         """Signal stream completion by pushing sentinel.
-        
+
         Call this from the inference thread when generation is complete.
         This pushes a None sentinel which signals __aiter__ to stop.
-        
+
         This method is idempotent; calling it multiple times is safe.
-        
+
         Thread-Safety:
             Safe to call from any thread. Uses asyncio.run_coroutine_threadsafe()
             to communicate with the event loop thread.
-        
+
         Example:
             >>> # After all tokens have been generated:
             >>> stream.complete()
         """
+        if finish_reason is not None:
+            self._finish_reason = finish_reason
+        if self._done:
+            return
+        self._done = True
         if self._loop is not None:
+            if not self._loop.is_running():
+                return
+            sentinel_coro = self._queue.put(_SENTINEL)
             try:
-                asyncio.run_coroutine_threadsafe(
-                    self._queue.put(_SENTINEL), self._loop
-                )
+                asyncio.run_coroutine_threadsafe(sentinel_coro, self._loop)
             except Exception:
-                # Loop may be closed; set done flag directly
-                self._done = True
-    
+                sentinel_coro.close()
+                logger.debug("Failed to schedule stream completion sentinel", exc_info=True)
+
     def error(self, exc: Exception) -> None:
         """Signal an error occurred during generation.
-        
+
         Call this from the inference thread if generation fails.
         The exception will be raised to the async iterator consumer.
-        
+
         Args:
             exc: The exception that occurred during inference.
-        
+
         Raises:
             TypeError: If exc is not an Exception instance.
-        
+
         Thread-Safety:
             Safe to call from any thread. Stores the exception and signals
             completion, which will raise the error to the consumer.
-        
+
         Example:
             >>> try:
             ...     # inference code
             ... except Exception as e:
             ...     stream.error(e)
         """
+        if not isinstance(exc, Exception):
+            raise TypeError("exc must be an Exception instance")
+        if self._done:
+            return
         self._error = exc
         self.complete()
-    
+
     def __aiter__(self) -> "AsyncTokenStream":
         """Return self as async iterator.
-        
+
         Returns:
             AsyncTokenStream: Self, implementing the async iterator protocol.
         """
         return self
-    
+
     async def __anext__(self) -> str:
         """Get the next token from the stream.
-        
+
         Waits for the next token to be pushed by callback(). Handles
         cancellation, timeouts, and error propagation.
-        
+
         Returns:
             str: The next token in the stream.
-        
+
         Raises:
             StopAsyncIteration: When the stream is complete or cancelled.
             TimeoutError: If no token arrives within the configured timeout.
             Exception: Any exception passed to error() is re-raised here.
-        
+
         Note:
             This method handles asyncio.CancelledError by setting the cancelled
-            flag and stopping iteration gracefully.
+            flag and re-raising the cancellation so disconnects are not mistaken
+            for clean stream completion.
         """
-        # Check for early termination
-        if self._cancelled or self._done:
+        # Check for early termination. If completion was requested while
+        # tokens were buffered, drain the queue before stopping.
+        if self._cancelled:
             raise StopAsyncIteration
-        
+        if self._done and self._queue.empty():
+            if self._error is not None:
+                raise self._error
+            raise StopAsyncIteration
+
         try:
             token = await asyncio.wait_for(
                 self._queue.get(),
                 timeout=self._timeout
             )
         except asyncio.CancelledError:
-            # Handle task cancellation gracefully
+            # Mark local state, then preserve the cancellation signal.
             self._cancelled = True
             self._done = True
-            raise StopAsyncIteration
+            raise
         except asyncio.TimeoutError:
             self._done = True
             raise TimeoutError(f"Token stream timed out after {self._timeout}s")
-        
+
         # Check for sentinel (completion signal)
         if token is _SENTINEL or token is None:
             self._done = True
             if self._error is not None:
                 raise self._error
             raise StopAsyncIteration
-        
+
         return token
-    
+
     async def collect(self, max_tokens: int | None = None) -> list[str]:
         """Collect all tokens into a list.
-        
+
         Convenience method to consume the entire stream and return all tokens.
         Useful for testing or when you need all tokens at once.
-        
+
         Args:
             max_tokens: Maximum number of tokens to collect. None means no limit.
-        
+
         Returns:
             list[str]: All tokens from the stream.
-        
+
         Raises:
             TimeoutError: If waiting for a token times out.
             Exception: Any exception passed to error().
-        
+
         Example:
             >>> tokens = await stream.collect()
             >>> full_text = "".join(tokens)
@@ -414,11 +561,11 @@ def create_token_stream(
     max_queue_size: int = 1000
 ) -> AsyncTokenStream:
     """Create a new token stream with the current event loop.
-    
+
     Convenience function that creates an AsyncTokenStream and automatically
     sets the running event loop. Use this in async contexts where you're
     already inside the event loop.
-    
+
     Args:
         timeout: Maximum seconds to wait for a token before raising TimeoutError.
             Default 60 seconds is suitable for most inference tasks.
@@ -426,31 +573,122 @@ def create_token_stream(
         max_queue_size: Maximum number of tokens to buffer. Default 1000 provides
             backpressure for slow consumers. Reduce for memory-constrained
             environments.
-    
+
     Returns:
         AsyncTokenStream: A properly configured stream ready to use.
-    
+
     Raises:
         RuntimeError: If called outside an async context (no running event loop).
         ValueError: If timeout or max_queue_size is not positive.
-    
+
     Example:
         Basic usage in FastAPI::
-        
+
             @app.post("/generate")
             async def generate():
                 stream = create_token_stream(timeout=30)
                 # ... pass stream to inference thread ...
                 async for token in stream:
                     yield token
-        
+
         With custom backpressure settings::
-        
+
             stream = create_token_stream(
                 timeout=120.0,      # 2 minutes for slow models
                 max_queue_size=100  # Smaller buffer for memory
             )
     """
     stream = AsyncTokenStream(timeout=timeout, max_queue_size=max_queue_size)
-    stream.set_loop(asyncio.get_event_loop())
+    stream.set_loop(asyncio.get_running_loop())
     return stream
+
+
+async def _await_stream_shutdown(
+    inference_task: asyncio.Future,
+    *,
+    request_id: str | None,
+    timeout: float = 5.0,
+) -> None:
+    """Wait briefly for the inference worker to stop after stream cancellation."""
+
+    try:
+        await asyncio.wait_for(asyncio.shield(inference_task), timeout=timeout)
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Streaming inference worker did not stop before shutdown timeout",
+            extra={"request_id": request_id},
+        )
+
+
+async def stream_engine_tokens(
+    *,
+    engine_factory: Callable[[], Any],
+    prompt: str,
+    max_new_tokens: int,
+    temperature: float,
+    request_id: str | None,
+    top_p: float = 0.9,
+    timeout: float = 180.0,
+    finish_reason_callback: Callable[[FinishReason], None] | None = None,
+) -> AsyncIterator[str]:
+    """Run shared generate_stream orchestration and yield streamed tokens."""
+
+    loop = asyncio.get_running_loop()
+    stream = AsyncTokenStream(timeout=timeout)
+    stream.set_loop(loop)
+
+    def run_inference() -> None:
+        native_finish_reason: FinishReason | None = None
+        try:
+            engine = engine_factory()
+            stream_kwargs = {
+                "max_new_tokens": max_new_tokens,
+                "temperature": temperature,
+                "top_p": top_p,
+                "streamer_callback": stream.callback,
+                "abort_callback": lambda: stream.is_cancelled,
+                "timeout": timeout,
+            }
+            try:
+                signature = inspect.signature(engine.generate_stream)
+                accepts_extra_kwargs = any(
+                    parameter.kind == inspect.Parameter.VAR_KEYWORD
+                    for parameter in signature.parameters.values()
+                )
+                if not accepts_extra_kwargs:
+                    stream_kwargs = {
+                        key: value
+                        for key, value in stream_kwargs.items()
+                        if key in signature.parameters
+                    }
+            except (TypeError, ValueError):
+                pass
+
+            for _ in engine.generate_stream(prompt, **stream_kwargs):
+                pass
+            native_finish_reason = _native_finish_reason_from_engine(engine) or native_finish_reason
+        except Exception as exc:
+            stream.error(exc)
+        finally:
+            finish_reason = determine_finish_reason(
+                completion_tokens=stream.completion_token_count,
+                max_new_tokens=max_new_tokens,
+                native_finish_reason=native_finish_reason,
+            )
+            stream.complete(finish_reason)
+
+    inference_task = loop.run_in_executor(None, run_inference)
+    try:
+        async for token in stream:
+            yield token
+        if finish_reason_callback is not None:
+            finish_reason_callback(
+                stream.finish_reason
+                or determine_finish_reason(
+                    completion_tokens=stream.completion_token_count,
+                    max_new_tokens=max_new_tokens,
+                )
+            )
+    finally:
+        stream.cancel()
+        await _await_stream_shutdown(inference_task, request_id=request_id)

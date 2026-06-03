@@ -54,13 +54,140 @@ Note:
 
 import logging
 import uuid
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, Request, Response
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from npu_proxy.inference.embedding_engine import get_embedding_engine
+from npu_proxy.api.header_utils import (
+    add_request_id_header,
+    apply_embedding_engine_headers as shared_apply_embedding_engine_headers,
+    embedding_failure_reason,
+    resolve_request_id,
+    openai_error_content,
+    validate_embedding_batch_result_count,
+)
+from npu_proxy.inference.embedding_config import InvalidEmbeddingModelError
+from npu_proxy.inference.embedding_engine import (
+    EmbeddingInferenceError,
+    EmbeddingTimeoutError,
+    EmbeddingUnavailableError,
+    get_embedding_engine,
+)
 from npu_proxy.inference.tokenizer import count_tokens
 
 router = APIRouter(prefix="/v1", tags=["embeddings"])
 logger = logging.getLogger(__name__)
+MAX_EMBEDDING_BATCH_SIZE = 128
+MAX_EMBEDDING_TEXT_CHARS = 8192
+MAX_EMBEDDING_TOTAL_CHARS = 65536
+
+
+def _get_requested_device(http_request: Request) -> str | None:
+    """Extract an optional per-request embedding device override."""
+    device = http_request.headers.get("X-NPU-Proxy-Device")
+    return device or None
+
+
+def _apply_engine_headers(response: Response, engine_info: dict) -> None:
+    """Expose resolved embedding routing details additively via sanitized headers."""
+    public_info = dict(engine_info)
+    if public_info.get("fallback_reason") or public_info.get("load_error"):
+        public_info["fallback_reason"] = "Embedding engine unavailable"
+        public_info.pop("load_error", None)
+    shared_apply_embedding_engine_headers(response, public_info)
+
+
+def _validate_embedding_batch_result_count(
+    inputs: list[str],
+    embeddings: list[list[float]],
+) -> None:
+    """Reject batch embedding responses that do not align 1:1 with inputs."""
+    validate_embedding_batch_result_count(inputs, embeddings)
+
+
+def _runtime_fallback_error_response(engine, response: Response, request_id: str) -> JSONResponse | None:
+    """Reject runtime failover that would otherwise look like a successful embed."""
+    engine_info = engine.get_engine_info()
+    if not (engine_info.get("is_fallback") and engine_info.get("fallback_mode") == "runtime"):
+        return None
+
+    logger.error(
+        "Request %s: embedding runtime fallback activated: %s",
+        request_id,
+        embedding_failure_reason(engine_info, default="unknown"),
+    )
+    _apply_engine_headers(response, engine_info)
+    return _openai_error_response(
+        500,
+        "Embedding inference failed",
+        error_type="inference_error",
+        code="embedding_failed",
+        headers=dict(response.headers),
+    )
+
+
+def _openai_error_response(
+    status_code: int,
+    message: str,
+    *,
+    error_type: str,
+    code: str,
+    headers: dict[str, str] | None = None,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content=openai_error_content(message, error_type=error_type, code=code),
+        headers=headers,
+    )
+
+
+def _validate_inputs(inputs: list[str], response: Response) -> JSONResponse | None:
+    """Validate input bounds before engine loading/inference."""
+    if not inputs:
+        return _openai_error_response(
+            400,
+            "Embedding input must contain at least one item",
+            error_type="invalid_request_error",
+            code="empty_input",
+            headers=dict(response.headers),
+        )
+    if len(inputs) > MAX_EMBEDDING_BATCH_SIZE:
+        return _openai_error_response(
+            413,
+            "Embedding input batch is too large",
+            error_type="request_too_large",
+            code="embedding_batch_too_large",
+            headers=dict(response.headers),
+        )
+    total_chars = 0
+    for text in inputs:
+        if not text.strip():
+            return _openai_error_response(
+                400,
+                "Embedding input text must not be empty",
+                error_type="invalid_request_error",
+                code="empty_input",
+                headers=dict(response.headers),
+            )
+        text_length = len(text)
+        if text_length > MAX_EMBEDDING_TEXT_CHARS:
+            return _openai_error_response(
+                413,
+                "Embedding input text is too large",
+                error_type="request_too_large",
+                code="embedding_input_too_large",
+                headers=dict(response.headers),
+            )
+        total_chars += text_length
+    if total_chars > MAX_EMBEDDING_TOTAL_CHARS:
+        return _openai_error_response(
+            413,
+            "Embedding request is too large",
+            error_type="request_too_large",
+            code="embedding_request_too_large",
+            headers=dict(response.headers),
+        )
+    return None
 
 
 class EmbeddingRequest(BaseModel):
@@ -200,6 +327,7 @@ class ErrorResponse(BaseModel):
 
 
 @router.post("/embeddings", response_model=EmbeddingResponse, responses={
+    503: {"model": ErrorResponse, "description": "Embedding engine unavailable"},
     500: {"model": ErrorResponse, "description": "Inference error"},
     504: {"model": ErrorResponse, "description": "Inference timeout"},
 })
@@ -225,9 +353,9 @@ async def create_embeddings(
             - model: Echo of requested model name
             - usage: Token counts for billing/tracking
     
-    Raises:
-        HTTPException(500): Engine initialization or inference failure.
-        HTTPException(504): Inference timeout exceeded.
+    Error responses:
+        Returns OpenAI-compatible {"error": {...}} payloads for invalid
+        requests, unavailable engines, inference failures, and timeouts.
     
     OpenAI Compatibility:
         - Matches POST /v1/embeddings from OpenAI API
@@ -270,51 +398,139 @@ async def create_embeddings(
         ZE_RESULT_ERROR_UNKNOWN errors for large models.
     """
     # Generate or extract request ID for tracing
-    request_id = http_request.headers.get("X-Request-ID", str(uuid.uuid4()))
-    response.headers["X-Request-ID"] = request_id
-    
-    logger.info(f"Embedding request {request_id}: model={request.model}")
-    
+    request_id = resolve_request_id(
+        http_request.headers.get("X-Request-ID"),
+        prefix="",
+        hex_chars=32,
+        generator=lambda: str(uuid.uuid4()),
+    )
+    add_request_id_header(response, request_id)
+
+    if request.encoding_format != "float":
+        return _openai_error_response(
+            400,
+            "Only encoding_format='float' is currently supported",
+            error_type="invalid_request_error",
+            code="unsupported_encoding_format",
+            headers=dict(response.headers),
+        )
+
+    logger.info("Embedding request %s: model=%s", request_id, request.model)
+
     # Normalize input to list
     inputs = request.input if isinstance(request.input, list) else [request.input]
-    
+    validation_error = _validate_inputs(inputs, response)
+    if validation_error is not None:
+        return validation_error
+    requested_device = _get_requested_device(http_request)
+
     # Get embedding engine
     try:
-        engine = get_embedding_engine()
-    except Exception as e:
-        logger.error(f"Failed to get embedding engine: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail={"message": str(e), "type": "engine_error", "code": "engine_init_failed"},
+        engine = await run_in_threadpool(
+            get_embedding_engine,
+            model_name=request.model,
+            device=requested_device,
+        )
+    except InvalidEmbeddingModelError:
+        logger.warning(
+            "Request %s: rejected embedding model identifier",
+            request_id,
+            exc_info=True,
+        )
+        return _openai_error_response(
+            400,
+            "Invalid embedding model identifier",
+            error_type="invalid_request_error",
+            code="invalid_embedding_model",
+            headers=dict(response.headers),
+        )
+    except EmbeddingUnavailableError:
+        logger.warning(
+            "Request %s: embedding engine unavailable",
+            request_id,
+            exc_info=True,
+        )
+        return _openai_error_response(
+            503,
+            "Embedding engine is unavailable",
+            error_type="service_unavailable_error",
+            code="embedding_unavailable",
+            headers=dict(response.headers),
+        )
+    except Exception:
+        logger.error("Request %s: failed to get embedding engine", request_id, exc_info=True)
+        return _openai_error_response(
+            503,
+            "Embedding engine is unavailable",
+            error_type="service_unavailable_error",
+            code="embedding_unavailable",
+            headers=dict(response.headers),
         )
     
-    # Check if engine had load errors (model too large for device, etc.)
     engine_info = engine.get_engine_info()
-    if engine_info.get("load_error"):
-        logger.warning(f"Request {request_id}: Using fallback due to load error: {engine_info['load_error']}")
-        response.headers["X-NPU-Proxy-Fallback"] = "true"
-    
-    # Set routing headers for observability
-    response.headers["X-NPU-Proxy-Device"] = engine_info.get("device", "unknown")
-    response.headers["X-NPU-Proxy-Model"] = engine_info.get("model", request.model)
+    _apply_engine_headers(response, engine_info)
+    if engine_info.get("is_fallback"):
+        logger.warning(
+            "Request %s: using embedding fallback (%s)",
+            request_id,
+            embedding_failure_reason(engine_info, default="unknown"),
+        )
+        if not engine_info.get("fallback_allowed", False):
+            return _openai_error_response(
+                503,
+                "Embedding engine is unavailable",
+                error_type="service_unavailable_error",
+                code="embedding_unavailable",
+                headers=dict(response.headers),
+            )
     
     # Generate embeddings for all inputs
     try:
-        embeddings = engine.embed_batch(inputs)
-        logger.debug(f"Request {request_id}: Generated {len(embeddings)} embeddings")
-    except TimeoutError as e:
-        logger.error(f"Request {request_id}: Embedding timeout: {e}")
-        raise HTTPException(
-            status_code=504,
-            detail={"message": str(e), "type": "timeout_error", "code": "inference_timeout"},
+        embeddings = await run_in_threadpool(engine.embed_batch, inputs)
+        _validate_embedding_batch_result_count(inputs, embeddings)
+        runtime_fallback_error = _runtime_fallback_error_response(engine, response, request_id)
+        if runtime_fallback_error is not None:
+            return runtime_fallback_error
+        logger.debug("Request %s: Generated %s embeddings", request_id, len(embeddings))
+    except EmbeddingTimeoutError:
+        logger.error("Request %s: embedding timeout", request_id, exc_info=True)
+        return _openai_error_response(
+            504,
+            "Embedding inference timed out",
+            error_type="timeout_error",
+            code="inference_timeout",
+            headers=dict(response.headers),
         )
-    except Exception as e:
-        # This catches OpenVINO errors like ZE_RESULT_ERROR_UNKNOWN
-        error_msg = str(e)
-        logger.error(f"Request {request_id}: Embedding failed: {error_msg}")
-        raise HTTPException(
-            status_code=500,
-            detail={"message": error_msg, "type": "inference_error", "code": "embedding_failed"},
+    except EmbeddingUnavailableError:
+        logger.warning(
+            "Request %s: embedding engine unavailable during inference",
+            request_id,
+            exc_info=True,
+        )
+        return _openai_error_response(
+            503,
+            "Embedding engine is unavailable",
+            error_type="service_unavailable_error",
+            code="embedding_unavailable",
+            headers=dict(response.headers),
+        )
+    except EmbeddingInferenceError:
+        logger.error("Request %s: embedding failed", request_id, exc_info=True)
+        return _openai_error_response(
+            500,
+            "Embedding inference failed",
+            error_type="inference_error",
+            code="embedding_failed",
+            headers=dict(response.headers),
+        )
+    except Exception:
+        logger.error("Request %s: embedding failed", request_id, exc_info=True)
+        return _openai_error_response(
+            500,
+            "Embedding inference failed",
+            error_type="inference_error",
+            code="embedding_failed",
+            headers=dict(response.headers),
         )
     
     # Build response
@@ -330,7 +546,7 @@ async def create_embeddings(
         )
         total_tokens += count_tokens(text)
     
-    logger.info(f"Request {request_id}: Completed with {total_tokens} tokens")
+    logger.info("Request %s: Completed with %s tokens", request_id, total_tokens)
     
     return EmbeddingResponse(
         data=embeddings_data,

@@ -9,7 +9,7 @@ This directory contains research notes and analysis that informed the NPU Proxy 
 
 ## Context
 
-These notes were created during the initial development phase (January-February 2026) to ensure NPU Proxy followed industry best practices. They're preserved here as reference for future contributors.
+These notes were created during the initial development phase (January-February 2026) and later branch-planning work to ensure NPU Proxy followed industry best practices. They're preserved here as reference for future contributors, but they may lag behind the current release-truth docs.
 
 ---
 
@@ -53,4 +53,4 @@ These notes were created during the initial development phase (January-February 
 
 ## Note
 
-These are working documents, not polished documentation. Some may contain outdated information or exploratory notes that weren't fully implemented.
+These are working documents, not polished documentation. Some contain outdated information, superseded branch ideas, or exploratory notes that were not fully implemented. Treat them like engineering scratchpads, not product commitments.

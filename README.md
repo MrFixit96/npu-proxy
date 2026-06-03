@@ -1,785 +1,459 @@
 # NPU Proxy
 
-**Ollama-compatible API proxy for Intel NPU inference via OpenVINO.**
+Ollama-compatible and OpenAI-compatible API proxy for local Intel NPU inference via OpenVINO.
 
-Enables Claude Code, Ollama clients, and any OpenAI-compatible application to use Intel NPU hardware acceleration for local LLM inference—including from WSL2 Linux applications.
+NPU Proxy is a **local, single-user developer-workstation tool**. It binds to loopback by default, has no authentication by design, and should not be treated as a shared production proxy.
 
-```
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│   Claude Code   │     │   Ollama CLI    │     │   OpenAI SDK    │
-│   (WSL2/Win)    │     │   (any OS)      │     │   (Python/JS)   │
-└────────┬────────┘     └────────┬────────┘     └────────┬────────┘
-         │                       │                       │
-         └───────────────────────┼───────────────────────┘
-                                 │ HTTP (port 11435)
-                                 ▼
-                    ┌────────────────────────┐
-                    │      NPU Proxy         │
-                    │  FastAPI + OpenVINO    │
-                    └────────────┬───────────┘
-                                 │
-                    ┌────────────▼───────────┐
-                    │     Intel NPU          │
-                    │  (Meteor/Lunar/Arrow)  │
-                    └────────────────────────┘
-```
+This repository currently ships:
 
-## Features
+- FastAPI app with OpenAI-style chat, embeddings, and model listing endpoints
+- Ollama-style generate, chat, embeddings, pull, tags, version, and model-discovery endpoints
+- Windows start scripts plus Linux packaging assets
+- Optional real inference mode backed by local OpenVINO model directories
 
-- **Ollama API Compatible**: Works with any Ollama client (`/api/generate`, `/api/ps`, `/api/show`)
-- **OpenAI API Compatible**: Drop-in replacement for OpenAI SDK (`/v1/chat/completions`, `/v1/embeddings`)
-- **Intel NPU Acceleration**: Uses OpenVINO GenAI for efficient NPU inference
-- **Real-Time Streaming**: True token-by-token SSE streaming (not buffered)
-- **WSL2 Bridge**: Run inference on Windows NPU from WSL2 Linux applications
-- **NPU→CPU Fallback**: Automatic fallback if NPU unavailable
-- **Benchmark CLI**: Compare NPU/GPU/CPU performance on your system
+## Current behavior at a glance
 
-## Quick Start
+- **Default CLI bind:** `127.0.0.1:8080`
+- **Default runtime device:** `NPU`
+- **Default token limit:** `1800`
+- **Default workers:** `1`
+- **Default LLM timeout:** `180` seconds
+- **Default mode:** mock responses unless `NPU_PROXY_REAL_INFERENCE=1` or `--real-inference` is set
+- **OpenAI chat streaming:** SSE (`text/event-stream`)
+- **Ollama streaming:** newline-delimited JSON chunks (`application/x-ndjson`)
+- **Default LLM model path:** `~/.cache/npu-proxy/models/tinyllama-1.1b-chat-int4-ov`
+- **Host-header allow-list:** loopback and test clients by default (`localhost`, `127.0.0.1`, `::1`, `[::1]`, `testserver`, `test`)
+
+## Routing truth and roadmap
+
+There are two different ideas that are easy to blur together:
+
+1. **Current routing classification** — the router can classify a request as better suited for `NPU`, `GPU`, or `CPU` based on prompt size.
+2. **Real per-request routing** — the runtime actually executes that request on the classified device.
+
+### Current release truth
+
+Today the service should be understood as **truthful single-engine execution**:
+
+- the router can still make an advisory choice
+- the API may report that choice for diagnostics
+- the real inference path still runs through the currently loaded engine/runtime state
+- the service should not promise that each request can switch devices independently
+
+In other words, the router is currently more like a **dispatcher recommendation** than an automatic train-track switch.
+
+### Roadmap
+
+- **Current release**: harden the current behavior so headers, health, and documentation describe what the runtime really does today
+- **Future release**: real per-request engine/device routing would need truthful execution binding, observability, certification, and concurrency rules
+
+## Release-truth snapshot for this docs pass
+
+- NPU Proxy is documented as a local developer-workstation process, not a production gateway.
+- Mock mode is the default; real inference must be explicitly enabled.
+- Host-header allow-listing, path hardening, and sanitized errors are implemented.
+- `/api/tags` is implemented and `/api/show` returns registry-backed model metadata.
+- OpenAI and Ollama generation responses now expose stop/length reasons.
+- Embedding inputs are validated before engine execution, with a batch limit of 128.
+
+## Quick start
 
 ### Prerequisites
 
-| Requirement | Version | Notes |
-|-------------|---------|-------|
-| Python | 3.10+ | 3.12+ recommended |
-| Windows | 11 24H2+ | Keep current Intel NPU drivers installed |
-| Intel NPU | Core Ultra Series 1/2/3 and newer Intel NPU hosts validated by OpenVINO | Intel-only path (for example Meteor Lake, Lunar Lake / 200V, Arrow Lake, newer Series 3) |
-| OpenVINO | 2026.1+ | Match the OpenVINO and OpenVINO GenAI package line |
+- Python 3.10+
+- Windows 11 host with current Intel NPU drivers for NPU-backed inference
+- OpenVINO/OpenVINO GenAI packages from `requirements.txt`
 
-### Installation
+### Install dependencies
 
 ```powershell
-# Clone/navigate to the project
-cd npu-proxy
-
-# Install dependencies
 pip install -r requirements.txt
-
-# Verify NPU is detected
-python -c "import openvino as ov; print('NPU available:', 'NPU' in ov.Core().available_devices)"
-# Expected: NPU available: True
 ```
 
-### Download a Model
+### Download the default LLM model
+
+Real LLM inference expects the default model directory to exist at:
+
+```text
+~/.cache/npu-proxy/models/tinyllama-1.1b-chat-int4-ov
+```
+
+One way to populate it is:
 
 ```powershell
-# TinyLlama 1.1B INT4 (recommended for NPU - ~640MB)
 pip install huggingface-hub
 hf download OpenVINO/TinyLlama-1.1B-Chat-v1.0-int4-ov --local-dir ~/.cache/npu-proxy/models/tinyllama-1.1b-chat-int4-ov
 ```
 
-### Start the Server
+### Start the server
+
+#### CLI entry point
 
 ```powershell
-# Option 1: Using the startup script (recommended)
+# CLI defaults to 127.0.0.1:8080 in mock mode
+npu-proxy
+
+# Real inference on the default local bind
+npu-proxy --real-inference
+
+# Explicit host/port
+npu-proxy --host 127.0.0.1 --port 8080 --real-inference
+```
+
+#### Recommended Windows launcher
+
+```powershell
 .\scripts\start-server.ps1
+```
 
-# Option 2: Direct uvicorn command
-python -m uvicorn npu_proxy.main:app --host 0.0.0.0 --port 11435
+That script defaults to loopback (`127.0.0.1`) and port `11435` unless `NPU_PROXY_HOST` or `NPU_PROXY_PORT` is already set. Binding all interfaces requires explicit opt-in:
 
-# Option 3: With real NPU inference enabled
+```powershell
+.\scripts\start-server.ps1 -ListenAll
+# or
+$env:NPU_PROXY_LISTEN_ALL = "true"
+.\scripts\start-server.ps1
+```
+
+If you bind beyond loopback, also set `NPU_PROXY_ALLOWED_HOSTS` or `--allowed-hosts` so legitimate remote Host headers are allowed.
+
+#### Direct uvicorn
+
+```powershell
+python -m uvicorn npu_proxy.main:app --host 127.0.0.1 --port 8080
+
 $env:NPU_PROXY_REAL_INFERENCE = "1"
-python -m uvicorn npu_proxy.main:app --host 0.0.0.0 --port 11435
+python -m uvicorn npu_proxy.main:app --host 127.0.0.1 --port 8080
 ```
 
-### Verify It's Working
+### Verify the service
 
 ```powershell
-# Health check
-Invoke-RestMethod http://localhost:11435/health
-
-# Expected output:
-# status        : ok
-# npu_available : True
-# devices       : {CPU, GPU.0, GPU.1, NPU}
+Invoke-RestMethod http://127.0.0.1:8080/health
 ```
 
-### Certify Real NPU Inference
-
-Use the hardware certification script to prove the live proxy is serving a real request on the Intel NPU with **no fallback**:
+Industry-standard probes are also available:
 
 ```powershell
-python .\scripts\certify_npu.py --output .\artifacts\npu-certification.json
+Invoke-RestMethod http://127.0.0.1:8080/health/liveness
+Invoke-RestMethod http://127.0.0.1:8080/health/readiness
 ```
 
-The certification run:
+Health contract:
 
-1. Starts NPU Proxy through the real CLI entrypoint with `--device NPU --real-inference`
-2. Sends a real `/api/generate` request against the live server
-3. Verifies `OpenVINO` sees the NPU
-4. Verifies `/health` reports the LLM engine as loaded on `NPU`
-5. Verifies `/health/devices` reports `active_device == NPU` and `used_fallback == false`
+- `/health` is an **observational summary** and does not auto-load models
+- `/health/liveness` is the cheap process-up probe
+- `/health/readiness` reports whether warmed runtime state is actually ready to serve traffic
+- when models are not loaded, health surfaces say that explicitly instead of hiding it behind probe-triggered initialization
 
-It exits `0` only when the software completes a real hardware-backed inference on the NPU. The JSON report captures the OpenVINO version, visible devices, active device, fallback status, and timing.
+## Using with Ollama clients
 
-This certification targets the **real LLM serving path** used by NPU Proxy. It does not certify the embedding fallback path, because model support can differ by workload even on the same hardware.
-
-Example successful run on the current Intel NPU host:
-
-```text
-Certified: YES
-Requested device: NPU
-Active device: NPU
-Fallback used: False
-LLM status: loaded
-NPU visible: True
-NPU name: Intel(R) AI Boost
-Model: tinyllama-1.1b-chat-int4-ov
-```
-
----
-
-## Using with Ollama CLI
-
-NPU Proxy is fully compatible with the standard Ollama CLI. Simply point `OLLAMA_HOST` to the proxy:
-
-### Windows PowerShell
+Point Ollama-compatible clients at the local NPU Proxy server:
 
 ```powershell
-# Set the Ollama host to NPU Proxy
-$env:OLLAMA_HOST = "http://localhost:11435"
-
-# Now use Ollama normally
-ollama list
-ollama run tinyllama-1.1b-chat-int4-ov "What is 2+2?"
+$env:OLLAMA_HOST = "http://127.0.0.1:8080"
+ollama pull tinyllama
+ollama run tinyllama "What is 2+2?"
 ollama ps
 ```
 
-### WSL2 / Linux
+If you use `scripts\start-server.ps1` without overriding its port, use `http://127.0.0.1:11435` instead.
+
+WSL 2, when the Windows host intentionally listens beyond loopback:
 
 ```bash
-# Install or refresh WSL 2 on the Windows host if needed:
-#   wsl --install
-#   wsl --update
-#
-# Get Windows host IP (WSL2 gateway)
 WINDOWS_HOST=$(ip route show | grep default | awk '{print $3}')
 export OLLAMA_HOST="http://${WINDOWS_HOST}:11435"
-
-# Now use Ollama normally
-ollama list
-ollama run tinyllama-1.1b-chat-int4-ov "Hello!"
+ollama pull tinyllama
+ollama run tinyllama "Hello"
 ```
-
-### Ollama API Examples
-
-```bash
-# List models
-curl http://localhost:11435/v1/models
-
-# Generate text (Ollama native format)
-curl -X POST http://localhost:11435/api/generate \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "tinyllama-1.1b-chat-int4-ov",
-    "prompt": "Why is the sky blue?",
-    "stream": false
-  }'
-
-# Show model info
-curl -X POST http://localhost:11435/api/show \
-  -H "Content-Type: application/json" \
-  -d '{"model": "tinyllama-1.1b-chat-int4-ov"}'
-
-# List running models
-curl http://localhost:11435/api/ps
-
-# Get version
-curl http://localhost:11435/api/version
-```
-
----
 
 ## Using with Claude Code
 
-NPU Proxy can serve as the local LLM backend for Claude Code's Ollama provider.
-
-### Windows: Launch Claude Code with NPU Backend
+Windows:
 
 ```powershell
-# Option 1: Use the launcher script
 .\scripts\ollama-launch-claude.ps1
-
-# Option 2: Manual setup
-$env:OLLAMA_HOST = "http://localhost:11435"
-claude --provider ollama
 ```
 
-### WSL2: Launch Claude Code with NPU Backend
+WSL 2:
 
 ```bash
-# Option 1: Use the launcher script
 ./scripts/ollama-launch-claude.sh
-
-# Option 2: Manual setup
-WINDOWS_HOST=$(ip route show | grep default | awk '{print $3}')
-export OLLAMA_HOST="http://${WINDOWS_HOST}:11435"
-claude --provider ollama
 ```
 
-### What the Launcher Scripts Do
+Both scripts set `OLLAMA_HOST` and check `/health` before launching `claude --provider ollama`.
 
-The launcher scripts (`ollama-launch-claude.ps1` and `ollama-launch-claude.sh`):
-
-1. **Set `OLLAMA_HOST`** to point to the NPU Proxy server
-2. **Check connectivity** to verify the proxy is running
-3. **Display NPU status** (available devices, health)
-4. **Launch Claude CLI** with the Ollama provider configured
-
-### Example Session
-
-```
-$ ./scripts/ollama-launch-claude.sh
-
-Launching Claude CLI with NPU Proxy backend
-  OLLAMA_HOST=http://<WINDOWS_HOST_IP>:11435
-
-NPU Proxy Status: ok
-  NPU Available: true
-
-╭─────────────────────────────────────────────────╮
-│ Claude Code (Ollama Provider)                   │
-│ Model: tinyllama-1.1b-chat-int4-ov              │
-│ Backend: Intel NPU via OpenVINO                 │
-╰─────────────────────────────────────────────────╯
-
-> What can you help me with?
-```
-
----
-
-## Using with OpenAI SDK
-
-NPU Proxy implements the OpenAI API, making it compatible with any OpenAI SDK:
+## Using with OpenAI SDKs
 
 ### Python
 
 ```python
 from openai import OpenAI
 
-# Point to NPU Proxy
 client = OpenAI(
-    base_url="http://localhost:11435/v1",
-    api_key="not-needed",  # No API key required
+    base_url="http://127.0.0.1:8080/v1",
+    api_key="not-needed",
 )
 
-# Chat completion
 response = client.chat.completions.create(
     model="tinyllama-1.1b-chat-int4-ov",
-    messages=[
-        {"role": "system", "content": "You are a helpful assistant."},
-        {"role": "user", "content": "Explain quantum computing in simple terms."}
-    ],
-    max_tokens=256,
+    messages=[{"role": "user", "content": "Say hello"}],
 )
+
 print(response.choices[0].message.content)
-
-# Streaming
-stream = client.chat.completions.create(
-    model="tinyllama-1.1b-chat-int4-ov",
-    messages=[{"role": "user", "content": "Write a haiku about coding."}],
-    stream=True,
-)
-for chunk in stream:
-    if chunk.choices[0].delta.content:
-        print(chunk.choices[0].delta.content, end="", flush=True)
-
-# Embeddings
-embeddings = client.embeddings.create(
-    model="all-minilm-l6-v2",
-    input=["Hello world", "NPU acceleration is fast"],
-)
-print(f"Embedding dimensions: {len(embeddings.data[0].embedding)}")
+print(response.choices[0].finish_reason)  # "stop" or "length"
 ```
 
-### RAG Example
-
-See [examples/rag_example.py](examples/rag_example.py) for a complete RAG (Retrieval-Augmented Generation) example using embeddings and chat:
-
-```bash
-python examples/rag_example.py
-```
-
-### JavaScript/TypeScript
+### JavaScript
 
 ```typescript
-import OpenAI from 'openai';
+import OpenAI from "openai";
 
 const client = new OpenAI({
-  baseURL: 'http://localhost:11435/v1',
-  apiKey: 'not-needed',
+  baseURL: "http://127.0.0.1:8080/v1",
+  apiKey: "not-needed",
 });
-
-const response = await client.chat.completions.create({
-  model: 'tinyllama-1.1b-chat-int4-ov',
-  messages: [{ role: 'user', content: 'Hello!' }],
-});
-
-console.log(response.choices[0].message.content);
 ```
 
-### cURL
+## API surface
+
+### OpenAI-compatible
+
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/v1/models` | Lists built-in registry models plus scanned local models |
+| POST | `/v1/chat/completions` | OpenAI-style chat; streaming uses SSE |
+| POST | `/v1/embeddings` | OpenAI-style embeddings |
+
+OpenAI chat responses set `choices[].finish_reason` to `"stop"` or `"length"`. Streaming responses set `finish_reason` on the final delta chunk before `data: [DONE]`.
+
+### Ollama-compatible
+
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/api/tags` | Lists locally available models in Ollama format |
+| POST | `/api/generate` | Non-streaming JSON or streaming NDJSON chunks |
+| POST | `/api/chat` | Non-streaming JSON or streaming NDJSON chunks |
+| POST | `/api/embed` | Current Ollama embeddings format |
+| POST | `/api/embeddings` | Legacy Ollama embeddings format |
+| GET | `/api/ps` | Running-model view |
+| POST | `/api/show` | Registry-backed model metadata, parameters, template, and modelfile |
+| GET | `/api/version` | Returns the NPU Proxy Ollama-compatible version string |
+| POST | `/api/pull` | Downloads model files from Hugging Face |
+| GET | `/api/search` | NPU Proxy extension for OpenVINO model search |
+| GET | `/api/models/known` | NPU Proxy extension listing short-name mappings |
+
+Ollama generate/chat final responses and final NDJSON frames include `done: true` and `done_reason` (`"stop"` or `"length"`).
+
+### System
+
+| Method | Path |
+|---|---|
+| GET | `/health` |
+| GET | `/health/liveness` |
+| GET | `/health/readiness` |
+| GET | `/health/devices` |
+| GET | `/metrics` |
+
+## Model management
+
+### Search
 
 ```bash
-# Chat completion
-curl -X POST http://localhost:11435/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "tinyllama-1.1b-chat-int4-ov",
-    "messages": [
-      {"role": "user", "content": "What is machine learning?"}
-    ],
-    "max_tokens": 100
-  }'
-
-# Streaming
-curl -X POST http://localhost:11435/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "tinyllama-1.1b-chat-int4-ov",
-    "messages": [{"role": "user", "content": "Count to 10"}],
-    "stream": true
-  }'
-
-# Embeddings
-curl -X POST http://localhost:11435/v1/embeddings \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "all-minilm-l6-v2",
-    "input": "Hello world"
-  }'
+curl "http://127.0.0.1:8080/api/search?q=llama&sort=popular"
+curl "http://127.0.0.1:8080/api/search?type=llm&quantization=int4"
 ```
 
----
+`/api/search` accepts:
 
-## API Reference
+- `q`
+- `sort` = `popular|newest|downloads|likes`
+- `limit`
+- `offset`
+- `type` = `all|llm|embedding|vision`
+- `quantization`
+- `min_downloads`
 
-### OpenAI-Compatible Endpoints
+The `vision` filter exists on the search endpoint, but this repository does **not** document vision serving support.
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/v1/models` | GET | List available models |
-| `/v1/chat/completions` | POST | Chat completion (streaming supported) |
-| `/v1/embeddings` | POST | Generate embeddings |
-
-### Ollama-Compatible Endpoints
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/api/generate` | POST | Raw text generation |
-| `/api/chat` | POST | Chat completion (alias) |
-| `/api/embed` | POST | Generate embeddings (batch) |
-| `/api/embeddings` | POST | Generate embeddings (legacy) |
-| `/api/ps` | GET | List running models |
-| `/api/show` | POST | Show model details |
-| `/api/version` | GET | Get version info |
-| `/api/pull` | POST | Download model from HuggingFace |
-| `/api/search` | GET | Search OpenVINO models |
-| `/api/models/known` | GET | List pre-mapped model names |
-
-### System Endpoints
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/health` | GET | Health check with device status |
-| `/health/devices` | GET | Detailed device information |
-
----
-
-## Ollama Compatibility
-
-NPU Proxy is designed for full Ollama API compatibility. It works with:
-- ✅ Claude Code
-- ✅ Open WebUI  
-- ✅ ollama Python/JS libraries
-- ✅ Any Ollama-compatible client
-
-**Supported parameters:** `temperature`, `top_k`, `top_p`, `repeat_penalty`, `num_predict`, `seed`, `stop`
-
-**Approximate mappings:** `presence_penalty` and `frequency_penalty` are converted to `repetition_penalty`
-
-**Gracefully ignored:** `mirostat`, `min_p`, `typical_p`, `tfs_z` (not available in OpenVINO)
-
-See [docs/api/OLLAMA_API.md](docs/api/OLLAMA_API.md) for complete details.
-
----
-
-## Model Management
-
-NPU Proxy can discover and download OpenVINO-optimized models from HuggingFace.
-
-### Search for Models
+### Pull
 
 ```bash
-# Search for LLaMA models
-curl "http://localhost:11435/api/search?q=llama&sort=popular"
-
-# Filter by quantization
-curl "http://localhost:11435/api/search?quantization=int4&limit=10"
-
-# Filter by type
-curl "http://localhost:11435/api/search?type=llm&sort=newest"
-```
-
-**Query Parameters:**
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `q` | "" | Search query |
-| `sort` | popular | Sort: popular, newest, downloads, likes |
-| `limit` | 20 | Results per page (1-100) |
-| `offset` | 0 | Pagination offset |
-| `type` | all | Filter: all, llm, embedding, vision |
-| `quantization` | "" | Filter: int4, int8, fp16 |
-| `min_downloads` | 0 | Minimum download count |
-
-### Download Models
-
-```bash
-# Using curl
-curl -X POST http://localhost:11435/api/pull \
+curl -X POST http://127.0.0.1:8080/api/pull \
   -H "Content-Type: application/json" \
-  -d '{"name": "tinyllama"}'
-
-# Using ollama CLI
-OLLAMA_HOST=http://localhost:11435 ollama pull tinyllama
+  -d '{"name": "tinyllama", "stream": false}'
 ```
 
-**Supported Pre-Mapped Models:**
-| Ollama Name | HuggingFace Repo | Quantization |
-|-------------|------------------|--------------|
-| tinyllama | OpenVINO/TinyLlama-1.1B-Chat-v1.0-int4-ov | INT4 |
-| tinyllama:fp16 | OpenVINO/TinyLlama-1.1B-Chat-v1.0-fp16-ov | FP16 |
-| phi-2 | OpenVINO/phi-2-int4-ov | INT4 |
-| llama3.2 | OpenVINO/Llama-3.2-3B-Instruct-int4-ov | INT4 |
-| mistral | OpenVINO/mistral-7b-instruct-v0.1-int4-ov | INT4 |
-| qwen2 | OpenVINO/Qwen2-1.5B-Instruct-int4-ov | INT4 |
+Known short-name mappings currently include:
 
-### List Known Models
+- LLMs: `tinyllama`, `tinyllama:fp16`, `phi-2`, `phi-3`, `llama2`, `llama2:13b`, `llama3.2`, `mistral`, `qwen2`, `gemma`
+- Embeddings: `bge-small`, `bge-base`, `bge-large`, `e5-small`, `e5-large`, `all-minilm`, `nomic-embed-text`
 
-```bash
-curl http://localhost:11435/api/models/known
-```
+Model downloads enforce Hugging Face allow-patterns and size limits; full-snapshot download is opt-in. Conversion work runs in a timeout-safe child process and publishes with an atomic directory rename so partially written model directories are not exposed as complete.
 
----
+## Embeddings
 
-## Device Selection & Fallback
+Current embedding behavior is request-aware:
 
-NPU Proxy automatically selects the best available device with a fallback chain:
+- the service caches embedding engines by resolved model and device
+- `NPU_PROXY_EMBEDDING_MODEL` and `NPU_PROXY_EMBEDDING_DEVICE` provide the default embedding model and device
+- request `model` fields plus device overrides can select a different cached engine when a runtime-ready export exists
+- if the requested runtime-ready model is missing or unusable, the request fails by default instead of returning success-shaped fallback embeddings
+- set `NPU_PROXY_EMBEDDING_FALLBACK_MODE=hash` only when you intentionally want explicit hash fallback for operator testing or wiring checks
 
-```
-NPU → GPU → CPU
-```
+Embedding inputs are validated before engine execution:
 
-### Automatic Fallback
+- empty input list: HTTP 400, code `empty_input`
+- more than 128 inputs: HTTP 413, code `embedding_batch_too_large`
+- whitespace-only or empty text: HTTP 400, code `empty_input`
+- oversized text: HTTP 413, code `embedding_input_too_large`
+- successful batches return exactly one finite, correctly dimensioned vector per input
 
-If your preferred device is unavailable, the proxy automatically falls back:
+Current workstation truth:
 
-1. **NPU** (default) - Best efficiency, fastest cold start
-2. **GPU** (Intel integrated/discrete) - Fastest inference, slower cold start
-3. **CPU** - Always available, slowest
+- the documented default embedding device remains `CPU`
+- `all-minilm` / `sentence-transformers/all-MiniLM-L6-v2` validated on `NPU` here via a static-shape profile
+- `bge-small` on `NPU` did not validate here because the Intel NPU plugin failed with `check_sdpa_nodes(model)`
+- download or registry support for an embedding model is **not** the same as validated NPU execution support
 
-### Manual Device Selection
+Recommended validated NPU setup:
 
 ```powershell
-# Use GPU instead of NPU
-$env:NPU_PROXY_DEVICE = "GPU"
-python -m uvicorn npu_proxy.main:app --host 0.0.0.0 --port 11435
-
-# Force CPU (useful for debugging)
-$env:NPU_PROXY_DEVICE = "CPU"
-python -m uvicorn npu_proxy.main:app --host 0.0.0.0 --port 11435
+python scripts\download_model.py download all-minilm
+$env:NPU_PROXY_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+$env:NPU_PROXY_EMBEDDING_DEVICE = "NPU"
 ```
 
-### Check Device Status
+Then restart the server so it picks up the new embedding defaults.
+
+## Security model
+
+NPU Proxy is intentionally a local, single-user tool:
+
+- it binds to `127.0.0.1` by default
+- it has **no authentication or API key enforcement** by design
+- do not expose it as a shared production proxy
+
+Current hardening:
+
+- Host-header allow-list middleware rejects disallowed `Host` headers with HTTP `421` and body `Host header not allowed`, mitigating DNS rebinding against the local service
+- the default allow-list is `localhost`, `127.0.0.1`, `::1`, `[::1]`, `testserver`, and `test`
+- configure the allow-list with `NPU_PROXY_ALLOWED_HOSTS` or `--allowed-hosts` (comma-separated)
+- binding to a non-loopback address logs a warning; `scripts\start-server.ps1` requires explicit opt-in (`-ListenAll` or `NPU_PROXY_LISTEN_ALL=true`) before choosing `0.0.0.0`
+- registry model names are slug-validated, resolved model paths are confined to the model directory, and tokenizer paths are guarded against traversal
+- client-facing errors are sanitized so internal exception details and stack traces are not leaked
+
+## Runtime extras that exist today
+
+- OpenVINO remains the default LLM backend.
+- OpenAI and Ollama chat prompt rendering attempts tokenizer chat templates when available and falls back to legacy formatting; set `NPU_PROXY_DISABLE_CHAT_TEMPLATES=1` to force legacy formatting.
+- Compile cache controls exist through `NPU_PROXY_COMPILE_CACHE_DIR`, `NPU_PROXY_COMPILE_CACHE_MODE`, and `NPU_PROXY_PREFIX_CACHE_MODE`.
+- An alpha `llama.cpp` GGUF path exists behind `NPU_PROXY_LLM_BACKEND=llama_cpp` and `NPU_PROXY_ENABLE_ALPHA_BACKENDS=1`, but it is currently CPU-only, feature-gated, and source-install only because `llama-cpp-python` is not part of the default packaged dependencies.
+
+See:
+
+- [docs/api/EMBEDDINGS.md](docs/api/EMBEDDINGS.md)
+- [docs/guides/MODEL_DOWNLOAD.md](docs/guides/MODEL_DOWNLOAD.md)
+
+## Configuration
+
+### CLI flags
+
+| Flag | Default | Notes |
+|---|---|---|
+| `--host` | `127.0.0.1` | Bind address |
+| `--port`, `-p` | `8080` | Bind port |
+| `--workers`, `-w` | `1` | Uvicorn worker processes |
+| `--reload` | off | Enable development auto-reload |
+| `--allowed-hosts` | loopback/test clients | Comma-separated Host-header allow-list |
+| `--device`, `-d` | `AUTO` CLI parser; effective runtime default `NPU` | `NPU`, `GPU`, `CPU`, or `AUTO`; `AUTO` leaves the LLM runtime default in place |
+| `--token-limit` | `1800` | Advisory context-routing threshold |
+| `--compile-cache-dir` | unset | Optional OpenVINO compile cache directory |
+| `--compile-cache-mode` | runtime default | `OPTIMIZE_SIZE` or `OPTIMIZE_SPEED` |
+| `--prefix-cache-mode` | `auto` | `auto`, `on`, or `off` |
+| `--real-inference` | off | Enable real model inference; otherwise mock mode |
+| `--log-level`, `-l` | `info` | `debug`, `info`, `warning`, `error`, or `critical` |
+| `--log-file` | unset | Log to file instead of stdout |
+| `--version`, `-v` | n/a | Print version and exit |
+
+### Bootstrap and LLM environment variables
+
+| Variable | Default | Notes |
+|---|---|---|
+| `NPU_PROXY_HOST` | `127.0.0.1` | Bind address |
+| `NPU_PROXY_PORT` | `8080` | Bind port |
+| `NPU_PROXY_DEVICE` | `NPU` effective runtime default | LLM device; CLI also accepts `AUTO` |
+| `NPU_PROXY_TOKEN_LIMIT` | `1800` | Advisory context-routing threshold |
+| `NPU_PROXY_REAL_INFERENCE` | `0` | Set `1` to enable real inference |
+| `NPU_PROXY_INFERENCE_TIMEOUT` | `180` | LLM inference timeout seconds |
+| `NPU_PROXY_MAX_PROMPT_LEN` | `4096` | LLM prompt limit |
+| `NPU_PROXY_COMPILE_CACHE_DIR` | unset | Optional OpenVINO compile cache directory |
+| `NPU_PROXY_COMPILE_CACHE_MODE` | runtime default | `OPTIMIZE_SIZE` or `OPTIMIZE_SPEED` |
+| `NPU_PROXY_PREFIX_CACHE_MODE` | `auto` | Prefix cache mode |
+| `NPU_PROXY_LLM_BACKEND` | `openvino` | `openvino` or alpha `llama_cpp` |
+| `NPU_PROXY_ENABLE_ALPHA_BACKENDS` | `0` | Required for alpha backends |
+| `NPU_PROXY_LLAMACPP_MODEL_PATH` | unset | Local `.gguf` path for alpha `llama.cpp` backend |
+| `NPU_PROXY_ALLOWED_HOSTS` | loopback/test clients | Comma-separated Host-header allow-list |
+| `NPU_PROXY_PREFERRED_DEVICE` | `NPU` | Advisory context-router preference |
+| `NPU_PROXY_FALLBACK_DEVICE` | auto | Advisory context-router fallback override |
+
+Invalid `TOKEN_LIMIT`, `PREFERRED_DEVICE`, and `FALLBACK_DEVICE` values warn and fall back to defaults in request-time routing paths; explicit startup validation can still fail for invalid bootstrap settings.
+
+### Other runtime environment variables
+
+| Variable | Default | Notes |
+|---|---|---|
+| `NPU_PROXY_MODEL_DIR` | `~/.cache/npu-proxy/models` | Model/tokenizer lookup root |
+| `NPU_PROXY_DISABLE_CHAT_TEMPLATES` | unset | Truthy value forces legacy chat formatting |
+| `NPU_PROXY_EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | Default embedding model |
+| `NPU_PROXY_EMBEDDING_DEVICE` | `CPU` | Default embedding device |
+| `NPU_PROXY_LOAD_TIMEOUT` | `300` | Embedding model load timeout seconds |
+| `NPU_PROXY_EMBED_TIMEOUT` | `60` | Embedding inference timeout seconds |
+| `NPU_PROXY_EMBEDDING_CACHE_SIZE` | `1024` | Embedding cache size |
+| `NPU_PROXY_EMBEDDING_FALLBACK_MODE` | disabled | Set `hash` only for explicit operator fallback tests |
+| `NPU_PROXY_EMBEDDING_UNAVAILABLE_COOLDOWN` | `30` | Cooldown seconds after embedding load failures |
+| `NPU_PROXY_LISTEN_ALL` | unset | `scripts\start-server.ps1` opt-in for `0.0.0.0` |
+
+## Benchmarking
+
+The benchmark CLI currently documents one end-to-end workflow:
 
 ```powershell
-# See all available devices
-Invoke-RestMethod http://localhost:11435/health/devices
-
-# Example output:
-# available_devices : {CPU, GPU.0, GPU.1, NPU}
-# active_device     : NPU
-# fallback_chain    : {NPU, GPU, CPU}
+python scripts\benchmark.py run --model tinyllama --device NPU --iterations 5 --warmup 1 --output results.json
 ```
 
----
-
-## Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `NPU_PROXY_HOST` | `0.0.0.0` | Server bind address |
-| `NPU_PROXY_PORT` | `11435` | Server port |
-| `NPU_PROXY_REAL_INFERENCE` | `0` | Enable real NPU inference (`1`) or mock (`0`) |
-| `NPU_PROXY_DEVICE` | `NPU` | Preferred device. Falls back: NPU→GPU→CPU |
-| `NPU_PROXY_MODEL_PATH` | `~/.cache/npu-proxy/models` | Model cache directory |
-| `NPU_PROXY_INFERENCE_TIMEOUT` | `180` | Inference timeout in seconds |
-
----
-
-## Supported Models
-
-### LLM Models (Chat/Generate)
-
-| Model | Size | Quantization | NPU Optimized |
-|-------|------|--------------|---------------|
-| `tinyllama-1.1b-chat-int4-ov` | 640MB | INT4 | ✅ Yes |
-| `phi-2-int4-ov` | 1.4GB | INT4 | ✅ Yes |
-| `llama-2-7b-chat-int4-ov` | 3.8GB | INT4 | ✅ Yes |
-
-### Embedding Models
-
-| Model | Size | Dimensions | Status |
-|-------|------|------------|--------|
-| `bge-small` | 130MB | 384 | ✅ Production (OpenVINO) |
-| `bge-base` | 420MB | 768 | ✅ Production (OpenVINO) |
-| `bge-large` | 1.3GB | 1024 | ✅ Production (OpenVINO) |
-| `all-minilm` | 91MB | 384 | ✅ Production (OpenVINO) |
-| `nomic-embed-text` | 520MB | 768 | ✅ Production (OpenVINO) |
-
-Download embedding models using:
-```powershell
-python scripts/download_model.py download bge-small
-```
-
-See [docs/api/EMBEDDINGS.md](docs/api/EMBEDDINGS.md) for full documentation.
-
----
-
-## Limitations
-
-- **Concurrency**: NPU supports 1 concurrent inference request. Additional requests queue.
-- **Timeout**: Default 180s inference timeout (configurable via `NPU_PROXY_INFERENCE_TIMEOUT`)
-- **Memory**: ~2-3GB peak RAM for TinyLlama INT4
-- **Streaming**: Mock mode yields real-time; Real inference collects tokens before yielding (async queue pending)
-
----
+See [docs/guides/BENCHMARKS.md](docs/guides/BENCHMARKS.md) for the current CLI surface.
 
 ## Development
 
-### Running Tests
+### Tests
 
 ```powershell
-# All tests (~200 tests, ~20s)
-pytest tests/ -v
-
-# Fast tests only (skip slow real-model tests)
-pytest tests/ -v -m "not slow"
-
-# With coverage
-pytest tests/ --cov=npu_proxy --cov-report=term-missing
-
-# Single test file
-pytest tests/test_chat.py -v
+python -m pytest -m "not slow and not e2e"
 ```
 
-### Development Server
+Fast tests do not require real NPU/model hardware. Slow/e2e tests do.
+
+### Dev server
 
 ```powershell
-# Hot reload for development
-uvicorn npu_proxy.main:app --reload --port 11435
-
-# Debug mode with full logging
-$env:NPU_PROXY_REAL_INFERENCE = "1"
-uvicorn npu_proxy.main:app --reload --port 11435 --log-level debug
+uvicorn npu_proxy.main:app --reload --host 127.0.0.1 --port 8080
+uvicorn npu_proxy.main:app --reload --host 127.0.0.1 --port 8080 --log-level debug
 ```
 
-### Project Structure
+## Limitations
 
-```
-npu-proxy/
-├── npu_proxy/
-│   ├── __init__.py
-│   ├── main.py              # FastAPI app entry point
-│   ├── api/
-│   │   ├── health.py        # /health endpoint
-│   │   ├── models.py        # /v1/models endpoint
-│   │   ├── chat.py          # /v1/chat/completions endpoint
-│   │   ├── embeddings.py    # /v1/embeddings endpoint
-│   │   └── ollama.py        # /api/* Ollama endpoints
-│   └── inference/
-│       └── engine.py        # OpenVINO GenAI wrapper
-├── tests/
-│   ├── test_health.py
-│   ├── test_models.py
-│   ├── test_chat.py
-│   ├── test_embeddings.py
-│   └── test_ollama.py
-├── scripts/
-│   ├── start-server.ps1     # Windows server launcher
-│   ├── ollama-launch-claude.ps1  # Windows Claude launcher
-│   └── ollama-launch-claude.sh   # WSL2/Linux Claude launcher
-├── requirements.txt
-├── pyproject.toml
-└── README.md
-```
+- Real LLM inference needs a local OpenVINO model directory.
+- Mock mode is the default unless real inference is explicitly enabled.
+- OpenAI chat streaming and Ollama streaming use different wire formats.
+- Routing is advisory only in this release; per-request LLM device switching is not implemented.
+- Validated NPU embedding support is currently limited to the static-shape `all-minilm` path; `bge-small` still failed workstation validation on NPU.
+- The alpha GGUF backend is intentionally not documented as a packaged/default runtime path.
+- NPU Proxy is documented for native host deployment; this repo does not document containerized NPU serving.
 
----
+## More docs
 
-## Troubleshooting
-
-### NPU Not Detected
-
-```powershell
-# Check OpenVINO devices
-python -c "import openvino as ov; print(ov.Core().available_devices)"
-
-# If NPU not listed:
-# 1. Update Intel NPU drivers from Intel Download Center
-# 2. Ensure Windows 11 24H2 or later
-# 3. Check Device Manager for "Intel AI Boost" or "NPU"
-```
-
-### WSL2 Cannot Connect
-
-```bash
-# Verify Windows IP is reachable
-WINDOWS_HOST=$(ip route show | grep default | awk '{print $3}')
-curl http://${WINDOWS_HOST}:11435/health
-
-# If connection refused:
-# 1. Ensure server is bound to 0.0.0.0 (not localhost)
-# 2. Check Windows Firewall allows port 11435
-# 3. Verify WSL2 networking mode (NAT vs mirrored)
-```
-
-### Slow First Request
-
-The first inference request loads the model onto the NPU (~5-8 seconds for TinyLlama). Subsequent requests are fast (~1-2 seconds).
-
-```powershell
-# Pre-warm the model
-curl http://localhost:11435/api/generate -d '{"model":"tinyllama-1.1b-chat-int4-ov","prompt":"hi","stream":false}'
-```
-
-### Out of Memory
-
-NPU has limited memory. Use INT4 quantized models:
-- TinyLlama INT4: ~640MB
-- Phi-2 INT4: ~1.4GB
-- Larger models may need CPU fallback
-
----
-
-## Performance
-
-Benchmarks on Intel Core Ultra 7 155H (Meteor Lake) with TinyLlama 1.1B INT4:
-
-### NPU vs GPU Comparison
-
-| Metric | NPU | GPU | Notes |
-|--------|-----|-----|-------|
-| **Cold Start** | 8.12s | 21.96s | NPU loads 2.7x faster |
-| **Chat Avg** | 4.03s | 2.25s | GPU is 1.8x faster inference |
-| **Generate Avg** | 4.23s | 2.31s | Similar pattern |
-
-### When to Use Each Device
-
-| Use Case | Recommended Device |
-|----------|-------------------|
-| Infrequent queries, fast startup | **NPU** |
-| Sustained workloads, throughput | **GPU** |
-| Low power consumption | **NPU** |
-| Larger models (7B+) | **GPU** or **CPU** |
-
-### Latency Breakdown (NPU, max_tokens=20)
-
-| Phase | Time |
-|-------|------|
-| Cold start (model load) | ~8s |
-| Warm inference | ~4s |
-| First token latency | ~0.5s |
-
-Set device with: `$env:NPU_PROXY_DEVICE = "GPU"` or `"NPU"` or `"CPU"`
-
-### Benchmark CLI
-
-Use the benchmark tool to compare devices on your system:
-
-```powershell
-# Benchmark NPU (default)
-python scripts/benchmark.py run
-
-# Benchmark specific device
-python scripts/benchmark.py run --device CPU
-
-# Compare multiple devices
-python scripts/benchmark.py compare NPU CPU GPU
-
-# Export results to JSON
-python scripts/benchmark.py run --output results.json
-```
-
-See [docs/guides/BENCHMARKS.md](docs/guides/BENCHMARKS.md) for detailed documentation.
-
----
-
-## Streaming
-
-Real-time token streaming is enabled for all chat endpoints. Tokens are delivered as they are generated, not buffered.
-
-### Streaming Architecture
-
-```
-┌──────────────────┐    callback()    ┌─────────────┐
-│ Inference Thread │ ────────────────▶│ AsyncQueue  │
-│ (OpenVINO)       │                  │             │
-└──────────────────┘                  └──────┬──────┘
-                                             │ async for
-                                             ▼
-                                      ┌─────────────┐
-                                      │ HTTP/SSE    │
-                                      │ Response    │
-                                      └─────────────┘
-```
-
-### Client Integration
-
-```python
-# Using OpenAI SDK
-from openai import OpenAI
-client = OpenAI(base_url="http://localhost:11435/v1", api_key="ignored")
-
-stream = client.chat.completions.create(
-    model="tinyllama",
-    messages=[{"role": "user", "content": "Hello!"}],
-    stream=True
-)
-for chunk in stream:
-    print(chunk.choices[0].delta.content or "", end="", flush=True)
-```
-
-See [docs/api/STREAMING.md](docs/api/STREAMING.md) for architecture details and troubleshooting.
-
----
-
-## Documentation
-
-- **[SPEC.md](SPEC.md)** - Complete technical specification
-- **[CHANGELOG.md](CHANGELOG.md)** - Version history
-- **[docs/](docs/README.md)** - Full documentation index
-  - [Guides](docs/guides/) - User guides and tutorials
-  - [API Reference](docs/api/) - Endpoint documentation
-  - [Research](docs/research/) - Design decisions and patterns
-
----
-
-## License
-
-MIT License - See [LICENSE](LICENSE) for details.
-
----
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
-
-This is a personal project - I check issues and PRs occasionally. Forks are encouraged!
-
----
-
-## Acknowledgments
-
-- [OpenVINO](https://github.com/openvinotoolkit/openvino) - Intel's inference toolkit
-- [OpenVINO GenAI](https://github.com/openvinotoolkit/openvino.genai) - LLM inference library
-- [FastAPI](https://fastapi.tiangolo.com/) - Modern Python web framework
-- [Ollama](https://ollama.ai/) - API design inspiration
+- [SPEC.md](SPEC.md)
+- [CHANGELOG.md](CHANGELOG.md)
+- [docs/README.md](docs/README.md)

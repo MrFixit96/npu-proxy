@@ -12,6 +12,17 @@ from npu_proxy.models.converter import (
     get_conversion_progress,
 )
 
+def _write_openvino_files(model_dir: Path) -> None:
+    model_dir.mkdir(parents=True, exist_ok=True)
+    (model_dir / "openvino_model.xml").write_text("<model/>", encoding="utf-8")
+    (model_dir / "openvino_model.bin").write_bytes(b"weights")
+
+
+def _mock_successful_conversion(cmd, *args, **kwargs):
+    _write_openvino_files(Path(cmd[-1]))
+    return MagicMock(returncode=0, stderr="", stdout="")
+
+
 
 class TestIsOpenVINOModel:
     """Tests for is_openvino_model function."""
@@ -20,8 +31,8 @@ class TestIsOpenVINOModel:
         """Valid OpenVINO model returns True."""
         model_dir = tmp_path / "valid_model"
         model_dir.mkdir()
-        (model_dir / "openvino_model.xml").touch()
-        (model_dir / "openvino_model.bin").touch()
+        (model_dir / "openvino_model.xml").write_text("<model/>", encoding="utf-8")
+        (model_dir / "openvino_model.bin").write_bytes(b"weights")
 
         assert is_openvino_model(model_dir) is True
 
@@ -29,7 +40,7 @@ class TestIsOpenVINOModel:
         """Model missing .xml file returns False."""
         model_dir = tmp_path / "invalid_model"
         model_dir.mkdir()
-        (model_dir / "openvino_model.bin").touch()
+        (model_dir / "openvino_model.bin").write_bytes(b"weights")
 
         assert is_openvino_model(model_dir) is False
 
@@ -37,7 +48,7 @@ class TestIsOpenVINOModel:
         """Model missing .bin file returns False."""
         model_dir = tmp_path / "invalid_model"
         model_dir.mkdir()
-        (model_dir / "openvino_model.xml").touch()
+        (model_dir / "openvino_model.xml").write_text("<model/>", encoding="utf-8")
 
         assert is_openvino_model(model_dir) is False
 
@@ -50,8 +61,8 @@ class TestIsOpenVINOModel:
         """Function accepts string paths."""
         model_dir = tmp_path / "valid_model"
         model_dir.mkdir()
-        (model_dir / "openvino_model.xml").touch()
-        (model_dir / "openvino_model.bin").touch()
+        (model_dir / "openvino_model.xml").write_text("<model/>", encoding="utf-8")
+        (model_dir / "openvino_model.bin").write_bytes(b"weights")
 
         assert is_openvino_model(str(model_dir)) is True
 
@@ -112,10 +123,10 @@ class TestConvertToOpenVINO:
     def test_convert_to_openvino_success(self, mock_run, tmp_path: Path):
         """Successful conversion returns success dict."""
         # Create the expected output files
-        (tmp_path / "openvino_model.xml").touch()
-        (tmp_path / "openvino_model.bin").touch()
+        (tmp_path / "openvino_model.xml").write_text("<model/>", encoding="utf-8")
+        (tmp_path / "openvino_model.bin").write_bytes(b"weights")
 
-        mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="")
+        mock_run.side_effect = _mock_successful_conversion
 
         result = convert_to_openvino("gpt2", tmp_path)
 
@@ -126,10 +137,10 @@ class TestConvertToOpenVINO:
     @patch("npu_proxy.models.converter.subprocess.run")
     def test_convert_to_openvino_success_dict_keys(self, mock_run, tmp_path: Path):
         """Success dict has required keys."""
-        (tmp_path / "openvino_model.xml").touch()
-        (tmp_path / "openvino_model.bin").touch()
+        (tmp_path / "openvino_model.xml").write_text("<model/>", encoding="utf-8")
+        (tmp_path / "openvino_model.bin").write_bytes(b"weights")
 
-        mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="")
+        mock_run.side_effect = _mock_successful_conversion
 
         result = convert_to_openvino("gpt2", tmp_path)
 
@@ -140,10 +151,10 @@ class TestConvertToOpenVINO:
     @patch("npu_proxy.models.converter.subprocess.run")
     def test_convert_to_openvino_progress_callback(self, mock_run, tmp_path: Path):
         """Progress callback is called."""
-        (tmp_path / "openvino_model.xml").touch()
-        (tmp_path / "openvino_model.bin").touch()
+        (tmp_path / "openvino_model.xml").write_text("<model/>", encoding="utf-8")
+        (tmp_path / "openvino_model.bin").write_bytes(b"weights")
 
-        mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="")
+        mock_run.side_effect = _mock_successful_conversion
 
         callback = MagicMock()
         result = convert_to_openvino("gpt2", tmp_path, progress_callback=callback)
@@ -177,10 +188,10 @@ class TestConvertToOpenVINO:
     @patch("npu_proxy.models.converter.subprocess.run")
     def test_convert_to_openvino_with_string_output_dir(self, mock_run, tmp_path: Path):
         """Function accepts string output_dir."""
-        (tmp_path / "openvino_model.xml").touch()
-        (tmp_path / "openvino_model.bin").touch()
+        (tmp_path / "openvino_model.xml").write_text("<model/>", encoding="utf-8")
+        (tmp_path / "openvino_model.bin").write_bytes(b"weights")
 
-        mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="")
+        mock_run.side_effect = _mock_successful_conversion
 
         result = convert_to_openvino("gpt2", str(tmp_path))
 
@@ -189,10 +200,10 @@ class TestConvertToOpenVINO:
     @patch("npu_proxy.models.converter.subprocess.run")
     def test_convert_to_openvino_feature_extraction_task(self, mock_run, tmp_path: Path):
         """Feature extraction task is supported."""
-        (tmp_path / "openvino_model.xml").touch()
-        (tmp_path / "openvino_model.bin").touch()
+        (tmp_path / "openvino_model.xml").write_text("<model/>", encoding="utf-8")
+        (tmp_path / "openvino_model.bin").write_bytes(b"weights")
 
-        mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="")
+        mock_run.side_effect = _mock_successful_conversion
 
         result = convert_to_openvino(
             "sentence-transformers/all-MiniLM-L6-v2",
@@ -205,6 +216,42 @@ class TestConvertToOpenVINO:
         call_args = mock_run.call_args
         assert "--task" in call_args[0][0]
         assert "feature-extraction" in call_args[0][0]
+
+    @patch("npu_proxy.models.converter.subprocess.run")
+    def test_convert_to_openvino_text_generation_with_past_task(self, mock_run, tmp_path: Path):
+        """LLM export should accept the documented KV-cache task."""
+        (tmp_path / "openvino_model.xml").write_text("<model/>", encoding="utf-8")
+        (tmp_path / "openvino_model.bin").write_bytes(b"weights")
+
+        mock_run.side_effect = _mock_successful_conversion
+
+        result = convert_to_openvino(
+            "gpt2",
+            tmp_path,
+            task="text-generation-with-past",
+        )
+
+        assert result["status"] == "success"
+        call_args = mock_run.call_args
+        assert "--task" in call_args[0][0]
+        assert "text-generation-with-past" in call_args[0][0]
+
+    @patch("npu_proxy.models.converter.subprocess.run")
+    def test_convert_to_openvino_defaults_to_text_generation_with_past(
+        self, mock_run, tmp_path: Path
+    ):
+        """Default LLM exports should use the KV-cache task."""
+        (tmp_path / "openvino_model.xml").write_text("<model/>", encoding="utf-8")
+        (tmp_path / "openvino_model.bin").write_bytes(b"weights")
+
+        mock_run.side_effect = _mock_successful_conversion
+
+        result = convert_to_openvino("gpt2", tmp_path)
+
+        assert result["status"] == "success"
+        call_args = mock_run.call_args
+        task_index = call_args[0][0].index("--task") + 1
+        assert call_args[0][0][task_index] == "text-generation-with-past"
 
 
 class TestAutoDownloadAndConvert:
@@ -223,10 +270,10 @@ class TestAutoDownloadAndConvert:
     @patch("npu_proxy.models.converter.resolve_model_repo")
     def test_auto_download_skips_if_exists(self, mock_resolve, tmp_path: Path):
         """Skip conversion if OpenVINO model already in cache."""
-        model_dir = tmp_path / "tinyllama"
+        model_dir = tmp_path / "tinyllama-1.1b-chat-int4-ov"
         model_dir.mkdir(parents=True)
-        (model_dir / "openvino_model.xml").touch()
-        (model_dir / "openvino_model.bin").touch()
+        (model_dir / "openvino_model.xml").write_text("<model/>", encoding="utf-8")
+        (model_dir / "openvino_model.bin").write_bytes(b"weights")
 
         mock_resolve.return_value = ("TinyLlama/TinyLlama-1.1B", "tinyllama")
 
@@ -242,7 +289,7 @@ class TestAutoDownloadAndConvert:
         self, mock_convert, mock_resolve, tmp_path: Path
     ):
         """Convert model if not in cache."""
-        model_dir = tmp_path / "tinyllama"
+        model_dir = tmp_path / "tinyllama-1.1b-chat-int4-ov"
 
         mock_resolve.return_value = ("TinyLlama/TinyLlama-1.1B", "tinyllama")
         mock_convert.return_value = {
@@ -271,10 +318,10 @@ class TestAutoDownloadAndConvert:
     @patch("npu_proxy.models.converter.resolve_model_repo")
     def test_auto_download_with_string_cache_dir(self, mock_resolve, tmp_path: Path):
         """Function accepts string cache_dir."""
-        model_dir = tmp_path / "tinyllama"
+        model_dir = tmp_path / "tinyllama-1.1b-chat-int4-ov"
         model_dir.mkdir(parents=True)
-        (model_dir / "openvino_model.xml").touch()
-        (model_dir / "openvino_model.bin").touch()
+        (model_dir / "openvino_model.xml").write_text("<model/>", encoding="utf-8")
+        (model_dir / "openvino_model.bin").write_bytes(b"weights")
 
         mock_resolve.return_value = ("TinyLlama/TinyLlama-1.1B", "tinyllama")
 
@@ -343,16 +390,15 @@ class TestGetConversionProgress:
     @patch("npu_proxy.models.converter.subprocess.Popen")
     def test_get_conversion_progress_yields_updates(self, mock_popen, tmp_path: Path):
         """Progress updates are yielded."""
-        # Create expected output files
-        (tmp_path / "openvino_model.xml").touch()
-        (tmp_path / "openvino_model.bin").touch()
-
-        # Mock subprocess output
         mock_process = MagicMock()
-        mock_process.stdout = StringIO("Converting model\nProgress: 50%\n")
-        mock_process.wait.return_value = 0
+        mock_process.communicate.return_value = ("Converting model\nProgress: 50%\n", None)
+        mock_process.returncode = 0
 
-        mock_popen.return_value = mock_process
+        def start_process(cmd, *args, **kwargs):
+            _write_openvino_files(Path(cmd[-1]))
+            return mock_process
+
+        mock_popen.side_effect = start_process
 
         gen = get_conversion_progress("gpt2", tmp_path)
         progress = list(gen)
@@ -367,8 +413,8 @@ class TestGetConversionProgress:
     def test_get_conversion_progress_nonzero_exit(self, mock_popen, tmp_path: Path):
         """Non-zero exit code yields error."""
         mock_process = MagicMock()
-        mock_process.stdout = StringIO("")
-        mock_process.wait.return_value = 1
+        mock_process.communicate.return_value = ("", None)
+        mock_process.returncode = 1
 
         mock_popen.return_value = mock_process
 
@@ -384,7 +430,10 @@ class TestGetConversionProgress:
         import subprocess
 
         mock_process = MagicMock()
-        mock_process.wait.side_effect = subprocess.TimeoutExpired("cmd", 3600)
+        mock_process.communicate.side_effect = [
+            subprocess.TimeoutExpired("cmd", 3600),
+            ("", None),
+        ]
 
         mock_popen.return_value = mock_process
 
@@ -398,14 +447,15 @@ class TestGetConversionProgress:
     @patch("npu_proxy.models.converter.subprocess.Popen")
     def test_get_conversion_progress_with_string_output_dir(self, mock_popen, tmp_path: Path):
         """Function accepts string output_dir."""
-        (tmp_path / "openvino_model.xml").touch()
-        (tmp_path / "openvino_model.bin").touch()
-
         mock_process = MagicMock()
-        mock_process.stdout = StringIO("")
-        mock_process.wait.return_value = 0
+        mock_process.communicate.return_value = ("", None)
+        mock_process.returncode = 0
 
-        mock_popen.return_value = mock_process
+        def start_process(cmd, *args, **kwargs):
+            _write_openvino_files(Path(cmd[-1]))
+            return mock_process
+
+        mock_popen.side_effect = start_process
 
         gen = get_conversion_progress("gpt2", str(tmp_path))
         progress = list(gen)
@@ -423,8 +473,8 @@ class TestConversionIntegration:
         # Setup cache
         model_dir = tmp_path / "gpt2"
         model_dir.mkdir(parents=True)
-        (model_dir / "openvino_model.xml").touch()
-        (model_dir / "openvino_model.bin").touch()
+        (model_dir / "openvino_model.xml").write_text("<model/>", encoding="utf-8")
+        (model_dir / "openvino_model.bin").write_bytes(b"weights")
 
         mock_resolve.return_value = ("openai-community/gpt2", "gpt2")
 

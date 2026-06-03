@@ -1,57 +1,28 @@
-"""Context-aware routing for NPU inference.
+"""Advisory context-aware routing recommendations.
 
-This module provides intelligent request routing based on prompt token count.
-NPU devices have limited context windows (~1800 tokens practical max), so
-prompts exceeding this limit are routed to fallback devices.
+This module estimates prompt size and returns a recommended device label. It
+does not switch OpenVINO devices per request; the currently loaded runtime still
+executes requests on the single configured device. The recommendation is used
+for observability and future routing work only.
 
-Device Fallback Chain:
-    NPU → GPU → CPU
-
-The router checks available devices and selects the next in chain when:
-    1. Prompt token count exceeds NPU_PROXY_TOKEN_LIMIT
-    2. Preferred device is unavailable
-
-Environment Variables:
-    NPU_PROXY_TOKEN_LIMIT: Maximum tokens for NPU routing (default: 1800).
-        Prompts exceeding this count are routed to fallback devices.
-    NPU_PROXY_PREFERRED_DEVICE: Primary device to use when within limits
-        (default: "NPU"). Must be one of: NPU, GPU, CPU.
-    NPU_PROXY_FALLBACK_DEVICE: Override automatic fallback selection
-        (default: auto-detect based on available hardware).
-
-Routing Logic:
-    1. Count tokens in the prompt/messages
-    2. If token_count <= NPU_PROXY_TOKEN_LIMIT: use preferred device
-    3. If token_count > NPU_PROXY_TOKEN_LIMIT: use fallback device
-    4. Fallback is auto-detected from available devices following chain order
-
-Example:
-    >>> router = ContextRouter(npu_limit=1800)
-    >>> result = router.select_device("Hello world")
-    >>> result.device
-    'NPU'
-    >>> result = router.select_device("word " * 2000)
-    >>> result.device
-    'GPU'  # or 'CPU' if GPU unavailable
-
-Note:
-    The 1800 token default is conservative. Intel NPUs can handle ~2048 tokens
-    but performance degrades near the limit. The default provides headroom for
-    system prompts and response generation.
+The token limit and preferred device come from the active
+ProxyBootstrapConfig/LLMRuntimeConfig. Fallback recommendations follow the
+central device fallback chain (NPU → GPU → CPU).
 """
 
-import os
-import logging
 from dataclasses import dataclass
 from typing import List, Dict, Optional
 
+from npu_proxy.config import (
+    DEFAULT_TOKEN_LIMIT,
+    load_context_routing_config,
+    normalize_context_device,
+)
+from npu_proxy.inference.devices import DEVICE_FALLBACK_CHAIN, get_available_devices
 from npu_proxy.inference.tokenizer import count_tokens
-from npu_proxy.inference.engine import DEVICE_FALLBACK_CHAIN, get_available_devices
-
-logger = logging.getLogger(__name__)
 
 # Default configuration values
-DEFAULT_NPU_TOKEN_LIMIT: int = 1800
+DEFAULT_NPU_TOKEN_LIMIT: int = DEFAULT_TOKEN_LIMIT
 """Default maximum token count for NPU routing (conservative limit)."""
 
 DEFAULT_PREFERRED_DEVICE: str = "NPU"
@@ -62,14 +33,14 @@ DEFAULT_PREFERRED_DEVICE: str = "NPU"
 
 @dataclass
 class RoutingResult:
-    """Result of a device routing decision.
+    """Result of an advisory device recommendation.
 
-    Contains the selected device, the reason for selection, and token count
-    information used to make the routing decision.
+    Contains the recommended device label, the reason, and token count
+    information used to make the recommendation.
 
     Attributes:
         device: The selected device identifier ("NPU", "GPU", or "CPU").
-        reason: Human-readable reason for the routing decision.
+        reason: Human-readable reason for the recommendation.
             Values: "within_npu_limit", "prompt_exceeds_npu_limit".
         token_count: Number of tokens counted in the prompt/messages.
 
@@ -84,127 +55,72 @@ class RoutingResult:
     token_count: int
 
 
+def _safe_device(device: str | None, *, default: str, field_name: str = "device") -> str:
+    return normalize_context_device(device, default=default, field_name=field_name)
+
+
 def get_npu_token_limit() -> int:
-    """Get the NPU token limit from environment variable or default.
-
-    Reads the NPU_PROXY_TOKEN_LIMIT environment variable and returns its
-    integer value. Falls back to DEFAULT_NPU_TOKEN_LIMIT (1800) if the
-    variable is unset or contains an invalid (non-integer) value.
-
-    Returns:
-        The maximum token count allowed for NPU routing.
-
-    Environment Variables:
-        NPU_PROXY_TOKEN_LIMIT: Integer value for token limit.
-
-    Example:
-        >>> os.environ["NPU_PROXY_TOKEN_LIMIT"] = "2000"
-        >>> get_npu_token_limit()
-        2000
-        >>> del os.environ["NPU_PROXY_TOKEN_LIMIT"]
-        >>> get_npu_token_limit()
-        1800
-    """
-    try:
-        return int(os.environ.get("NPU_PROXY_TOKEN_LIMIT", DEFAULT_NPU_TOKEN_LIMIT))
-    except ValueError:
-        logger.warning(f"Invalid NPU_PROXY_TOKEN_LIMIT, using default: {DEFAULT_NPU_TOKEN_LIMIT}")
-        return DEFAULT_NPU_TOKEN_LIMIT
+    """Return the advisory NPU token limit from centrally resolved config."""
+    return load_context_routing_config().token_limit
 
 
 def get_preferred_device() -> str:
-    """Get the preferred device from environment variable or default.
+    """Return the advisory preferred device from centrally resolved config."""
+    return load_context_routing_config().preferred_device
 
-    Reads the NPU_PROXY_PREFERRED_DEVICE environment variable. Falls back
-    to DEFAULT_PREFERRED_DEVICE ("NPU") if the variable is unset.
 
-    Returns:
-        The preferred device identifier (e.g., "NPU", "GPU", "CPU").
+def get_fallback_device(preferred_device: str | None = None) -> str:
+    """Return the next available advisory fallback device.
 
-    Environment Variables:
-        NPU_PROXY_PREFERRED_DEVICE: Device identifier string.
-
-    Example:
-        >>> os.environ["NPU_PROXY_PREFERRED_DEVICE"] = "GPU"
-        >>> get_preferred_device()
-        'GPU'
+    Explicit NPU_PROXY_FALLBACK_DEVICE takes precedence. This is a recommendation
+    only; it does not change the active runtime device.
     """
-    return os.environ.get("NPU_PROXY_PREFERRED_DEVICE", DEFAULT_PREFERRED_DEVICE)
+    routing_config = load_context_routing_config()
+    if routing_config.fallback_device:
+        return routing_config.fallback_device
 
+    preferred = _safe_device(
+        preferred_device or routing_config.preferred_device,
+        default=DEFAULT_PREFERRED_DEVICE,
+        field_name="preferred_device",
+    )
+    available = {
+        _safe_device(device, default="CPU")
+        for device in get_available_devices()
+        if device
+    }
 
-def get_fallback_device() -> str:
-    """Get the fallback device from environment or auto-detect from available hardware.
-
-    Determines the fallback device to use when prompts exceed the NPU token limit.
-    First checks for an explicit override via environment variable, then
-    auto-detects based on available devices following the fallback chain order.
-
-    Device Fallback Chain:
-        NPU → GPU → CPU
-
-    The function finds the preferred device's position in the chain and returns
-    the next available device. CPU is always available as the final fallback.
-
-    Returns:
-        The fallback device identifier (e.g., "GPU", "CPU").
-
-    Environment Variables:
-        NPU_PROXY_FALLBACK_DEVICE: Override automatic detection.
-            If set, this value is returned (uppercased) regardless of
-            device availability.
-
-    Example:
-        >>> # With NPU as preferred device and GPU available:
-        >>> get_fallback_device()
-        'GPU'
-        >>> # With explicit override:
-        >>> os.environ["NPU_PROXY_FALLBACK_DEVICE"] = "cpu"
-        >>> get_fallback_device()
-        'CPU'
-    """
-    # Check for explicit override
-    env_fallback = os.environ.get("NPU_PROXY_FALLBACK_DEVICE")
-    if env_fallback:
-        return env_fallback.upper()
-    
-    # Determine fallback based on available devices and fallback chain
-    preferred = get_preferred_device()
-    available = get_available_devices()
-    
-    # Find position of preferred device in chain
     try:
         chain_idx = DEVICE_FALLBACK_CHAIN.index(preferred)
     except ValueError:
         chain_idx = -1
-    
-    # Return next available device in chain
+
     for device in DEVICE_FALLBACK_CHAIN[chain_idx + 1:]:
         if device in available:
             return device
-    
-    # Default to CPU (always available)
+
     return "CPU"
 
 
 class ContextRouter:
-    """Routes inference requests based on context/token count thresholds.
+    """Recommends device labels based on context/token count thresholds.
 
-    The ContextRouter implements intelligent device selection based on prompt
+    The ContextRouter implements advisory device selection based on prompt
     size. NPU devices have limited context windows, so prompts exceeding the
-    configured limit are automatically routed to fallback devices (GPU or CPU).
+    configured limit are recommended for fallback devices (GPU or CPU).
 
     Device Fallback Chain:
         NPU → GPU → CPU
 
     Routing Logic:
         1. Count tokens in the input prompt or messages
-        2. If count <= npu_limit: route to preferred_device (default: NPU)
-        3. If count > npu_limit: route to fallback_device (default: GPU/CPU)
+        2. If count <= npu_limit: recommend preferred_device (default: NPU)
+        3. If count > npu_limit: recommend fallback_device (default: GPU/CPU)
 
     Attributes:
-        npu_limit: Maximum token count for NPU routing.
-        preferred_device: Device to use when within token limit.
-        fallback_device: Device to use when token limit is exceeded.
+        npu_limit: Maximum token count for recommending NPU.
+        preferred_device: Device label to recommend when within token limit.
+        fallback_device: Device label to recommend when token limit is exceeded.
 
     Example:
         >>> # Create router with default settings
@@ -217,7 +133,7 @@ class ContextRouter:
         >>> result.device
         'NPU'
         
-        >>> # Long prompts route to fallback
+        >>> # Long prompts recommend fallback
         >>> long_prompt = "word " * 2000
         >>> result = router.select_device(long_prompt)
         >>> result.device
@@ -232,17 +148,16 @@ class ContextRouter:
     ) -> None:
         """Initialize the ContextRouter with optional configuration overrides.
 
-        Configuration values can be provided directly or read from environment
-        variables. Direct parameters take precedence over environment variables.
+        Configuration values can be provided directly or read from the active
+        centralized config. Direct parameters take precedence.
 
         Args:
-            npu_limit: Maximum token count for NPU routing. If None, reads from
-                NPU_PROXY_TOKEN_LIMIT environment variable or uses default (1800).
-            preferred_device: Device to use when within token limit. If None,
-                reads from NPU_PROXY_PREFERRED_DEVICE or uses default ("NPU").
-            fallback_device: Device to use when limit is exceeded. If None,
-                reads from NPU_PROXY_FALLBACK_DEVICE or auto-detects from
-                available hardware.
+            npu_limit: Maximum token count for NPU recommendation. If None,
+                reads from the active ProxyBootstrapConfig.
+            preferred_device: Recommended device when within token limit. If None,
+                reads from the active LLMRuntimeConfig.
+            fallback_device: Recommended device when limit is exceeded. If None,
+                auto-detects from available hardware.
 
         Example:
             >>> # Use environment defaults
@@ -254,9 +169,20 @@ class ContextRouter:
             >>> # Force CPU fallback
             >>> router = ContextRouter(fallback_device="CPU")
         """
-        self.npu_limit = npu_limit if npu_limit is not None else get_npu_token_limit()
-        self.preferred_device = preferred_device if preferred_device is not None else get_preferred_device()
-        self.fallback_device = fallback_device if fallback_device is not None else get_fallback_device()
+        routing_config = load_context_routing_config()
+        self.npu_limit = npu_limit if npu_limit is not None else routing_config.token_limit
+        self.preferred_device = _safe_device(
+            preferred_device if preferred_device is not None else routing_config.preferred_device,
+            default=DEFAULT_PREFERRED_DEVICE,
+            field_name="preferred_device",
+        )
+        self.fallback_device = _safe_device(
+            fallback_device
+            if fallback_device is not None
+            else (routing_config.fallback_device or get_fallback_device(self.preferred_device)),
+            default="CPU",
+            field_name="fallback_device",
+        )
     
     def exceeds_npu_limit(self, prompt: str) -> bool:
         """Check if a prompt's token count exceeds the NPU limit.
@@ -377,9 +303,8 @@ _context_router: Optional[ContextRouter] = None
 def get_context_router() -> ContextRouter:
     """Get or create the singleton ContextRouter instance.
 
-    This function provides a shared router instance configured from environment
-    variables. Use this for application-wide routing to ensure consistent
-    configuration and avoid repeated environment variable lookups.
+    This function provides a shared router instance configured from the active
+    centralized config. Use this for application-wide advisory recommendations.
 
     The singleton is created on first access and reused for subsequent calls.
     Use reset_context_router() to force re-creation (e.g., for testing).
@@ -403,15 +328,8 @@ def reset_context_router() -> None:
     """Reset the router singleton to force re-creation.
 
     Clears the cached singleton instance so that the next call to
-    get_context_router() creates a fresh instance. This is primarily
-    useful for testing scenarios where environment variables are modified.
-
-    Example:
-        >>> os.environ["NPU_PROXY_TOKEN_LIMIT"] = "1000"
-        >>> reset_context_router()
-        >>> router = get_context_router()
-        >>> router.npu_limit
-        1000
+    get_context_router() creates a fresh instance. This is primarily useful for
+    tests that activate a different ProxyBootstrapConfig.
     """
     global _context_router
     _context_router = None

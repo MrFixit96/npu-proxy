@@ -1,161 +1,282 @@
 # Ollama API Compatibility
 
-NPU Proxy implements the Ollama API to provide seamless compatibility with Ollama clients, including Claude Code, Open WebUI, and other tools that speak the Ollama protocol.
+This file documents the Ollama-compatible surface that exists today.
 
-## Overview
+## Supported endpoints
 
-This proxy accepts Ollama API requests and translates them to OpenVINO GenAI calls running on Intel NPU hardware. Most Ollama functionality works identically, with some parameters mapped or gracefully ignored due to OpenVINO limitations.
+| Method | Path | Current behavior |
+|---|---|---|
+| POST | `/api/generate` | Ollama-style generate; streaming returns NDJSON chunks |
+| POST | `/api/chat` | Ollama-style chat; streaming returns NDJSON chunks |
+| POST | `/api/embed` | Current Ollama embedding format |
+| POST | `/api/embeddings` | Legacy embedding format |
+| GET | `/api/tags` | Lists locally available models in Ollama format |
+| GET | `/api/ps` | Running models |
+| POST | `/api/show` | Real registry-backed model metadata |
+| GET | `/api/version` | Returns `0.2.0-npu-proxy` |
+| POST | `/api/pull` | Download model files from Hugging Face |
+| GET | `/api/search` | NPU Proxy extension |
+| GET | `/api/models/known` | NPU Proxy extension |
 
-## Parameter Mapping
+Not implemented in this repository:
 
-### Fully Supported Parameters
+- `DELETE /api/delete`
+- `POST /api/copy`
+- `POST /api/create`
 
-These parameters work exactly as in Ollama:
+## Validation truth for this release pass
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `temperature` | 0.8 | Sampling temperature (0.0-2.0) |
-| `top_k` | 40 | Top-K sampling |
-| `top_p` | 0.9 | Top-P (nucleus) sampling |
-| `seed` | 0 | Random seed (0 = random) |
-| `stop` | [] | Stop sequences |
+- The successful live NPU certification run in this repository exercised `POST /api/generate`.
+- `/api/chat` remains implemented and now uses the shared chat-template rendering path, falling back to the legacy role-prefixed formatter only when tokenizer templates are unavailable or disabled.
+- `GET /api/tags` returns locally available registry/scanned models with `models[].name`, `model`, `modified_at`, `size`, `digest`, and `details`.
+- `POST /api/show` now returns real model metadata: `modelfile`, `parameters`, `template`, `details`, and `model_info` from the registry/tokenizer path.
+- The Ollama embedding endpoints are implemented and `all-minilm` validated on NPU here via a static-shape profile, but `bge-small` on NPU still failed workstation validation when the Intel NPU plugin raised `check_sdpa_nodes(model)`.
 
-### Renamed Parameters
+## Streaming format
 
-These parameters are supported but use different names internally:
+`/api/generate`, `/api/chat`, and `/api/pull` stream newline-delimited JSON chunks.
 
-| Ollama Parameter | OpenVINO Equivalent | Notes |
-|------------------|---------------------|-------|
-| `repeat_penalty` | `repetition_penalty` | Direct 1:1 mapping |
-| `num_predict` | `max_new_tokens` | Controls output length |
-| `stop` | `stop_strings` | Same functionality |
+Current implementation detail:
 
-### Approximate Mappings
+- media type: `application/x-ndjson`
+- the final success frame for `/api/generate` and `/api/chat` includes `done: true` and `done_reason`
+- `done_reason` is either `stop` or `length`; `length` means generation reached the effective max output token limit
+- stream failures emit a terminal NDJSON error object and stop without a final `done: true` success frame
 
-These parameters are converted to the closest OpenVINO equivalent:
+This is different from the OpenAI chat endpoint, which uses SSE.
 
-| Ollama Parameter | Behavior |
-|------------------|----------|
-| `presence_penalty` | Combined into `repetition_penalty` |
-| `frequency_penalty` | Combined into `repetition_penalty` |
+## Routing semantics
 
-**Conversion Formula:**
-```
+`/api/generate` and `/api/chat` currently expose **advisory routing semantics** that are narrower than multi-engine execution.
+
+- the router can classify a request toward a preferred or fallback device
+- the current runtime still behaves as a **single active engine** for real execution
+- `X-NPU-Proxy-Device` reports the actual configured/loaded singleton runtime device
+- `X-NPU-Proxy-Route-Reason` is currently `single_engine_runtime`, while `X-NPU-Proxy-Token-Count` still exposes the advisory token-count classification input
+
+## Parameter handling
+
+### Defaults currently applied
+
+The server merges incoming Ollama options with these current defaults:
+
+| Parameter | Default |
+|---|---|
+| `temperature` | `0.8` |
+| `top_k` | `40` |
+| `top_p` | `0.9` |
+| `repeat_penalty` | `1.1` |
+| `num_predict` | `128` |
+| `num_ctx` | `2048` |
+| `num_batch` | `512` |
+| `seed` | `0` |
+| `stop` | `[]` |
+| `mirostat` | `0` |
+| `mirostat_tau` | `5.0` |
+| `mirostat_eta` | `0.1` |
+| `min_p` | `0.0` |
+| `typical_p` | `1.0` |
+| `tfs_z` | `1.0` |
+
+### Direct or renamed mappings
+
+| Incoming parameter | Current handling |
+|---|---|
+| `temperature` | passed through |
+| `top_k` | passed through |
+| `top_p` | passed through |
+| `seed` | passed through |
+| `repeat_penalty` | renamed to `repetition_penalty` |
+| `num_predict` | renamed to `max_new_tokens` |
+| `stop` | renamed to `stop_strings` |
+
+### Approximate mappings
+
+`presence_penalty` and `frequency_penalty` are combined into:
+
+```text
 repetition_penalty = 1.0 + (presence_penalty + frequency_penalty) / 2
 ```
 
-If you specify `repeat_penalty` explicitly, it takes precedence over `presence_penalty` and `frequency_penalty`.
+If `repeat_penalty` is explicitly provided, it wins.
 
-### Unsupported Parameters (Gracefully Ignored)
+### Accepted but ignored
 
-These parameters are accepted but have no effect. A DEBUG-level log is emitted when they are used:
+Logged at debug level and dropped:
 
-| Parameter | Reason |
-|-----------|--------|
-| `mirostat` | Mirostat sampling not implemented in OpenVINO |
-| `mirostat_tau` | Mirostat not available |
-| `mirostat_eta` | Mirostat not available |
-| `min_p` | MinP sampling not implemented in OpenVINO |
-| `typical_p` | Locally typical sampling not implemented |
-| `tfs_z` | Tail-free sampling not implemented |
+- `mirostat`
+- `mirostat_tau`
+- `mirostat_eta`
+- `min_p`
+- `typical_p`
+- `tfs_z`
 
-### Silent Parameters (No Effect, No Log)
+Silently ignored:
 
-These parameters are accepted silently because they don't apply to our architecture:
+- `num_ctx`
+- `num_batch`
 
-| Parameter | Reason |
-|-----------|--------|
-| `num_ctx` | Context length is fixed at model export time |
-| `num_batch` | Batch scheduling is internal to OpenVINO |
+Unknown parameters are warned about and ignored.
 
-## Supported Endpoints
+## Response and validation notes
 
-| Endpoint | Status | Notes |
-|----------|--------|-------|
-| `POST /api/chat` | ✅ Full | Streaming and non-streaming |
-| `POST /api/generate` | ✅ Full | Streaming and non-streaming |
-| `GET /api/tags` | ✅ Full | List available models |
-| `POST /api/show` | ✅ Full | Model details |
-| `GET /api/ps` | ✅ Full | Running models |
-| `GET /api/version` | ✅ Full | Version info |
-| `POST /api/pull` | ✅ Full | Download from HuggingFace |
-| `GET /api/search` | ✅ NPU Proxy extension | Search OpenVINO models |
-| `POST /api/embeddings` | ✅ Full | Generate embeddings |
-| `DELETE /api/delete` | ❌ Not implemented | |
-| `POST /api/copy` | ❌ Not implemented | |
-| `POST /api/create` | ❌ Not implemented | |
+### Generate/chat completion frames
 
-## Client Compatibility
+Non-streaming `POST /api/generate` returns a single object with `done: true` and `done_reason`:
 
-### Claude Code
-
-NPU Proxy is fully compatible with Claude Code. Configure it with:
-
-```bash
-# In WSL2
-export OLLAMA_HOST=http://<windows-ip>:11435
-
-# Or in Claude Code settings
-# Set Ollama endpoint to http://<windows-ip>:11435
+```json
+{
+  "model": "tinyllama-1.1b-chat-int4-ov",
+  "created_at": "2025-01-01T00:00:00Z",
+  "response": "Hello!",
+  "done": true,
+  "total_duration": 1000000,
+  "eval_count": 1,
+  "done_reason": "stop"
+}
 ```
 
-### Open WebUI
+Non-streaming `POST /api/chat` has the same final fields, with generated content under `message`:
 
-Configure the Ollama API URL in Open WebUI settings:
-```
-http://<windows-ip>:11435
+```json
+{
+  "model": "tinyllama-1.1b-chat-int4-ov",
+  "created_at": "2025-01-01T00:00:00Z",
+  "message": {"role": "assistant", "content": "Hello!"},
+  "done": true,
+  "total_duration": 1000000,
+  "eval_count": 1,
+  "done_reason": "stop"
+}
 ```
 
-### Python (ollama library)
+For streaming, `done_reason` appears on the final NDJSON success frame alongside `done: true`.
+
+### Embedding validation errors
+
+`POST /api/embed` and `POST /api/embeddings` validate input before loading the engine:
+
+| Condition | HTTP status | `code` | Message |
+|---|---:|---|---|
+| Empty input list | 400 | `empty_input` | `Embedding input must contain at least one item` |
+| Batch larger than 128 | 413 | `embedding_batch_too_large` | `Embedding input batch is too large` |
+| Empty or whitespace-only text | 400 | `empty_input` | `Embedding input text must not be empty` |
+| Single text over 8192 characters | 413 | `embedding_input_too_large` | `Embedding input text is too large` |
+| Request total over 65536 characters | 413 | `embedding_request_too_large` | `Embedding request is too large` |
+
+Responses include `X-Request-ID`. Ollama error responses use the flat envelope returned by the implementation:
+
+```json
+{
+  "error": "Embedding input text must not be empty (request id: req-abc123)",
+  "code": "empty_input"
+}
+```
+
+## Model naming
+
+### Generate/chat/show/model listing
+
+These paths work with built-in registry IDs and scanned local model IDs, such as:
+
+- `tinyllama-1.1b-chat-int4-ov`
+- `phi-2-int4-ov`
+- `mistral-7b-int4-ov`
+
+### Pull and known-model discovery
+
+`/api/pull` and `/api/models/known` understand short aliases such as:
+
+- `tinyllama`
+- `phi-3`
+- `llama3.2`
+- `mistral`
+- `bge-small`
+- `all-minilm`
+
+Alias resolution and download support do **not** imply that a model path is validated on Intel NPU hardware.
+The currently validated NPU embedding alias on this workstation is `all-minilm`.
+
+### Pull authentication
+
+`POST /api/pull` now supports both public and private Hugging Face repos:
+
+- **public repos**: no token required
+- **private repos**: require an explicit Hugging Face token
+
+The API does **not** silently inherit ambient server-side Hugging Face credentials for user-selected pulls.
+Private pulls must provide a token in exactly one of these places:
+
+- request body field: `huggingface_token`
+- `Authorization: Bearer <token>` header
+
+If a cached model was originally pulled with explicit private auth, anonymous callers do not get a cached success response for that repo.
+
+## Client examples
+
+### Ollama CLI
+
+```powershell
+$env:OLLAMA_HOST = "http://127.0.0.1:8080"
+ollama pull tinyllama
+ollama run tinyllama "Hello"
+ollama ps
+```
+
+### Python `ollama` client
 
 ```python
 import ollama
 
-client = ollama.Client(host='http://localhost:11435')
+client = ollama.Client(host="http://127.0.0.1:8080")
 response = client.chat(
-    model='tinyllama',
-    messages=[{'role': 'user', 'content': 'Hello!'}]
+    model="tinyllama",
+    messages=[{"role": "user", "content": "Hello!"}],
 )
 ```
 
-### curl
+### cURL
 
 ```bash
-curl http://localhost:11435/api/chat -d '{
-  "model": "tinyllama",
+curl http://127.0.0.1:8080/api/chat -d '{
+  "model": "tinyllama-1.1b-chat-int4-ov",
   "messages": [{"role": "user", "content": "Hello!"}],
   "stream": false
 }'
 ```
 
-## Troubleshooting
-
-### "Parameter X doesn't seem to work"
-
-Check if the parameter is in the "Unsupported Parameters" list above. These are accepted for compatibility but have no effect on generation.
-
-### "Response is different from real Ollama"
-
-The underlying model and inference engine are different. OpenVINO models may produce slightly different outputs than llama.cpp-based Ollama, even with identical parameters.
-
-### "Getting truncated responses"
-
-Increase `num_predict` (default: 128) to generate longer responses:
-
-```json
-{
-  "model": "tinyllama",
-  "prompt": "Tell me a story",
-  "options": {"num_predict": 1000}
-}
-```
-
-### Enable Debug Logging
-
-To see which parameters are being ignored:
+### Private model pull
 
 ```bash
-# Set log level before starting the server
-export NPU_PROXY_LOG_LEVEL=DEBUG
-python -m npu_proxy.main
+curl -X POST http://127.0.0.1:8080/api/pull \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer hf_xxx" \
+  -d '{"name": "your-org/private-model", "stream": false}'
 ```
+
+## Logging
+
+Use the CLI log-level flag for debugging:
+
+```powershell
+npu-proxy --host 127.0.0.1 --port 8080 --log-level debug
+```
+
+## NPU Proxy extensions
+
+These routes are repository-specific extensions, not standard Ollama API endpoints:
+
+- `/api/search`
+- `/api/models/known`
+
+`/api/search` supports:
+
+- `q`
+- `sort=popular|newest|downloads|likes`
+- `limit`
+- `offset`
+- `type=all|llm|embedding|vision`
+- `quantization`
+- `min_downloads`
+
+The `vision` filter is part of the search API surface only; this document does not claim vision serving support.

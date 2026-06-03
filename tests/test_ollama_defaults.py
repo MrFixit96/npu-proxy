@@ -23,7 +23,7 @@ class TestOllamaDefaultsValues:
         assert OLLAMA_DEFAULTS["seed"] == 0
 
     def test_stop_default(self):
-        assert OLLAMA_DEFAULTS["stop"] == []
+        assert OLLAMA_DEFAULTS["stop"] == ()
 
     def test_num_ctx_default(self):
         assert OLLAMA_DEFAULTS["num_ctx"] == 2048

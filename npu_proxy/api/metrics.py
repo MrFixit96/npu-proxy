@@ -32,7 +32,7 @@ router = APIRouter(tags=["metrics"])
 
 
 @router.get("/metrics")
-async def metrics():
+async def metrics() -> Response:
     """Expose Prometheus metrics for scraping.
 
     Returns metrics in Prometheus exposition format for monitoring.

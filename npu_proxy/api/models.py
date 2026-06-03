@@ -100,10 +100,11 @@ async def list_models() -> ModelsResponse:
         ['tinyllama-1.1b-chat-int4-ov', 'mistral-7b-instruct-int4-ov']
     """
     models = list_all_models()
+    created = int(time.time())
     model_infos = [
         ModelInfo(
             id=m["id"],
-            created=int(time.time()),
+            created=created,
             owned_by=m.get("owned_by", "local"),
         )
         for m in models

@@ -1,154 +1,123 @@
-"""Model name mapping between Ollama-style names and HuggingFace OpenVINO repositories.
-
-This module provides utilities for resolving model names between Ollama-style
-short names (e.g., "tinyllama", "phi-2") and their corresponding HuggingFace
-repository paths (e.g., "OpenVINO/TinyLlama-1.1B-Chat-v1.0-int4-ov").
-
-The mapping enables users to reference models using familiar Ollama naming
-conventions while the system internally resolves to the correct HuggingFace
-repository for downloading OpenVINO-optimized models.
-
-Model Categories:
-    - LLM: Language models for text generation (Llama, Phi, Mistral, etc.)
-    - Embedding: Text embedding models for semantic search (BGE, E5, MiniLM)
-
-Mapping Behavior:
-    1. Ollama-style names (e.g., "tinyllama") -> mapped to HuggingFace repo
-    2. Direct HuggingFace format (e.g., "OpenVINO/phi-2-int4-ov") -> passed through
-    3. Version tags (e.g., "tinyllama:fp16") -> mapped to variant if available
-
-Example:
-    >>> from npu_proxy.models.mapper import resolve_model_repo
-    >>> resolve_model_repo("tinyllama")
-    ('OpenVINO/TinyLlama-1.1B-Chat-v1.0-int4-ov', 'tinyllama')
-
-    >>> from npu_proxy.models.mapper import list_known_models
-    >>> models = list_known_models()
-    >>> len(models) > 0
-    True
-
-    >>> from npu_proxy.models.mapper import get_ollama_name
-    >>> get_ollama_name("OpenVINO/TinyLlama-1.1B-Chat-v1.0-int4-ov")
-    'tinyllama'
-
-Note:
-    To add new model mappings, update the OLLAMA_TO_HUGGINGFACE dictionary.
-    The reverse mapping (REVERSE_MAPPING) is generated automatically.
-"""
+"""Mapping helpers derived from the canonical model catalog."""
 
 from __future__ import annotations
 
-# Ollama-style model names to HuggingFace OpenVINO repository mappings
-# Values are tuples of (huggingface_repo, model_type) where model_type is "llm" or "embedding"
+import re
+
+from huggingface_hub.utils import HFValidationError, validate_repo_id
+
+from npu_proxy.models.metadata import detect_quantization
+from npu_proxy.models.registry import (
+    MODEL_CATALOG,
+    encode_repo_storage_key,
+    find_catalog_entry,
+    get_catalog_storage_key,
+)
+
 OLLAMA_TO_HUGGINGFACE: dict[str, tuple[str, str]] = {
-    # LLM models
-    "tinyllama": ("OpenVINO/TinyLlama-1.1B-Chat-v1.0-int4-ov", "llm"),
-    "tinyllama:fp16": ("OpenVINO/TinyLlama-1.1B-Chat-v1.0-fp16-ov", "llm"),
-    "phi-2": ("OpenVINO/phi-2-int4-ov", "llm"),
-    "phi-3": ("OpenVINO/Phi-3-mini-4k-instruct-int4-ov", "llm"),
-    "llama2": ("OpenVINO/llama-2-7b-chat-int4-ov", "llm"),
-    "llama2:13b": ("OpenVINO/llama-2-13b-chat-int4-ov", "llm"),
-    "llama3.2": ("OpenVINO/Llama-3.2-3B-Instruct-int4-ov", "llm"),
-    "mistral": ("OpenVINO/mistral-7b-instruct-v0.1-int4-ov", "llm"),
-    "qwen2": ("OpenVINO/Qwen2-1.5B-Instruct-int4-ov", "llm"),
-    "gemma": ("OpenVINO/gemma-2b-it-int4-ov", "llm"),
-    # Embedding models
-    "bge-small": ("BAAI/bge-small-en-v1.5", "embedding"),
-    "bge-base": ("BAAI/bge-base-en-v1.5", "embedding"),
-    "bge-large": ("BAAI/bge-large-en-v1.5", "embedding"),
-    "e5-small": ("intfloat/e5-small-v2", "embedding"),
-    "e5-large": ("intfloat/multilingual-e5-large", "embedding"),
-    "all-minilm": ("sentence-transformers/all-MiniLM-L6-v2", "embedding"),
-    "nomic-embed-text": ("nomic-ai/nomic-embed-text-v1.5", "embedding"),
+    entry["ollama_name"]: (entry["repo_id"], entry["type"])
+    for entry in MODEL_CATALOG
+    if entry.get("ollama_name")
 }
 
-# Reverse mapping: HuggingFace repo to Ollama-style name
-REVERSE_MAPPING: dict[str, str] = {v[0]: k for k, v in OLLAMA_TO_HUGGINGFACE.items()}
+REVERSE_MAPPING: dict[str, str] = {
+    entry["repo_id"]: entry["ollama_name"]
+    for entry in MODEL_CATALOG
+    if entry.get("ollama_name")
+}
+
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+_URL_LIKE = re.compile(r"^[a-z][a-z0-9+.-]*://", re.IGNORECASE)
+
+
+def is_valid_repo_id(repo_id: str) -> bool:
+    """Return True when a request string is an acceptable Hugging Face repo ID."""
+    if not isinstance(repo_id, str):
+        return False
+    candidate = repo_id.strip()
+    if candidate != repo_id or not candidate:
+        return False
+    if "\\" in candidate or _CONTROL_CHARS.search(candidate) or _URL_LIKE.match(candidate):
+        return False
+    if any(part in {"", ".", ".."} for part in candidate.split("/")):
+        return False
+    try:
+        validate_repo_id(candidate)
+    except HFValidationError:
+        return False
+    return True
 
 
 def resolve_model_repo(name: str) -> tuple[str, str] | None:
-    """Resolve a model name to a HuggingFace repository.
-
-    Args:
-        name: Ollama-style model name or direct HuggingFace repo (org/repo format).
-
-    Returns:
-        Tuple of (repo_id, local_model_name) or None if not found.
-
-    Examples:
-        >>> resolve_model_repo("tinyllama")
-        ('OpenVINO/TinyLlama-1.1B-Chat-v1.0-int4-ov', 'tinyllama')
-
-        >>> resolve_model_repo("OpenVINO/phi-2-int4-ov")
-        ('OpenVINO/phi-2-int4-ov', 'phi-2-int4-ov')
-    """
-    # Check static mappings first
+    """Resolve an Ollama-style name or registry ID to a HuggingFace repository."""
     if name in OLLAMA_TO_HUGGINGFACE:
         repo_id, _ = OLLAMA_TO_HUGGINGFACE[name]
         return (repo_id, name)
 
-    # Support direct HuggingFace repo format (org/repo)
     if "/" in name:
-        # Extract local name from repo path
-        local_name = name.split("/")[-1]
-        return (name, local_name)
+        if not is_valid_repo_id(name):
+            return None
+        return (name, name.split("/")[-1])
+
+    catalog_entry = find_catalog_entry(name)
+    if catalog_entry:
+        return (catalog_entry["repo_id"], name)
+
+    return None
+
+
+def resolve_model_storage_key(name: str) -> str | None:
+    """Resolve a request to the canonical on-disk cache directory name."""
+    catalog_entry = find_catalog_entry(name)
+    if catalog_entry:
+        return get_catalog_storage_key(catalog_entry)
+
+    if "/" in name:
+        if not is_valid_repo_id(name):
+            return None
+        return encode_repo_storage_key(name)
+
+    return None
+
+
+def resolve_runtime_model_name(name: str) -> str | None:
+    """Resolve the model identifier that should be returned to clients."""
+    if find_catalog_entry(name):
+        return name
+
+    if "/" in name:
+        if not is_valid_repo_id(name):
+            return None
+        return encode_repo_storage_key(name)
 
     return None
 
 
 def get_ollama_name(repo_id: str) -> str | None:
-    """Get the Ollama-style name for a HuggingFace repository.
-
-    Args:
-        repo_id: HuggingFace repository ID
-            (e.g., "OpenVINO/TinyLlama-1.1B-Chat-v1.0-int4-ov").
-
-    Returns:
-        Ollama-style name or None if not found.
-
-    Examples:
-        >>> get_ollama_name("OpenVINO/TinyLlama-1.1B-Chat-v1.0-int4-ov")
-        'tinyllama'
-    """
+    """Get the primary Ollama-style alias for a HuggingFace repository."""
     return REVERSE_MAPPING.get(repo_id)
 
 
 def _extract_quantization(repo_name: str) -> str:
-    """Extract quantization type from repository name.
-
-    Args:
-        repo_name: Repository name containing quantization info.
-
-    Returns:
-        Quantization type string (fp16, int4, int8, or unknown).
-    """
-    repo_lower = repo_name.lower()
-    if "fp16" in repo_lower:
-        return "fp16"
-    if "int4" in repo_lower:
-        return "int4"
-    if "int8" in repo_lower:
-        return "int8"
-    return "unknown"
+    """Extract quantization type from a repository name for display helpers."""
+    return detect_quantization(repo_name).lower() or "unknown"
 
 
 def list_known_models() -> list[dict[str, str]]:
-    """List all known model mappings.
-
-    Returns:
-        List of dicts with ollama_name, huggingface_repo, quantization, and type keys.
-
-    Examples:
-        >>> models = list_known_models()
-        >>> models[0].keys()
-        dict_keys(['ollama_name', 'huggingface_repo', 'quantization', 'type'])
-    """
+    """List all known alias-to-repository mappings derived from the catalog."""
     models: list[dict[str, str]] = []
-    for ollama_name, (hf_repo, model_type) in OLLAMA_TO_HUGGINGFACE.items():
-        models.append({
-            "ollama_name": ollama_name,
-            "huggingface_repo": hf_repo,
-            "quantization": _extract_quantization(hf_repo),
-            "type": model_type,
-        })
+    for entry in sorted(MODEL_CATALOG, key=lambda item: item["ollama_name"]):
+        models.append(
+            {
+                "ollama_name": entry["ollama_name"],
+                "huggingface_repo": entry["repo_id"],
+                "quantization": _extract_quantization(entry["repo_id"]),
+                "type": entry["type"],
+                "family": entry["family"],
+                "parameter_size": entry["parameter_size"],
+                "backend": entry["backend"],
+                "format": entry["format"],
+                "task": entry["task"],
+            }
+        )
     return models

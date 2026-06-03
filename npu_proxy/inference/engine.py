@@ -24,15 +24,75 @@ Environment Variables:
     NPU_PROXY_DEVICE: Default device selection (default: NPU)
 """
 
+import importlib
 import logging
-import os
 import threading
 import concurrent.futures
+import time
+from dataclasses import replace
 from pathlib import Path
-from typing import Iterator, Callable, Optional
-import openvino_genai as ov_genai
+from typing import Iterator, Callable, Optional, Any, Literal
+
+from npu_proxy.config import (
+    DEFAULT_INFERENCE_TIMEOUT as CONFIG_DEFAULT_INFERENCE_TIMEOUT,
+    DEFAULT_LLM_MODEL as CONFIG_DEFAULT_LLM_MODEL,
+    DEFAULT_MAX_PROMPT_LEN as CONFIG_DEFAULT_MAX_PROMPT_LEN,
+    DEFAULT_MODEL_DIR as CONFIG_DEFAULT_MODEL_DIR,
+    LLMBackend,
+    LLMRuntimeConfig,
+    get_active_llm_runtime_config,
+    normalize_compile_cache_mode,
+    normalize_prefix_cache_mode,
+)
+from npu_proxy.inference.devices import DEVICE_FALLBACK_CHAIN, get_available_devices
+
+from npu_proxy.metrics import (
+    record_error,
+    record_inference,
+    record_model_load_time,
+    record_runtime_feature_degradation,
+    record_runtime_feature_state,
+    record_tokens_per_second,
+    record_tpot,
+    record_ttft,
+)
 
 logger = logging.getLogger(__name__)
+
+FinishReason = Literal["stop", "length"]
+
+
+def _normalize_finish_reason(reason: Any) -> FinishReason | None:
+    if reason is None:
+        return None
+    normalized = str(reason).strip().lower()
+    if not normalized:
+        return None
+    if any(marker in normalized for marker in ("length", "max", "limit")):
+        return "length"
+    if any(marker in normalized for marker in ("stop", "eos", "end")):
+        return "stop"
+    return None
+
+
+class _OpenVINOGenAIProxy:
+    """Lazily import openvino_genai only when the OpenVINO backend is used."""
+
+    _module: Any | None = None
+    _lock = threading.Lock()
+
+    def _load(self) -> Any:
+        if self._module is None:
+            with self._lock:
+                if self._module is None:
+                    self._module = importlib.import_module("openvino_genai")
+        return self._module
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._load(), name)
+
+
+ov_genai = _OpenVINOGenAIProxy()
 
 
 # =============================================================================
@@ -69,7 +129,7 @@ class InferenceError(Exception):
         self.status_code = status_code
 
 
-class InferenceTimeoutError(InferenceError):
+class InferenceTimeoutError(InferenceError, TimeoutError):
     """Raised when inference exceeds the configured timeout.
     
     NPU inference can take significant time, especially on first run
@@ -87,14 +147,18 @@ class InferenceTimeoutError(InferenceError):
         ...     logger.error(f"Timed out after {e.timeout_seconds}s")
     """
     
-    def __init__(self, timeout_seconds: int) -> None:
+    def __init__(
+        self,
+        timeout_seconds: int,
+        message: Optional[str] = None,
+    ) -> None:
         """Initialize InferenceTimeoutError.
         
         Args:
             timeout_seconds: The timeout duration that was exceeded.
         """
         super().__init__(
-            f"Inference timed out after {timeout_seconds} seconds",
+            message or f"Inference timed out after {timeout_seconds} seconds",
             status_code=504
         )
         self.timeout_seconds = timeout_seconds
@@ -186,22 +250,10 @@ class ModelNotFoundError(InferenceError):
 # =============================================================================
 
 
-# Default model paths
-DEFAULT_MODEL_DIR: Path = Path.home() / ".cache" / "npu-proxy" / "models"
-DEFAULT_LLM_MODEL: str = "tinyllama-1.1b-chat-int4-ov"
-
-# Default timeout for inference (seconds)
-DEFAULT_INFERENCE_TIMEOUT: int = int(
-    os.environ.get("NPU_PROXY_INFERENCE_TIMEOUT", "180")
-)
-
-# Maximum prompt length for NPU (tokens) - NPU default is 1024, increase for longer prompts
-DEFAULT_MAX_PROMPT_LEN: int = int(
-    os.environ.get("NPU_PROXY_MAX_PROMPT_LEN", "4096")
-)
-
-# Device priority for fallback (NPU → GPU → CPU)
-DEVICE_FALLBACK_CHAIN: list[str] = ["NPU", "GPU", "CPU"]
+DEFAULT_MODEL_DIR: Path = CONFIG_DEFAULT_MODEL_DIR
+DEFAULT_LLM_MODEL: str = CONFIG_DEFAULT_LLM_MODEL
+DEFAULT_INFERENCE_TIMEOUT: int = CONFIG_DEFAULT_INFERENCE_TIMEOUT
+DEFAULT_MAX_PROMPT_LEN: int = CONFIG_DEFAULT_MAX_PROMPT_LEN
 
 
 # =============================================================================
@@ -209,35 +261,7 @@ DEVICE_FALLBACK_CHAIN: list[str] = ["NPU", "GPU", "CPU"]
 # =============================================================================
 
 
-def get_available_devices() -> list[str]:
-    """Get list of available OpenVINO compute devices.
-    
-    Queries the OpenVINO runtime to discover available hardware accelerators
-    including NPU, GPU, and CPU. Falls back to CPU-only if device enumeration
-    fails.
-    
-    Returns:
-        A list of device identifiers (e.g., ["NPU", "GPU", "CPU"]).
-    
-    Example:
-        >>> devices = get_available_devices()
-        >>> print(devices)
-        ['NPU', 'GPU', 'CPU']
-    
-    Note:
-        This function creates a new OpenVINO Core instance on each call.
-        For performance-critical code, consider caching the result.
-    """
-    try:
-        import openvino as ov
-        core = ov.Core()
-        return core.available_devices
-    except Exception as e:
-        logger.warning(f"Failed to enumerate devices: {e}")
-        return ["CPU"]  # CPU is always available
-
-
-def select_best_device(preferred: Optional[str] = None) -> tuple[str, Optional[str]]:
+def select_best_device(preferred: Optional[str] = None) -> tuple[str | None, Optional[str]]:
     """Select the best available compute device with automatic fallback.
     
     Implements a device selection strategy that respects user preference
@@ -249,8 +273,9 @@ def select_best_device(preferred: Optional[str] = None) -> tuple[str, Optional[s
             unavailable, the best available device is selected automatically.
     
     Returns:
-        A tuple of (selected_device, fallback_device). The fallback_device
-        is None if no fallback is available (e.g., when CPU is selected).
+        A tuple of (selected_device, fallback_device). selected_device is
+        None when a custom preferred device is unavailable and has no known
+        fallback chain. The fallback_device is None if no fallback is available.
     
     Example:
         >>> device, fallback = select_best_device("NPU")
@@ -275,21 +300,23 @@ def select_best_device(preferred: Optional[str] = None) -> tuple[str, Optional[s
         if preferred in available:
             # Find fallback from chain
             fallback: Optional[str] = None
-            chain_idx = (
-                DEVICE_FALLBACK_CHAIN.index(preferred) 
-                if preferred in DEVICE_FALLBACK_CHAIN 
-                else -1
-            )
-            for device in DEVICE_FALLBACK_CHAIN[chain_idx + 1:]:
-                if device in available:
-                    fallback = device
-                    break
+            if preferred in DEVICE_FALLBACK_CHAIN:
+                chain_idx = DEVICE_FALLBACK_CHAIN.index(preferred)
+                for device in DEVICE_FALLBACK_CHAIN[chain_idx + 1:]:
+                    if device in available:
+                        fallback = device
+                        break
             return preferred, fallback
-        else:
+        if preferred not in DEVICE_FALLBACK_CHAIN:
             logger.warning(
-                f"Requested device {preferred} not available, "
-                "selecting best alternative"
+                "Requested custom device %s is unavailable and has no fallback chain",
+                preferred,
             )
+            return None, None
+        logger.warning(
+            f"Requested device {preferred} not available, "
+            "selecting best alternative"
+        )
     
     # Select best available from fallback chain
     for device in DEVICE_FALLBACK_CHAIN:
@@ -357,7 +384,12 @@ class InferenceEngine:
     def __init__(
         self,
         model_path: str | Path,
-        device: str = "NPU"
+        device: str = "NPU",
+        inference_timeout: int = DEFAULT_INFERENCE_TIMEOUT,
+        max_prompt_len: int = DEFAULT_MAX_PROMPT_LEN,
+        compile_cache_dir: Optional[str | Path] = None,
+        compile_cache_mode: Optional[str] = None,
+        prefix_cache_mode: str = "auto",
     ) -> None:
         """Initialize the inference engine and load the model.
         
@@ -379,16 +411,176 @@ class InferenceEngine:
         """
         self.model_path: Path = Path(model_path)
         self.requested_device: str = device.upper()
+        self.inference_timeout: int = int(inference_timeout)
+        if self.inference_timeout <= 0:
+            raise ValueError("inference_timeout must be greater than zero")
+        self.max_prompt_len: int = int(max_prompt_len)
+        if self.max_prompt_len <= 0:
+            raise ValueError("max_prompt_len must be greater than zero")
+        self.compile_cache_dir: Optional[Path] = (
+            Path(compile_cache_dir) if compile_cache_dir else None
+        )
+        self.compile_cache_mode: Optional[str] = normalize_compile_cache_mode(
+            compile_cache_mode
+        )
+        self.prefix_cache_mode: str = normalize_prefix_cache_mode(prefix_cache_mode)
         self.device: str
         self.fallback_device: Optional[str]
-        self.device, self.fallback_device = select_best_device(self.requested_device)
+        selected_device, self.fallback_device = select_best_device(self.requested_device)
+        if selected_device is None:
+            raise DeviceError(self.requested_device, get_available_devices())
+        self.device = selected_device
         self.actual_device: str = self.device  # Updated if fallback occurs
-        self.pipeline: Optional[ov_genai.LLMPipeline] = None
+        self.pipeline: Optional[Any] = None
         self.model_name: str = self.model_path.name
         self.used_fallback: bool = False
         self._is_warmed_up: bool = False
         self._warmup_lock: threading.Lock = threading.Lock()
+        self._load_diagnostics: list[dict[str, Any]] = []
+        self._runtime_features: dict[str, Any] = {
+            "compile_cache_enabled": False,
+            "prefix_cache_enabled": None,
+            "degraded_features": [],
+        }
+        self._last_generation_stats: Optional[dict[str, Any]] = None
+        self._last_finish_reason: FinishReason | None = None
+        self._model_load_seconds: Optional[float] = None
+        self._inference_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="npu-proxy-inference",
+        )
+        self._inference_lock = threading.Lock()
+        self._active_future: Optional[concurrent.futures.Future[Any]] = None
+        self._active_timeout_seconds: Optional[int] = None
+        self._active_operation: Optional[str] = None
         self._load_model()
+
+    def _ensure_compile_cache_dir(self) -> Optional[Path]:
+        """Create compile cache directory if configured."""
+        if self.compile_cache_dir is None:
+            return None
+        try:
+            self.compile_cache_dir.mkdir(parents=True, exist_ok=True)
+            return self.compile_cache_dir
+        except OSError as exc:
+            logger.warning(
+                "Compile cache directory unavailable (%s): %s",
+                self.compile_cache_dir,
+                exc,
+            )
+            self._load_diagnostics.append(
+                {
+                    "device": self.actual_device,
+                    "status": "compile_cache_dir_unavailable",
+                    "compile_cache_dir": str(self.compile_cache_dir),
+                    "error": str(exc),
+                }
+            )
+            return None
+
+    def _base_pipeline_config(self, device: str) -> dict[str, object]:
+        """Build base LLMPipeline configuration for a device."""
+        config: dict[str, object] = {}
+        if device == "NPU":
+            config["MAX_PROMPT_LEN"] = self.max_prompt_len
+        return config
+
+    def _build_pipeline_attempts(self, device: str) -> list[dict[str, Any]]:
+        """Build runtime configuration attempts with safe degradation."""
+        base_config = self._base_pipeline_config(device)
+        compile_cache_config: dict[str, object] = {}
+        cache_dir = self._ensure_compile_cache_dir()
+        if cache_dir is not None:
+            compile_cache_config["CACHE_DIR"] = str(cache_dir)
+            if self.compile_cache_mode is not None:
+                compile_cache_config["CACHE_MODE"] = self.compile_cache_mode
+
+        prefix_cache_config: dict[str, object] = {}
+        if self.prefix_cache_mode in {"on", "off"}:
+            if device == "NPU":
+                prefix_cache_config["NPUW_LLM_ENABLE_PREFIX_CACHING"] = (
+                    "YES" if self.prefix_cache_mode == "on" else "NO"
+                )
+            else:
+                logger.warning(
+                    "Prefix cache mode %s requested on %s; skipping because it is only "
+                    "configured for NPU",
+                    self.prefix_cache_mode,
+                    device,
+                )
+                record_runtime_feature_degradation(
+                    self.model_name,
+                    device.lower(),
+                    "prefix_cache",
+                    "device_not_npu",
+                )
+
+        attempts: list[dict[str, Any]] = []
+
+        def add_attempt(
+            config: dict[str, object],
+            compile_cache_enabled: bool,
+            prefix_cache_enabled: Optional[bool],
+            degraded: list[str],
+        ) -> None:
+            signature = tuple(sorted((key, str(value)) for key, value in config.items()))
+            if any(existing["signature"] == signature for existing in attempts):
+                return
+            attempts.append(
+                {
+                    "config": config,
+                    "compile_cache_enabled": compile_cache_enabled,
+                    "prefix_cache_enabled": prefix_cache_enabled,
+                    "degraded_features": degraded,
+                    "signature": signature,
+                }
+            )
+
+        full_config = {
+            **base_config,
+            **compile_cache_config,
+            **prefix_cache_config,
+        }
+        add_attempt(
+            full_config,
+            compile_cache_enabled=bool(compile_cache_config),
+            prefix_cache_enabled=(
+                True if prefix_cache_config.get("NPUW_LLM_ENABLE_PREFIX_CACHING") == "YES"
+                else False if "NPUW_LLM_ENABLE_PREFIX_CACHING" in prefix_cache_config
+                else None
+            ),
+            degraded=[],
+        )
+
+        if prefix_cache_config:
+            add_attempt(
+                {**base_config, **compile_cache_config},
+                compile_cache_enabled=bool(compile_cache_config),
+                prefix_cache_enabled=None,
+                degraded=["prefix_cache"],
+            )
+
+        if compile_cache_config:
+            add_attempt(
+                {**base_config, **prefix_cache_config},
+                compile_cache_enabled=False,
+                prefix_cache_enabled=(
+                    True if prefix_cache_config.get("NPUW_LLM_ENABLE_PREFIX_CACHING") == "YES"
+                    else False if "NPUW_LLM_ENABLE_PREFIX_CACHING" in prefix_cache_config
+                    else None
+                ),
+                degraded=["compile_cache"],
+            )
+
+        if prefix_cache_config and compile_cache_config:
+            add_attempt(
+                dict(base_config),
+                compile_cache_enabled=False,
+                prefix_cache_enabled=None,
+                degraded=["prefix_cache", "compile_cache"],
+            )
+
+        return attempts
     
     def _load_model(self) -> None:
         """Load the model with automatic device fallback.
@@ -406,48 +598,348 @@ class InferenceEngine:
         devices_to_try = [self.device]
         if self.fallback_device:
             devices_to_try.append(self.fallback_device)
-        # Always include CPU as last resort
         if "CPU" not in devices_to_try:
             devices_to_try.append("CPU")
-        
+
+        load_started_at = time.perf_counter()
         last_error: Optional[Exception] = None
+
         for device in devices_to_try:
-            try:
-                logger.info(f"Loading model from {self.model_path} on {device}")
-                
-                # Configure device-specific settings
-                if device == "NPU":
-                    # NPU requires MAX_PROMPT_LEN config for longer prompts
-                    config = {"MAX_PROMPT_LEN": DEFAULT_MAX_PROMPT_LEN}
-                    logger.info(f"NPU config: MAX_PROMPT_LEN={DEFAULT_MAX_PROMPT_LEN}")
-                    self.pipeline = ov_genai.LLMPipeline(
-                        str(self.model_path), device, config
+            attempts = self._build_pipeline_attempts(device)
+            for attempt_index, attempt in enumerate(attempts, start=1):
+                config = dict(attempt["config"])
+                try:
+                    logger.info(
+                        "Loading model from %s on %s (attempt %s/%s)",
+                        self.model_path,
+                        device,
+                        attempt_index,
+                        len(attempts),
                     )
-                else:
-                    self.pipeline = ov_genai.LLMPipeline(
-                        str(self.model_path), device
+                    if config:
+                        logger.info("Runtime config for %s: %s", device, config)
+                        self.pipeline = ov_genai.LLMPipeline(
+                            str(self.model_path),
+                            device,
+                            config,
+                        )
+                    else:
+                        self.pipeline = ov_genai.LLMPipeline(str(self.model_path), device)
+
+                    self.actual_device = device
+                    self.used_fallback = (device != self.device)
+                    self._model_load_seconds = time.perf_counter() - load_started_at
+                    degraded_features = list(attempt["degraded_features"])
+                    prefix_cache_enabled = attempt["prefix_cache_enabled"]
+                    if self.prefix_cache_mode in {"on", "off"} and device != "NPU":
+                        if "prefix_cache" not in degraded_features:
+                            degraded_features.append("prefix_cache")
+                        prefix_cache_enabled = False
+                    self._runtime_features = {
+                        "compile_cache_enabled": attempt["compile_cache_enabled"],
+                        "prefix_cache_enabled": prefix_cache_enabled,
+                        "degraded_features": degraded_features,
+                    }
+                    self._load_diagnostics.append(
+                        {
+                            "device": device,
+                            "status": "loaded",
+                            "config": config,
+                            "degraded_features": degraded_features,
+                        }
                     )
-                
-                self.actual_device = device
-                self.used_fallback = (device != self.device)
-                if self.used_fallback:
-                    logger.warning(
-                        f"Using fallback device {device} instead of {self.device}"
+
+                    if self.used_fallback:
+                        logger.warning(
+                            "Using fallback device %s instead of %s",
+                            device,
+                            self.device,
+                        )
+                    else:
+                        logger.info("Model loaded successfully on %s", device)
+
+                    record_model_load_time(self.model_name, self._model_load_seconds)
+                    record_runtime_feature_state(
+                        self.model_name,
+                        device.lower(),
+                        "compile_cache",
+                        bool(attempt["compile_cache_enabled"]),
                     )
-                else:
-                    logger.info(f"Model loaded successfully on {device}")
-                return
-            except Exception as e:
-                logger.warning(f"Failed to load on {device}: {e}")
-                last_error = e
-                continue
-        
-        # All devices failed
+                    if prefix_cache_enabled is not None:
+                        record_runtime_feature_state(
+                            self.model_name,
+                            device.lower(),
+                            "prefix_cache",
+                            bool(prefix_cache_enabled),
+                        )
+                    for feature in degraded_features:
+                        record_runtime_feature_degradation(
+                            self.model_name,
+                            device.lower(),
+                            feature,
+                            "safe_retry",
+                        )
+                    return
+                except Exception as exc:
+                    last_error = exc
+                    self._load_diagnostics.append(
+                        {
+                            "device": device,
+                            "status": "failed",
+                            "config": config,
+                            "degraded_features": attempt["degraded_features"],
+                            "error": str(exc),
+                        }
+                    )
+                    if attempt_index < len(attempts):
+                        next_degraded = attempts[attempt_index]["degraded_features"]
+                        removed_features = sorted(
+                            set(next_degraded) - set(attempt["degraded_features"])
+                        )
+                        logger.warning(
+                            "Failed to load on %s with runtime settings %s: %s. "
+                            "Retrying without %s.",
+                            device,
+                            config,
+                            exc,
+                            ", ".join(removed_features) or "optional runtime features",
+                        )
+                    else:
+                        logger.warning("Failed to load on %s: %s", device, exc)
+
+        record_error("engine.load_model", "device_error")
         raise DeviceError(
             device=self.requested_device,
             available_devices=get_available_devices(),
             original_error=last_error
         )
+
+    @staticmethod
+    def _metric_mean(value: Any) -> Optional[float]:
+        """Convert OpenVINO perf metric values into floats."""
+        if value is None:
+            return None
+        metric_value = getattr(value, "mean", value)
+        try:
+            return float(metric_value)
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _metric_seconds(cls, value: Any) -> Optional[float]:
+        """Convert millisecond perf metric values into seconds."""
+        mean_value = cls._metric_mean(value)
+        if mean_value is None:
+            return None
+        return mean_value / 1000.0
+
+    @staticmethod
+    def _extract_native_finish_reason(result: Any) -> FinishReason | None:
+        for attr in ("finish_reason", "stop_reason", "finish_status", "stop_reason_name"):
+            reason = _normalize_finish_reason(getattr(result, attr, None))
+            if reason is not None:
+                return reason
+        if isinstance(result, dict):
+            for key in ("finish_reason", "stop_reason", "finish_status"):
+                reason = _normalize_finish_reason(result.get(key))
+                if reason is not None:
+                    return reason
+        return None
+
+    def _set_last_finish_reason(
+        self,
+        result: Any,
+        *,
+        completion_tokens: int,
+        max_new_tokens: int,
+    ) -> None:
+        native_reason = self._extract_native_finish_reason(result)
+        if native_reason is not None:
+            self._last_finish_reason = native_reason
+        elif completion_tokens >= 0:
+            if max_new_tokens > 0 and completion_tokens >= max_new_tokens:
+                self._last_finish_reason = "length"
+            else:
+                self._last_finish_reason = "stop"
+        else:
+            self._last_finish_reason = None
+        if self._last_generation_stats is not None:
+            self._last_generation_stats["finish_reason"] = self._last_finish_reason
+
+    @property
+    def last_finish_reason(self) -> FinishReason | None:
+        """Normalized reason for the most recent generation, when known."""
+        return self._last_finish_reason
+
+    @staticmethod
+    def _decode_generation_text(result: Any) -> str:
+        """Normalize LLMPipeline generate output into text."""
+        texts = getattr(result, "texts", None)
+        if isinstance(texts, list) and texts:
+            return str(texts[0])
+        return str(result)
+
+    def _update_last_generation_stats(self, result: Any) -> None:
+        """Capture additive runtime generation diagnostics."""
+        perf_metrics = getattr(result, "perf_metrics", None)
+        if perf_metrics is None:
+            self._last_generation_stats = None
+            return
+
+        stats = {
+            "device": self.actual_device,
+            "load_time_seconds": self._metric_seconds(
+                getattr(perf_metrics, "get_load_time", lambda: None)()
+            ),
+            "generate_duration_seconds": self._metric_seconds(
+                getattr(perf_metrics, "get_generate_duration", lambda: None)()
+            ),
+            "inference_duration_seconds": self._metric_seconds(
+                getattr(perf_metrics, "get_inference_duration", lambda: None)()
+            ),
+            "tokenization_duration_seconds": self._metric_seconds(
+                getattr(perf_metrics, "get_tokenization_duration", lambda: None)()
+            ),
+            "detokenization_duration_seconds": self._metric_seconds(
+                getattr(perf_metrics, "get_detokenization_duration", lambda: None)()
+            ),
+            "ttft_seconds": self._metric_seconds(
+                getattr(perf_metrics, "get_ttft", lambda: None)()
+            ),
+            "tpot_seconds": self._metric_seconds(
+                getattr(perf_metrics, "get_tpot", lambda: None)()
+            ),
+            "throughput_tokens_per_second": self._metric_mean(
+                getattr(perf_metrics, "get_throughput", lambda: None)()
+            ),
+            "input_tokens": getattr(
+                perf_metrics,
+                "get_num_input_tokens",
+                lambda: None,
+            )(),
+            "generated_tokens": getattr(
+                perf_metrics,
+                "get_num_generated_tokens",
+                lambda: None,
+            )(),
+        }
+        self._last_generation_stats = stats
+
+        latency = stats["generate_duration_seconds"]
+        if latency is not None:
+            record_inference(self.model_name, self.actual_device.lower(), "chat", latency)
+        if stats["ttft_seconds"] is not None:
+            record_ttft(self.model_name, stats["ttft_seconds"])
+        if stats["tpot_seconds"] is not None:
+            record_tpot(self.model_name, stats["tpot_seconds"])
+        if stats["throughput_tokens_per_second"] is not None:
+            record_tokens_per_second(
+                self.model_name,
+                self.actual_device.lower(),
+                stats["throughput_tokens_per_second"],
+            )
+
+    def _clear_active_call_locked(self) -> None:
+        """Clear active inference bookkeeping."""
+        self._active_future = None
+        self._active_timeout_seconds = None
+        self._active_operation = None
+
+    def _reap_completed_call_locked(self) -> None:
+        """Clear active inference state once the worker finishes."""
+        if self._active_future is not None and self._active_future.done():
+            self._clear_active_call_locked()
+
+    def _submit_inference_call(
+        self,
+        operation: str,
+        func: Callable[[], Any],
+    ) -> concurrent.futures.Future[Any]:
+        """Submit a single inference call while preventing hidden queueing."""
+        with self._inference_lock:
+            self._reap_completed_call_locked()
+            if self._active_future is not None:
+                if self._active_timeout_seconds is not None:
+                    record_error(f"engine.{operation}", "busy_after_timeout")
+                    raise InferenceTimeoutError(
+                        self._active_timeout_seconds,
+                        message=(
+                            f"Previous {self._active_operation or 'inference'} timed out "
+                            f"after {self._active_timeout_seconds} seconds and is still "
+                            "running; refusing to queue another request"
+                        ),
+                    )
+
+                record_error(f"engine.{operation}", "busy")
+                raise InferenceError(
+                    "Inference already in progress on this shared engine; "
+                    "retry after the current request completes",
+                    status_code=503,
+                )
+
+            future = self._inference_executor.submit(func)
+            self._active_future = future
+            self._active_timeout_seconds = None
+            self._active_operation = operation
+            return future
+
+    def _release_inference_call(
+        self,
+        future: concurrent.futures.Future[Any],
+    ) -> None:
+        """Release the active inference slot once the future completes."""
+        with self._inference_lock:
+            if self._active_future is future and future.done():
+                self._clear_active_call_locked()
+
+    def _mark_inference_timeout(
+        self,
+        future: concurrent.futures.Future[Any],
+        timeout: int,
+    ) -> None:
+        """Preserve timed-out in-flight work so follow-up calls fail fast."""
+        with self._inference_lock:
+            if self._active_future is not future:
+                return
+            if future.cancel():
+                self._clear_active_call_locked()
+                return
+            self._active_timeout_seconds = timeout
+
+    def _run_with_timeout(
+        self,
+        operation: str,
+        func: Callable[[], Any],
+        timeout: int,
+    ) -> Any:
+        """Run inference work on the long-lived executor with prompt timeout returns."""
+        future = self._submit_inference_call(operation, func)
+        try:
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            self._mark_inference_timeout(future, timeout)
+            logger.error("%s timed out after %ss", operation, timeout)
+            record_error(f"engine.{operation}", "timeout")
+            raise InferenceTimeoutError(timeout)
+        except Exception as exc:
+            record_error(f"engine.{operation}", exc.__class__.__name__.lower())
+            raise
+        finally:
+            self._release_inference_call(future)
+
+    def has_active_inference(self) -> bool:
+        """Return whether native inference is still active on this engine."""
+        with self._inference_lock:
+            self._reap_completed_call_locked()
+            return self._active_future is not None
+
+    def shutdown(self, wait: bool = False) -> None:
+        """Release executor resources associated with this engine.
+
+        Timeouts are soft: shutdown can cancel queued work, but cannot forcibly
+        stop a native OpenVINO call that is already running.
+        """
+        self._inference_executor.shutdown(wait=wait, cancel_futures=True)
     
     def warmup(self, warmup_tokens: int = 16) -> None:
         """Perform warmup inference to pre-compile the NPU pipeline.
@@ -527,6 +1019,18 @@ class InferenceEngine:
             "used_fallback": self.used_fallback,
             "available_devices": get_available_devices(),
             "is_warmed_up": self._is_warmed_up,
+            "inference_timeout": self.inference_timeout,
+            "max_prompt_len": self.max_prompt_len,
+            "compile_cache_dir": (
+                str(self.compile_cache_dir) if self.compile_cache_dir is not None else None
+            ),
+            "compile_cache_mode": self.compile_cache_mode,
+            "prefix_cache_mode": self.prefix_cache_mode,
+            "runtime_features": dict(self._runtime_features),
+            "model_load_seconds": self._model_load_seconds,
+            "load_diagnostics": list(self._load_diagnostics),
+            "last_generation_stats": self._last_generation_stats,
+            "last_finish_reason": self._last_finish_reason,
         }
     
     def generate(
@@ -553,7 +1057,9 @@ class InferenceEngine:
             top_p: Nucleus sampling probability. Only tokens with cumulative
                 probability <= top_p are considered. Defaults to 0.9.
             timeout: Maximum time in seconds to wait for completion.
-                Defaults to DEFAULT_INFERENCE_TIMEOUT (180s).
+                Defaults to DEFAULT_INFERENCE_TIMEOUT (180s). This is a soft
+                timeout: native OpenVINO work may continue in the worker after
+                the caller receives InferenceTimeoutError.
         
         Returns:
             Generated text completion as a string.
@@ -580,7 +1086,7 @@ class InferenceEngine:
             raise ModelNotLoadedError()
         
         if timeout is None:
-            timeout = DEFAULT_INFERENCE_TIMEOUT
+            timeout = self.inference_timeout
         
         config = ov_genai.GenerationConfig()
         config.max_new_tokens = max_new_tokens
@@ -591,15 +1097,26 @@ class InferenceEngine:
         else:
             config.do_sample = False
         
-        # Run with timeout
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(self.pipeline.generate, prompt, config)
-            try:
-                result = future.result(timeout=timeout)
-                return result
-            except concurrent.futures.TimeoutError:
-                logger.error(f"Inference timed out after {timeout}s")
-                raise InferenceTimeoutError(timeout)
+        result = self._run_with_timeout(
+            "generate",
+            lambda: self.pipeline.generate(prompt, config),
+            timeout,
+        )
+        self._update_last_generation_stats(result)
+        response_text = self._decode_generation_text(result)
+        generated_tokens = None
+        if self._last_generation_stats is not None:
+            generated_tokens = self._last_generation_stats.get("generated_tokens")
+        try:
+            completion_tokens = int(generated_tokens) if generated_tokens is not None else -1
+        except (TypeError, ValueError):
+            completion_tokens = -1
+        self._set_last_finish_reason(
+            result,
+            completion_tokens=completion_tokens,
+            max_new_tokens=max_new_tokens,
+        )
+        return response_text
     
     def generate_stream(
         self,
@@ -633,7 +1150,9 @@ class InferenceEngine:
                 Should return True to abort generation. This enables clean
                 cancellation (e.g., when client disconnects). Defaults to None.
             timeout: Maximum time in seconds to wait for completion.
-                Defaults to DEFAULT_INFERENCE_TIMEOUT (180s).
+                Defaults to DEFAULT_INFERENCE_TIMEOUT (180s). This is a soft
+                timeout: native OpenVINO work may continue in the worker after
+                the caller receives InferenceTimeoutError.
         
         Yields:
             Individual tokens as strings.
@@ -668,7 +1187,7 @@ class InferenceEngine:
             raise ModelNotLoadedError()
         
         if timeout is None:
-            timeout = DEFAULT_INFERENCE_TIMEOUT
+            timeout = self.inference_timeout
         
         config = ov_genai.GenerationConfig()
         config.max_new_tokens = max_new_tokens
@@ -704,16 +1223,17 @@ class InferenceEngine:
             
             return False
         
-        # Generate with streamer and timeout
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(
-                self.pipeline.generate, prompt, config, streamer
-            )
-            try:
-                future.result(timeout=timeout)
-            except concurrent.futures.TimeoutError:
-                logger.error(f"Streaming inference timed out after {timeout}s")
-                raise InferenceTimeoutError(timeout)
+        result = self._run_with_timeout(
+            "generate_stream",
+            lambda: self.pipeline.generate(prompt, config, streamer),
+            timeout,
+        )
+        self._update_last_generation_stats(result)
+        self._set_last_finish_reason(
+            result,
+            completion_tokens=len(tokens),
+            max_new_tokens=max_new_tokens,
+        )
         
         # Yield collected tokens
         for token in tokens:
@@ -731,7 +1251,40 @@ _loaded_models: dict[str, InferenceEngine] = {}
 _engine_lock: threading.Lock = threading.Lock()
 
 
-def reset_engine() -> None:
+def _resolve_engine_runtime_config(
+    *,
+    config: LLMRuntimeConfig | None = None,
+    model_path: Optional[str | Path] = None,
+    device: Optional[str] = None,
+    inference_timeout: Optional[int] = None,
+    max_prompt_len: Optional[int] = None,
+    compile_cache_dir: Optional[str | Path] = None,
+    compile_cache_mode: Optional[str] = None,
+    prefix_cache_mode: Optional[str] = None,
+) -> LLMRuntimeConfig:
+    """Resolve engine configuration from the active control plane plus overrides."""
+    base_config = config or get_active_llm_runtime_config()
+    overrides: dict[str, object] = {}
+    if model_path is not None:
+        overrides["model_path"] = Path(model_path)
+    if device is not None:
+        overrides["device"] = device
+    if inference_timeout is not None:
+        overrides["inference_timeout"] = inference_timeout
+    if max_prompt_len is not None:
+        overrides["max_prompt_len"] = max_prompt_len
+    if compile_cache_dir is not None:
+        overrides["compile_cache_dir"] = (
+            Path(compile_cache_dir) if compile_cache_dir else None
+        )
+    if compile_cache_mode is not None:
+        overrides["compile_cache_mode"] = compile_cache_mode
+    if prefix_cache_mode is not None:
+        overrides["prefix_cache_mode"] = prefix_cache_mode
+    return replace(base_config, **overrides) if overrides else base_config
+
+
+def reset_engine(*, force: bool = False) -> None:
     """Reset the global engine to allow reloading with different configuration.
     
     Clears the singleton instance and loaded models dictionary, allowing
@@ -746,18 +1299,52 @@ def reset_engine() -> None:
         >>> engine2 = get_llm_engine(device="CPU")  # New instance
     
     Warning:
-        Any references to the previous engine instance become stale.
-        Ensure no active inference is running before calling reset_engine().
+        Any references to the previous engine instance become stale. Active
+        inference prevents reset unless force=True is used. Forced reset is
+        best-effort because already-running native calls cannot be killed.
     """
     global _llm_engine, _loaded_models
+    engines_to_shutdown: list[InferenceEngine] = []
     with _engine_lock:
+        if _llm_engine is not None:
+            engines_to_shutdown.append(_llm_engine)
+        for engine in _loaded_models.values():
+            if engine not in engines_to_shutdown:
+                engines_to_shutdown.append(engine)
+
+        active_engines = [
+            engine
+            for engine in engines_to_shutdown
+            if callable(getattr(engine, "has_active_inference", None))
+            and engine.has_active_inference() is True
+        ]
+        if active_engines and not force:
+            raise InferenceError(
+                "Cannot reset inference engine while inference is active; "
+                "retry after completion or call reset_engine(force=True) for a best-effort reset",
+                status_code=409,
+            )
+        if active_engines:
+            logger.warning(
+                "Forcing engine reset while %s inference call(s) are still active; "
+                "native work may continue until it returns",
+                len(active_engines),
+            )
         _llm_engine = None
         _loaded_models = {}
+    for engine in engines_to_shutdown:
+        engine.shutdown(wait=False)
 
 
 def get_llm_engine(
     model_path: Optional[str | Path] = None,
     device: Optional[str] = None,
+    inference_timeout: Optional[int] = None,
+    max_prompt_len: Optional[int] = None,
+    compile_cache_dir: Optional[str | Path] = None,
+    compile_cache_mode: Optional[str] = None,
+    prefix_cache_mode: Optional[str] = None,
+    config: LLMRuntimeConfig | None = None,
 ) -> InferenceEngine:
     """Get or create the singleton LLM inference engine instance.
     
@@ -796,24 +1383,69 @@ def get_llm_engine(
     """
     global _llm_engine
     
-    # Use environment variable for device if not specified
-    if device is None:
-        device = os.environ.get("NPU_PROXY_DEVICE", "NPU")
-    
+    runtime_config = _resolve_engine_runtime_config(
+        config=config,
+        model_path=model_path,
+        device=device,
+        inference_timeout=inference_timeout,
+        max_prompt_len=max_prompt_len,
+        compile_cache_dir=compile_cache_dir,
+        compile_cache_mode=compile_cache_mode,
+        prefix_cache_mode=prefix_cache_mode,
+    )
+
     # Double-checked locking for thread safety
     if _llm_engine is None:
         with _engine_lock:
             if _llm_engine is None:
-                if model_path is None:
-                    model_path = DEFAULT_MODEL_DIR / DEFAULT_LLM_MODEL
-                
-                if not Path(model_path).exists():
-                    raise ModelNotFoundError(Path(model_path))
-                
-                _llm_engine = InferenceEngine(model_path, device)
+                if runtime_config.backend is not LLMBackend.OPENVINO:
+                    raise InferenceError(
+                        "Legacy engine path only supports the openvino backend; "
+                        "use npu_proxy.inference.llm_runtime.get_llm_runtime() "
+                        "for backend-neutral access.",
+                    )
+                if not runtime_config.model_path.exists():
+                    raise ModelNotFoundError(Path(runtime_config.model_path))
+
+                _llm_engine = InferenceEngine(
+                    runtime_config.model_path,
+                    runtime_config.device,
+                    inference_timeout=runtime_config.inference_timeout,
+                    max_prompt_len=runtime_config.max_prompt_len,
+                    compile_cache_dir=runtime_config.compile_cache_dir,
+                    compile_cache_mode=runtime_config.compile_cache_mode,
+                    prefix_cache_mode=runtime_config.prefix_cache_mode,
+                )
                 _loaded_models[_llm_engine.model_name] = _llm_engine
     
     return _llm_engine
+
+
+def get_llm_execution_target(*, load_if_needed: bool = False) -> dict[str, object]:
+    """Return the actual singleton execution target without inventing per-request routing."""
+    if load_if_needed:
+        engine = get_llm_engine()
+    else:
+        engine = _llm_engine
+
+    if engine is None:
+        runtime_config = get_active_llm_runtime_config()
+        return {
+            "model": runtime_config.model_path.name,
+            "device": runtime_config.device,
+            "requested_device": runtime_config.device,
+            "used_fallback": False,
+            "loaded": False,
+        }
+
+    device_info = engine.get_device_info()
+    return {
+        "model": engine.model_name,
+        "device": str(device_info.get("actual_device") or engine.actual_device),
+        "requested_device": str(device_info.get("requested_device") or engine.requested_device),
+        "used_fallback": bool(device_info.get("used_fallback")),
+        "loaded": True,
+    }
 
 
 def get_loaded_models() -> dict[str, InferenceEngine]:
@@ -830,10 +1462,10 @@ def get_loaded_models() -> dict[str, InferenceEngine]:
         ['tinyllama-1.1b-chat-int4-ov']
     
     Note:
-        This returns a reference to the internal dictionary. Modifications
-        will affect the module state - copy if mutation is needed.
+        This returns a shallow copy so callers cannot mutate module state.
     """
-    return _loaded_models
+    with _engine_lock:
+        return dict(_loaded_models)
 
 
 def is_model_loaded() -> bool:

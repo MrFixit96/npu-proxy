@@ -1,7 +1,23 @@
 # Launch Claude CLI with NPU Proxy as Ollama backend
-# Sets OLLAMA_HOST to point to the local NPU proxy server
+# Sets OLLAMA_HOST to point to the local NPU proxy server when unset
 
-$env:OLLAMA_HOST = "http://localhost:11435"
+[CmdletBinding()]
+param(
+    [string]$OllamaHost
+)
+
+$ErrorActionPreference = "Stop"
+
+if ($OllamaHost) {
+    $env:OLLAMA_HOST = $OllamaHost
+} elseif (-not $env:OLLAMA_HOST) {
+    $env:OLLAMA_HOST = "http://localhost:11435"
+}
+
+if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {
+    Write-Error "Required tool not found: claude"
+    exit 1
+}
 
 Write-Host "Launching Claude CLI with NPU Proxy backend" -ForegroundColor Cyan
 Write-Host "  OLLAMA_HOST=$env:OLLAMA_HOST" -ForegroundColor Gray
@@ -20,4 +36,5 @@ try {
 }
 
 # Launch Claude CLI
-claude --provider ollama
+& claude --provider ollama
+exit $LASTEXITCODE

@@ -20,8 +20,74 @@ try:
 except ImportError:
     tabulate = None
 
-from npu_proxy.inference.engine import get_llm_engine, InferenceEngine, get_available_devices
-from npu_proxy.inference.embedding_engine import get_embedding_engine, ProductionEmbeddingEngine
+
+
+def get_available_devices() -> list[str]:
+    from npu_proxy.inference.devices import get_available_devices as impl
+
+    return impl()
+
+
+def get_llm_engine(*args, **kwargs):
+    from npu_proxy.inference.engine import get_llm_engine as impl
+
+    return impl(*args, **kwargs)
+
+
+def reset_engine() -> None:
+    try:
+        from npu_proxy.inference.engine import reset_engine as impl
+    except Exception:
+        return
+
+    impl()
+
+
+def get_embedding_engine(*args, **kwargs):
+    from npu_proxy.inference.embedding_engine import get_embedding_engine as impl
+
+    return impl(*args, **kwargs)
+
+
+def resolve_model_storage_key(model: str) -> Optional[str]:
+    from npu_proxy.models.mapper import resolve_model_storage_key as impl
+
+    return impl(model)
+
+
+def _default_model_dir() -> Path:
+    from npu_proxy.models.registry import DEFAULT_MODEL_DIR
+
+    return DEFAULT_MODEL_DIR
+
+
+def count_completion_tokens(output: str, *, precision: object = None, model: Optional[str] = None) -> int:
+    try:
+        from npu_proxy.inference.tokenizer import (
+            TokenCountPrecision,
+            count_completion_tokens as impl,
+        )
+    except Exception:
+        return len(output.split())
+
+    return impl(
+        output,
+        precision=precision or TokenCountPrecision.APPROXIMATE,
+        model=model,
+    )
+
+
+class TokenCountPrecision:
+    APPROXIMATE = "approximate"
+
+
+class InferenceEngine:
+    def generate(self, *args, **kwargs):
+        raise NotImplementedError
+
+
+class ProductionEmbeddingEngine:
+    pass
 
 
 class BenchmarkResult:
@@ -71,6 +137,7 @@ class NPUProxyBenchmark:
 
     def __init__(self):
         self.results: List[BenchmarkResult] = []
+        self.failures: List[str] = []
 
     def run_benchmark(
         self,
@@ -95,14 +162,18 @@ class NPUProxyBenchmark:
             print(f"\nBenchmarking {model} on {device or 'auto'}...")
 
             # Initialize engine
-            engine = get_llm_engine(model_name=model, preferred_device=device)
+            model_path = self._resolve_model_path(model)
+            reset_engine()
+            engine = get_llm_engine(model_path=model_path, device=device)
             if engine is None:
                 actual_device = device or "available device"
-                warnings.warn(f"Device {actual_device} unavailable, skipping...")
+                message = f"Device {actual_device} unavailable, skipping..."
+                self.failures.append(f"{model} on {device or 'auto'}: {message}")
+                warnings.warn(message)
                 return None
 
             # Determine actual device
-            actual_device = device or engine.device
+            actual_device = self._get_device_name(engine, requested_device=device)
 
             # Cold start - first inference
             print("  Measuring cold start...")
@@ -119,24 +190,32 @@ class NPUProxyBenchmark:
             print(f"  Running {iterations} benchmark iteration(s)...")
             warm_times = []
             token_counts = []
+            reported_throughputs = []
 
             for i in range(iterations):
                 start = time.perf_counter()
-                output, token_count = self._run_inference(
-                    engine, self.INFERENCE_PROMPT
+                output, token_count, reported_throughput = self._run_inference(
+                    engine,
+                    self.INFERENCE_PROMPT,
+                    model=model,
                 )
                 elapsed = (time.perf_counter() - start) * 1000
                 warm_times.append(elapsed)
                 token_counts.append(token_count)
+                if reported_throughput is not None:
+                    reported_throughputs.append(reported_throughput)
 
             warm_inference_ms = sum(warm_times) / len(warm_times)
 
             # Calculate tokens per second
-            total_tokens = sum(token_counts)
-            total_time_s = sum(warm_times) / 1000
-            tokens_per_second = (
-                total_tokens / total_time_s if total_time_s > 0 else 0
-            )
+            if reported_throughputs:
+                tokens_per_second = sum(reported_throughputs) / len(reported_throughputs)
+            else:
+                total_tokens = sum(token_counts)
+                total_time_s = sum(warm_times) / 1000
+                tokens_per_second = (
+                    total_tokens / total_time_s if total_time_s > 0 else 0
+                )
 
             result = BenchmarkResult(
                 device=actual_device,
@@ -152,10 +231,12 @@ class NPUProxyBenchmark:
             return result
 
         except Exception as e:
-            warnings.warn(
-                f"Benchmark on {device or 'auto'} failed: {str(e)}"
-            )
+            message = f"Benchmark on {device or 'auto'} failed: {str(e)}"
+            self.failures.append(f"{model} on {device or 'auto'}: {str(e)}")
+            warnings.warn(message)
             return None
+        finally:
+            reset_engine()
 
     def benchmark_embedding(
         self, model: str = "all-MiniLM-L6-v2", device: Optional[str] = None
@@ -173,8 +254,14 @@ class NPUProxyBenchmark:
         try:
             print(f"\nBenchmarking embedding model {model}...")
 
-            engine = get_embedding_engine()
-            actual_device = engine.get_engine_info().get("device", "CPU")
+            engine = get_embedding_engine(model_name=model, device=device)
+            engine_info = engine.get_engine_info()
+            actual_device = (
+                engine_info.get("actual_device")
+                or engine_info.get("device")
+                or device
+                or "CPU"
+            )
 
             # Cold start
             print("  Measuring cold start...")
@@ -210,31 +297,98 @@ class NPUProxyBenchmark:
             return result
 
         except Exception as e:
-            warnings.warn(f"Embedding benchmark failed: {str(e)}")
+            message = f"Embedding benchmark failed: {str(e)}"
+            self.failures.append(f"embedding {model} on {device or 'auto'}: {str(e)}")
+            warnings.warn(message)
             return None
 
     @staticmethod
     def _run_inference(
-        engine: InferenceEngine, prompt: str
-    ) -> tuple[str, int]:
+        engine: InferenceEngine,
+        prompt: str,
+        *,
+        model: Optional[str] = None,
+    ) -> tuple[str, int, Optional[float]]:
         """
-        Run single inference and return output with token count.
+        Run single inference and return output with token accounting.
 
         Returns:
-            Tuple of (output_text, token_count)
+            Tuple of (output_text, token_count, reported_tokens_per_second).
+
+        Notes:
+            Prefers runtime-reported generation metrics when available. Falls
+            back to tokenizer-backed approximate completion counting instead of
+            using a raw word-count heuristic.
         """
-        output = engine.generate(prompt, max_tokens=100)
-        # Simple token count estimation (words + punctuation)
-        token_count = len(output.split())
-        return output, token_count
+        output = str(engine.generate(prompt, max_new_tokens=100))
+        stats = NPUProxyBenchmark._get_last_generation_stats(engine)
+
+        generated_tokens = stats.get("generated_tokens")
+        token_count = generated_tokens if isinstance(generated_tokens, int) else count_completion_tokens(
+            output,
+            precision=TokenCountPrecision.APPROXIMATE,
+            model=model,
+        )
+
+        throughput = stats.get("throughput_tokens_per_second")
+        reported_tps = float(throughput) if isinstance(throughput, (int, float)) else None
+        return output, token_count, reported_tps
 
     @staticmethod
-    def _get_device_name(engine: InferenceEngine) -> str:
+    def _get_last_generation_stats(engine: InferenceEngine) -> dict[str, Any]:
+        """Return engine-reported generation metrics when available."""
+        get_engine_info = getattr(engine, "get_engine_info", None)
+        if not callable(get_engine_info):
+            return {}
+
+        try:
+            info = get_engine_info()
+        except Exception:
+            return {}
+
+        if not isinstance(info, dict):
+            return {}
+
+        stats = info.get("last_generation_stats")
+        return stats if isinstance(stats, dict) else {}
+
+    @staticmethod
+    def _get_device_name(
+        engine: InferenceEngine,
+        requested_device: Optional[str] = None,
+    ) -> str:
         """Extract device name from engine."""
-        # Try to get device from engine attributes
-        if hasattr(engine, "device"):
-            return str(engine.device).upper()
-        return "UNKNOWN"
+        for attr in ("actual_device", "device", "requested_device"):
+            value = getattr(engine, attr, None)
+            if isinstance(value, str) and value:
+                return value.upper()
+
+        get_engine_info = getattr(engine, "get_engine_info", None)
+        if callable(get_engine_info):
+            try:
+                info = get_engine_info()
+            except Exception:
+                info = {}
+            if isinstance(info, dict):
+                for key in ("actual_device", "device", "requested_device"):
+                    value = info.get(key)
+                    if isinstance(value, str) and value:
+                        return value.upper()
+
+        return (requested_device or "UNKNOWN").upper()
+
+    @staticmethod
+    def _resolve_model_path(model: str) -> Path:
+        """Resolve a benchmark model argument to the runtime's OpenVINO model path."""
+        candidate = Path(model)
+        if candidate.exists():
+            return candidate
+
+        storage_key = resolve_model_storage_key(model)
+        if storage_key is not None:
+            return _default_model_dir() / storage_key
+
+        return _default_model_dir() / model
 
     def print_results(self):
         """Print formatted results table."""
@@ -307,19 +461,37 @@ class NPUProxyBenchmark:
             "openvino": openvino_version,
         }
 
-    def compare_results(self, baseline_json: str):
+    @staticmethod
+    def _load_results_file(path: str) -> dict[str, Any]:
+        with open(path, "r") as f:
+            return json.load(f)
+
+    def compare_results(self, baseline_json: str, current_json: Optional[str] = None) -> bool:
         """
         Compare current results with baseline.
 
         Args:
             baseline_json: Path to baseline JSON file
+            current_json: Optional path to current results JSON file
         """
         try:
-            with open(baseline_json, "r") as f:
-                baseline = json.load(f)
+            baseline = self._load_results_file(baseline_json)
         except FileNotFoundError:
-            print(f"Baseline file not found: {baseline_json}")
-            return
+            print(f"Baseline file not found: {baseline_json}", file=sys.stderr)
+            return False
+
+        if current_json is not None:
+            try:
+                current_results = self._load_results_file(current_json).get("results", [])
+            except FileNotFoundError:
+                print(f"Current results file not found: {current_json}", file=sys.stderr)
+                return False
+        else:
+            current_results = [result.to_dict() for result in self.results]
+
+        if not current_results:
+            print("No current results to compare", file=sys.stderr)
+            return False
 
         print("\n" + "=" * 80)
         print("COMPARISON WITH BASELINE")
@@ -339,11 +511,11 @@ class NPUProxyBenchmark:
             for r in baseline.get("results", [])
         }
 
-        for result in self.results:
-            key = f"{result.device}_{result.model}"
+        for result in current_results:
+            key = f"{result['device']}_{result['model']}"
             if key in baseline_results:
                 baseline_result = baseline_results[key]
-                current = result.warm_inference_ms
+                current = result.get("warm_inference_ms", 0)
                 baseline_val = baseline_result.get("warm_inference_ms", 0)
                 diff = current - baseline_val
                 diff_pct = (
@@ -354,13 +526,17 @@ class NPUProxyBenchmark:
 
                 rows.append(
                     [
-                        result.device,
-                        result.model,
+                        result["device"],
+                        result["model"],
                         f"{current:.2f}",
                         f"{baseline_val:.2f}",
                         f"{diff:+.2f} ({diff_pct:+.1f}%)",
                     ]
                 )
+
+        if not rows:
+            print("No matching benchmark rows found to compare", file=sys.stderr)
+            return False
 
         if tabulate:
             print("\n" + tabulate(rows, headers=headers, tablefmt="grid"))
@@ -369,6 +545,7 @@ class NPUProxyBenchmark:
             print("-" * 80)
             for row in rows:
                 print(" | ".join(str(cell) for cell in row))
+        return True
 
 
 def main():
@@ -465,7 +642,13 @@ Examples:
 
     if args.command == "run":
         # Determine devices to benchmark
-        devices = [args.device] if args.device else [None]
+        if args.device:
+            devices = [args.device]
+        else:
+            devices = list(dict.fromkeys(get_available_devices()))
+            if not devices:
+                warnings.warn("No available devices found for benchmarking.")
+                return 1
 
         for device in devices:
             benchmark.run_benchmark(
@@ -482,8 +665,16 @@ Examples:
         if args.output:
             benchmark.export_json(args.output)
 
+        if benchmark.failures:
+            for failure in benchmark.failures:
+                print(f"Benchmark failed: {failure}", file=sys.stderr)
+            return 1
+        if not benchmark.results:
+            print("No benchmark results produced", file=sys.stderr)
+            return 1
+
     elif args.command == "compare":
-        benchmark.compare_results(args.baseline)
+        return 0 if benchmark.compare_results(args.baseline, args.current) else 1
 
     elif args.command == "export":
         # Load from input and export

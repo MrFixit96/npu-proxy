@@ -1,26 +1,34 @@
-"""Tests for the search module (TDD - RED phase)."""
+"""Tests for the search module."""
+
+from dataclasses import fields
+from unittest.mock import MagicMock, patch
 
 import pytest
-from dataclasses import fields
-from unittest.mock import patch, MagicMock
 
 from npu_proxy.models.search import (
     SearchResult,
-    extract_quantization,
-    extract_parameters,
+    _cached_search,
     extract_architecture,
     extract_model_metadata,
+    extract_parameters,
+    extract_quantization,
+    get_model_details,
     is_openvino_compatible,
     search_openvino_models,
-    get_model_details,
 )
+
+
+@pytest.fixture(autouse=True)
+def clear_search_cache() -> None:
+    _cached_search.cache_clear()
+    yield
+    _cached_search.cache_clear()
 
 
 class TestSearchResultDataclass:
     """Tests for SearchResult dataclass."""
 
     def test_search_result_dataclass_fields(self):
-        """SearchResult should have all required fields."""
         expected_fields = {
             "id",
             "name",
@@ -40,44 +48,45 @@ class TestExtractQuantization:
     """Tests for extract_quantization function."""
 
     def test_extract_quantization_int4(self):
-        """Model with int4 in name should extract INT4."""
-        result = extract_quantization("model-int4-ov")
-        assert result == "INT4"
+        assert extract_quantization("model-int4-ov") == "INT4"
 
     def test_extract_quantization_fp16(self):
-        """Model with fp16 in name should extract FP16."""
-        result = extract_quantization("model-fp16-ov")
-        assert result == "FP16"
+        assert extract_quantization("model-fp16-ov") == "FP16"
+
+    def test_extract_quantization_fp8(self):
+        assert extract_quantization("model-fp8-ov") == "FP8"
+
+    def test_extract_quantization_gguf_variant(self):
+        assert extract_quantization("DeepSeek-R1-Q4_K_M-GGUF") == "Q4_K_M"
 
 
 class TestExtractParameters:
     """Tests for extract_parameters function."""
 
     def test_extract_parameters_1b(self):
-        """TinyLlama-1.1B should extract 1.1B."""
-        result = extract_parameters("TinyLlama-1.1B")
-        assert result == "1.1B"
+        assert extract_parameters("TinyLlama-1.1B") == "1.1B"
 
     def test_extract_parameters_7b(self):
-        """Llama-7B should extract 7B."""
-        result = extract_parameters("Llama-7B")
-        assert result == "7B"
+        assert extract_parameters("Llama-7B") == "7B"
+
+    def test_extract_parameters_22m(self):
+        assert extract_parameters("all-MiniLM-L6-v2-22M") == "22M"
 
 
 class TestExtractArchitecture:
     """Tests for extract_architecture function."""
 
-    def test_extract_architecture(self):
-        """tinyllama should map to TinyLLaMA."""
-        result = extract_architecture("tinyllama")
-        assert result == "TinyLLaMA"
+    def test_extract_architecture_tinyllama(self):
+        assert extract_architecture("tinyllama") == "TinyLLaMA"
+
+    def test_extract_architecture_granite(self):
+        assert extract_architecture("granite-3.3") == "Granite"
 
 
 class TestExtractModelMetadata:
     """Tests for extract_model_metadata function."""
 
     def test_extract_model_metadata_returns_dict(self):
-        """extract_model_metadata should return dict with 3 keys."""
         result = extract_model_metadata("OpenVINO/TinyLlama-1.1B-int4-ov")
         assert isinstance(result, dict)
         assert set(result.keys()) == {"quantization", "parameters", "architecture"}
@@ -87,7 +96,6 @@ class TestIsOpenvinoCompatible:
     """Tests for is_openvino_compatible function."""
 
     def test_is_openvino_compatible_true(self):
-        """Model with OpenVINO author should be compatible."""
         with patch("npu_proxy.models.search.HfApi") as mock_api:
             mock_instance = MagicMock()
             mock_api.return_value = mock_instance
@@ -96,11 +104,9 @@ class TestIsOpenvinoCompatible:
                 tags=["text-generation"],
             )
 
-            result = is_openvino_compatible("OpenVINO/some-model")
-            assert result is True
+            assert is_openvino_compatible("OpenVINO/some-model") is True
 
     def test_is_openvino_compatible_false(self):
-        """Non-OpenVINO model should not be compatible."""
         with patch("npu_proxy.models.search.HfApi") as mock_api:
             mock_instance = MagicMock()
             mock_api.return_value = mock_instance
@@ -109,15 +115,13 @@ class TestIsOpenvinoCompatible:
                 tags=["pytorch"],
             )
 
-            result = is_openvino_compatible("random-user/some-model")
-            assert result is False
+            assert is_openvino_compatible("random-user/some-model") is False
 
 
 class TestSearchOpenvinoModels:
     """Tests for search_openvino_models function."""
 
     def test_search_returns_tuple(self):
-        """search_openvino_models should return (list, int)."""
         with patch("npu_proxy.models.search.list_models") as mock_list:
             mock_list.return_value = []
 
@@ -128,7 +132,6 @@ class TestSearchOpenvinoModels:
             assert isinstance(result[1], int)
 
     def test_search_sort_popular(self):
-        """Sort by popular should order by downloads descending."""
         with patch("npu_proxy.models.search.list_models") as mock_list:
             mock_model_1 = MagicMock(
                 id="OpenVINO/model-a-int4-ov",
@@ -148,9 +151,9 @@ class TestSearchOpenvinoModels:
 
             results, total = search_openvino_models(sort="popular")
             assert total >= 0
+            assert results[0].downloads >= results[-1].downloads
 
     def test_search_filter_quantization(self):
-        """Quantization filter should work."""
         with patch("npu_proxy.models.search.list_models") as mock_list:
             mock_model_int4 = MagicMock(
                 id="OpenVINO/model-int4-ov",
@@ -168,12 +171,32 @@ class TestSearchOpenvinoModels:
             )
             mock_list.return_value = [mock_model_int4, mock_model_fp16]
 
-            results, total = search_openvino_models(quantization="INT4")
-            for r in results:
-                assert r.quantization == "INT4"
+            results, _ = search_openvino_models(quantization="INT4")
+            assert {result.quantization for result in results} == {"INT4"}
+
+    def test_search_filter_quantization_fp8(self):
+        with patch("npu_proxy.models.search.list_models") as mock_list:
+            mock_model_fp8 = MagicMock(
+                id="OpenVINO/DeepSeek-R1-Distill-Qwen-7B-fp8-ov",
+                author="OpenVINO",
+                downloads=100,
+                likes=5,
+                last_modified=None,
+            )
+            mock_model_int4 = MagicMock(
+                id="OpenVINO/TinyLlama-1.1B-Chat-int4-ov",
+                author="OpenVINO",
+                downloads=200,
+                likes=10,
+                last_modified=None,
+            )
+            mock_list.return_value = [mock_model_fp8, mock_model_int4]
+
+            results, _ = search_openvino_models(quantization="FP8")
+            assert len(results) == 1
+            assert results[0].quantization == "FP8"
 
     def test_search_filter_model_type(self):
-        """model_type filter should work."""
         with patch("npu_proxy.models.search.list_models") as mock_list:
             mock_model_llm = MagicMock(
                 id="OpenVINO/llama-7b-int4-ov",
@@ -193,9 +216,31 @@ class TestSearchOpenvinoModels:
 
             results, total = search_openvino_models(model_type="llm")
             assert total >= 0
+            assert all(result.architecture for result in results)
+
+    def test_search_filter_model_type_with_newer_family(self):
+        with patch("npu_proxy.models.search.list_models") as mock_list:
+            mock_model_llm = MagicMock(
+                id="OpenVINO/DeepSeek-R1-Distill-Qwen-7B-fp8-ov",
+                author="OpenVINO",
+                downloads=100,
+                likes=5,
+                last_modified=None,
+            )
+            mock_model_embed = MagicMock(
+                id="OpenVINO/Qwen3-Embedding-0.6B-int4-ov",
+                author="OpenVINO",
+                downloads=50,
+                likes=2,
+                last_modified=None,
+            )
+            mock_list.return_value = [mock_model_llm, mock_model_embed]
+
+            results, _ = search_openvino_models(model_type="llm")
+            assert len(results) == 1
+            assert results[0].architecture in {"DeepSeek", "Qwen"}
 
     def test_search_min_downloads(self):
-        """min_downloads filter should work."""
         with patch("npu_proxy.models.search.list_models") as mock_list:
             mock_model_low = MagicMock(
                 id="OpenVINO/model-a-int4-ov",
@@ -213,26 +258,24 @@ class TestSearchOpenvinoModels:
             )
             mock_list.return_value = [mock_model_low, mock_model_high]
 
-            results, total = search_openvino_models(min_downloads=500)
-            for r in results:
-                assert r.downloads >= 500
+            results, _ = search_openvino_models(min_downloads=500)
+            assert all(result.downloads >= 500 for result in results)
 
     def test_search_pagination(self):
-        """offset/limit should work for pagination."""
         with patch("npu_proxy.models.search.list_models") as mock_list:
             mock_models = [
                 MagicMock(
-                    id=f"OpenVINO/model-{i}-int4-ov",
+                    id=f"OpenVINO/model-{index}-int4-ov",
                     author="OpenVINO",
-                    downloads=100 * i,
-                    likes=i,
+                    downloads=100 * index,
+                    likes=index,
                     last_modified=None,
                 )
-                for i in range(1, 11)
+                for index in range(1, 11)
             ]
             mock_list.return_value = mock_models
 
-            results, total = search_openvino_models(limit=3, offset=2)
+            results, _ = search_openvino_models(limit=3, offset=2)
             assert len(results) <= 3
 
 
@@ -240,7 +283,6 @@ class TestGetModelDetails:
     """Tests for get_model_details function."""
 
     def test_get_model_details(self):
-        """get_model_details should return SearchResult or None."""
         with patch("npu_proxy.models.search.HfApi") as mock_api:
             mock_instance = MagicMock()
             mock_api.return_value = mock_instance
