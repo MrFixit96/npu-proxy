@@ -328,6 +328,15 @@ def get_loaded_models() -> dict[str, Any]:
     return _get_loaded_models()
 
 
+def get_primary_loaded_engine() -> Any:
+    """Return the default-device LLM engine, preferring it over recent fallbacks."""
+    from npu_proxy.inference.engine import (
+        get_primary_loaded_engine as _get_primary_loaded_engine,
+    )
+
+    return _get_primary_loaded_engine()
+
+
 def check_npu_available() -> tuple[bool, str | None]:
     """Check if an Intel NPU device is available via OpenVINO.
 
@@ -498,11 +507,11 @@ def _get_llm_engine_state() -> tuple[LLMEngineHealthState, dict[str, Any] | None
         return LLMEngineHealthState.from_payload(state), device_info
 
     try:
-        loaded = get_loaded_models()
-        if not loaded:
+        engine = get_primary_loaded_engine()
+        if engine is None:
             return LLMEngineHealthState.from_payload(state), device_info
 
-        name, engine = next(iter(loaded.items()))
+        name = getattr(engine, "model_name", None)
         raw_device_info = engine.get_device_info() if hasattr(engine, "get_device_info") else {}
         device_info = dict(raw_device_info or {})
 

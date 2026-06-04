@@ -158,6 +158,7 @@ async def test_health_devices_reports_advisory_fallback_runtime_state(monkeypatc
     ))
     monkeypatch.setattr(health_api, "is_model_loaded", lambda: True)
     monkeypatch.setattr(health_api, "get_loaded_models", lambda: {"tinyllama": FakeLlmEngine()})
+    monkeypatch.setattr(health_api, "get_primary_loaded_engine", lambda: FakeLlmEngine())
     monkeypatch.setattr(
         health_api.embedding_config,
         "resolve_embedding_model_config",

@@ -1563,19 +1563,33 @@ def get_llm_engine(
     return engine
 
 
+def get_primary_loaded_engine() -> InferenceEngine | None:
+    """Return the default-device engine if loaded, else any loaded engine.
+
+    With the per-(model, device) pool a single model can have several engines
+    loaded at once. Observability surfaces need a stable "primary" engine that
+    reflects the configured/default device rather than whichever device served
+    the most recent request, so they don't misreport the active device after a
+    cross-device fallback.
+    """
+    runtime_config = get_active_llm_runtime_config()
+    default_key = _engine_pool_key(runtime_config)
+    with _engine_lock:
+        engine = _engine_pool.get(default_key)
+        if engine is None:
+            engine = next(iter(_engine_pool.values()), None)
+        if engine is None:
+            engine = next(iter(_loaded_models.values()), None)
+    return engine
+
+
 def get_llm_execution_target(*, load_if_needed: bool = False) -> dict[str, object]:
     """Return the current/default LLM execution target."""
     runtime_config = get_active_llm_runtime_config()
     if load_if_needed:
         engine = get_llm_engine(config=runtime_config)
     else:
-        default_key = _engine_pool_key(runtime_config)
-        with _engine_lock:
-            engine = _engine_pool.get(default_key)
-            if engine is None:
-                engine = next(iter(_engine_pool.values()), None)
-            if engine is None:
-                engine = next(iter(_loaded_models.values()), None)
+        engine = get_primary_loaded_engine()
 
     if engine is None:
         return {
@@ -1598,7 +1612,15 @@ def get_llm_execution_target(*, load_if_needed: bool = False) -> dict[str, objec
 
 def get_loaded_models() -> dict[str, InferenceEngine]:
     """Get dictionary of all currently loaded model engines.
-    
+
+    .. note::
+        This is a legacy index keyed by model NAME only. With the
+        per-(model, device) engine pool a single model can have several
+        engines loaded at once (e.g. NPU and CPU), but this mapping retains
+        only the most recently loaded engine per model name. For complete
+        per-device state use :func:`get_engine_pool_snapshot`, and for the
+        primary/default-device engine use :func:`get_primary_loaded_engine`.
+
     Returns:
         Dictionary mapping model names to their InferenceEngine instances.
         Empty if no models have been loaded.

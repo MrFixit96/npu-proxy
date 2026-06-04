@@ -135,3 +135,28 @@ def test_get_llm_execution_target_reports_loaded_default_engine(fake_engine, tmp
     assert target["loaded"] is True
     assert target["model"] == "model"
     assert target["requested_device"] == "CPU"
+
+
+def test_get_primary_loaded_engine_prefers_default_device(fake_engine, tmp_path, monkeypatch) -> None:
+    """A later cross-device load must not displace the default-device engine.
+
+    Regression for the certification finding where health reported CPU after a
+    long prompt fell back to CPU even though NPU was the routed default device.
+    """
+    import npu_proxy.inference.engine as engine_module
+    from npu_proxy.inference.engine import get_primary_loaded_engine
+
+    model_path = tmp_path / "model"
+    model_path.mkdir()
+    default_config = LLMRuntimeConfig(model_path=model_path, device="NPU")
+    monkeypatch.setattr(engine_module, "get_active_llm_runtime_config", lambda: default_config)
+
+    npu_engine = get_llm_engine(config=default_config)
+    cpu_engine = get_llm_engine(model_path=model_path, device="CPU")
+
+    assert npu_engine is not cpu_engine
+
+    primary = get_primary_loaded_engine()
+
+    assert primary is npu_engine
+    assert primary.requested_device == "NPU"

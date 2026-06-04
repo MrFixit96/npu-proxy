@@ -18,6 +18,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - Real inference now binds each generation request to the routed device instead of reusing a single global LLM engine.
 - `X-NPU-Proxy-Device` remains backward-compatible while matching the actual execution device.
 
+### Fixed
+
+- `/health` and `/health/devices` now report the default/preferred-device engine as the active device instead of whichever device served the most recent request. Previously, after a long prompt fell back to CPU, the legacy single-active-device fields misreported CPU even though NPU remained the routed default and continued serving short prompts. The additive `device_pool` snapshot remains the source of truth for all loaded per-device engines.
+
 ## [0.2.1] - 2026-06-03
 
 This release is the result of a comprehensive security, correctness, and code-quality

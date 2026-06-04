@@ -136,6 +136,7 @@ async def test_health_reports_loaded_llm_device(monkeypatch):
         "get_loaded_models",
         lambda: {"tinyllama-1.1b-chat-int4-ov": FakeLlmEngine()},
     )
+    monkeypatch.setattr(health_api, "get_primary_loaded_engine", lambda: FakeLlmEngine())
     monkeypatch.setattr(health_api, "get_loaded_embedding_engine", lambda model_name=None, device=None: FakeEmbeddingEngine())
     monkeypatch.setattr(health_api, "get_active_llm_runtime_config", lambda: FakeRuntimeConfig())
     monkeypatch.setattr(
@@ -220,6 +221,7 @@ async def test_health_devices_reports_engine_runtime_state(monkeypatch):
         "get_loaded_models",
         lambda: {"tinyllama-1.1b-chat-int4-ov": FakeLlmEngine()},
     )
+    monkeypatch.setattr(health_api, "get_primary_loaded_engine", lambda: FakeLlmEngine())
     monkeypatch.setattr(
         health_api,
         "get_loaded_embedding_engine",
@@ -431,7 +433,7 @@ def test_llm_state_message_distinguishes_missing_and_existing_model_paths(monkey
     assert "path is missing" in str(missing_state.message)
 
 
-def test_llm_state_uses_first_loaded_model_when_multiple_are_present(monkeypatch):
+def test_llm_state_reports_primary_default_device_engine(monkeypatch):
     class FakeEngine:
         def __init__(self, model_name, actual_device):
             self.model_name = model_name
@@ -440,22 +442,19 @@ def test_llm_state_uses_first_loaded_model_when_multiple_are_present(monkeypatch
         def get_device_info(self):
             return {"actual_device": self.actual_device, "backend": "openvino"}
 
+    # With the per-(model, device) pool the default-device engine is primary,
+    # even when a later cross-device request loaded another engine.
+    primary = FakeEngine("default-model", "NPU")
+
     monkeypatch.setattr(health_api, "get_active_llm_runtime_config", lambda: _FakeRuntimeConfig())
     monkeypatch.setattr(health_api, "is_model_loaded", lambda: True)
-    monkeypatch.setattr(
-        health_api,
-        "get_loaded_models",
-        lambda: {
-            "first": FakeEngine("first-model", "GPU"),
-            "second": FakeEngine("second-model", "NPU"),
-        },
-    )
+    monkeypatch.setattr(health_api, "get_primary_loaded_engine", lambda: primary)
 
     state, device_info = health_api._get_llm_engine_state()
 
-    assert state.model == "first-model"
-    assert state.device == "GPU"
-    assert device_info == {"actual_device": "GPU", "backend": "openvino"}
+    assert state.model == "default-model"
+    assert state.device == "NPU"
+    assert device_info == {"actual_device": "NPU", "backend": "openvino"}
 
 
 @pytest.mark.asyncio
@@ -506,6 +505,7 @@ async def test_health_endpoint_reports_loaded_llm_without_embedding(monkeypatch,
     monkeypatch.setattr(health_api, "get_active_llm_runtime_config", lambda: _FakeRuntimeConfig())
     monkeypatch.setattr(health_api, "is_model_loaded", lambda: True)
     monkeypatch.setattr(health_api, "get_loaded_models", lambda: {"tinyllama": FakeLlmEngine()})
+    monkeypatch.setattr(health_api, "get_primary_loaded_engine", lambda: FakeLlmEngine())
     monkeypatch.setattr(health_api.embedding_config, "resolve_embedding_model_config", lambda: _embedding_config(downloaded=True))
     monkeypatch.setattr(health_api, "get_loaded_embedding_engine", lambda model_name=None, device=None: None)
 
