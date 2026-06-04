@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
@@ -255,6 +255,7 @@ class CertificationReport:
     startup_seconds: float
     inference_seconds: float
     failures: list[str]
+    routing_checks: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         """Return the report as a JSON-serializable dictionary."""
@@ -288,6 +289,59 @@ def collect_openvino_runtime_details() -> dict[str, Any]:
     }
 
 
+def _header_value(headers: dict[str, Any], name: str) -> str | None:
+    for key, value in headers.items():
+        if key.lower() == name.lower():
+            return str(value).strip().upper()
+    return None
+
+
+def evaluate_routing_certification(
+    *,
+    short_headers: dict[str, Any],
+    long_headers: dict[str, Any],
+    fallback_device: str,
+    npu_expected: bool,
+) -> tuple[dict[str, Any], list[str]]:
+    """Evaluate per-request routing headers captured from live certification calls."""
+    expected_fallback = fallback_device.strip().upper()
+    short_routed = _header_value(short_headers, "X-NPU-Proxy-Routed-Device")
+    short_execution = _header_value(short_headers, "X-NPU-Proxy-Execution-Device")
+    long_routed = _header_value(long_headers, "X-NPU-Proxy-Routed-Device")
+    long_execution = _header_value(long_headers, "X-NPU-Proxy-Execution-Device")
+    long_reason = _header_value(long_headers, "X-NPU-Proxy-Fallback-Reason")
+
+    failures: list[str] = []
+    if not short_routed or not short_execution:
+        failures.append("Short routing check did not return routed/execution device headers.")
+    elif short_routed != short_execution:
+        failures.append(
+            f"Short routing check routed to {short_routed!r} but executed on {short_execution!r}."
+        )
+    elif npu_expected and short_execution != "NPU":
+        failures.append(f"Short routing check executed on {short_execution!r}, not 'NPU'.")
+
+    if not long_execution:
+        failures.append("Long routing check did not return an execution device header.")
+    elif long_execution != expected_fallback:
+        failures.append(
+            f"Long routing check executed on {long_execution!r}, not configured fallback {expected_fallback!r}."
+        )
+
+    return {
+        "short": {
+            "routed_device": short_routed,
+            "execution_device": short_execution,
+        },
+        "long": {
+            "routed_device": long_routed,
+            "execution_device": long_execution,
+            "fallback_reason": long_reason,
+            "expected_fallback_device": expected_fallback,
+        },
+    }, failures
+
+
 def evaluate_hardware_certification(
     *,
     runtime_details: dict[str, Any],
@@ -298,6 +352,7 @@ def evaluate_hardware_certification(
     model: str,
     startup_seconds: float,
     inference_seconds: float,
+    routing_data: dict[str, Any] | None = None,
 ) -> CertificationReport:
     """Evaluate whether a live run qualifies as real NPU certification."""
     failures: list[str] = []
@@ -355,6 +410,16 @@ def evaluate_hardware_certification(
     if not response_text:
         failures.append("The generate endpoint returned an empty response.")
 
+    routing_checks: dict[str, Any] = {}
+    if routing_data is not None:
+        routing_checks, routing_failures = evaluate_routing_certification(
+            short_headers=dict(routing_data.get("short_headers") or {}),
+            long_headers=dict(routing_data.get("long_headers") or {}),
+            fallback_device=str(routing_data.get("fallback_device") or "CPU"),
+            npu_expected=runtime.npu_visible,
+        )
+        failures.extend(routing_failures)
+
     return CertificationReport(
         certified=not failures,
         timestamp_utc=datetime.now(timezone.utc).isoformat(),
@@ -379,6 +444,7 @@ def evaluate_hardware_certification(
         startup_seconds=round(startup_seconds, 3),
         inference_seconds=round(inference_seconds, 3),
         failures=failures,
+        routing_checks=routing_checks,
     )
 
 
@@ -423,6 +489,25 @@ def format_certification_report(report: CertificationReport) -> str:
         ),
         f"Response preview: {report.response_preview or '<empty>'}",
     ]
+
+    if report.routing_checks:
+        short_check = report.routing_checks.get("short", {})
+        long_check = report.routing_checks.get("long", {})
+        lines.extend(
+            [
+                (
+                    "Short routing: "
+                    f"routed={short_check.get('routed_device')}, "
+                    f"execution={short_check.get('execution_device')}"
+                ),
+                (
+                    "Long routing: "
+                    f"routed={long_check.get('routed_device')}, "
+                    f"execution={long_check.get('execution_device')}, "
+                    f"expected={long_check.get('expected_fallback_device')}"
+                ),
+            ]
+        )
 
     if report.failures:
         lines.append("Failures:")

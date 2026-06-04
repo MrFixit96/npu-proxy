@@ -6,6 +6,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+### Added
+
+- Real per-request OpenAI/Ollama generation routing with lazy per-device LLM engine pools keyed by `(model, device)`.
+- Per-device concurrency guards with `503 device_busy` backpressure by default and opt-in busy fallback via `NPU_PROXY_FALLBACK_ON_BUSY`.
+- Truthful routing observability: routed/execution/fallback headers, LLM engine-pool health snapshots, and bounded Prometheus routing-execution metrics.
+- Hardware certification checks for per-request routing and optional startup warmup via `NPU_PROXY_WARMUP_DEVICES`.
+
+### Changed
+
+- Real inference now binds each generation request to the routed device instead of reusing a single global LLM engine.
+- `X-NPU-Proxy-Device` remains backward-compatible while matching the actual execution device.
+
 ## [0.2.1] - 2026-06-03
 
 This release is the result of a comprehensive security, correctness, and code-quality

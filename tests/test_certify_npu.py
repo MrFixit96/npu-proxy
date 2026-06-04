@@ -170,6 +170,11 @@ def test_main_terminates_server_process_on_success(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(certify_npu, "_run_llm_workload", lambda client, args, log_path: ({"response": "ok"}, 1.2))
     monkeypatch.setattr(
         certify_npu,
+        "_run_routing_checks",
+        lambda client, args, log_path: {"short_headers": {}, "long_headers": {}, "fallback_device": "CPU"},
+    )
+    monkeypatch.setattr(
+        certify_npu,
         "_collect_observability_snapshots",
         lambda client, log_path: ({"status": "healthy"}, {"active_device": "NPU"}),
     )

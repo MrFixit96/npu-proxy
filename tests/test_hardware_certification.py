@@ -80,6 +80,89 @@ def test_certification_passes_for_real_npu_run():
     assert report.embedding_runtime_state["cache"]["configured_max_entries"] == 1024
 
 
+def test_certification_validates_per_request_routing_headers():
+    runtime_details = {
+        "openvino_version": "2026.1.0",
+        "available_devices": ["CPU", "NPU"],
+        "npu_visible": True,
+        "npu_device_name": "Intel(R) AI Boost",
+    }
+    health_data = {
+        "status": "healthy",
+        "engines": {"llm": {"status": "loaded", "device": "NPU", "backend": "openvino"}},
+    }
+    devices_data = {"active_device": "NPU", "device_info": {"used_fallback": False}}
+    generate_data = {"response": "Certified on Intel NPU."}
+
+    report = evaluate_hardware_certification(
+        runtime_details=runtime_details,
+        health_data=health_data,
+        devices_data=devices_data,
+        generate_data=generate_data,
+        requested_device="NPU",
+        model="tinyllama-1.1b-chat-int4-ov",
+        startup_seconds=1.2,
+        inference_seconds=3.4,
+        routing_data={
+            "short_headers": {
+                "X-NPU-Proxy-Routed-Device": "NPU",
+                "X-NPU-Proxy-Execution-Device": "NPU",
+            },
+            "long_headers": {
+                "X-NPU-Proxy-Routed-Device": "CPU",
+                "X-NPU-Proxy-Execution-Device": "CPU",
+                "X-NPU-Proxy-Fallback-Reason": "device_fallback",
+            },
+            "fallback_device": "CPU",
+        },
+    )
+
+    assert report.certified is True
+    assert report.routing_checks["short"]["execution_device"] == "NPU"
+    assert report.routing_checks["long"]["execution_device"] == "CPU"
+
+
+def test_certification_fails_when_routing_execution_is_not_truthful():
+    runtime_details = {
+        "openvino_version": "2026.1.0",
+        "available_devices": ["CPU", "NPU"],
+        "npu_visible": True,
+        "npu_device_name": "Intel(R) AI Boost",
+    }
+    health_data = {
+        "status": "healthy",
+        "engines": {"llm": {"status": "loaded", "device": "NPU", "backend": "openvino"}},
+    }
+    devices_data = {"active_device": "NPU", "device_info": {"used_fallback": False}}
+    generate_data = {"response": "Certified on Intel NPU."}
+
+    report = evaluate_hardware_certification(
+        runtime_details=runtime_details,
+        health_data=health_data,
+        devices_data=devices_data,
+        generate_data=generate_data,
+        requested_device="NPU",
+        model="tinyllama-1.1b-chat-int4-ov",
+        startup_seconds=1.2,
+        inference_seconds=3.4,
+        routing_data={
+            "short_headers": {
+                "X-NPU-Proxy-Routed-Device": "NPU",
+                "X-NPU-Proxy-Execution-Device": "CPU",
+            },
+            "long_headers": {
+                "X-NPU-Proxy-Routed-Device": "CPU",
+                "X-NPU-Proxy-Execution-Device": "NPU",
+            },
+            "fallback_device": "CPU",
+        },
+    )
+
+    assert report.certified is False
+    assert any("Short routing" in failure for failure in report.failures)
+    assert any("Long routing" in failure for failure in report.failures)
+
+
 def test_certification_fails_when_proxy_falls_back():
     runtime_details = {
         "openvino_version": "2026.1.0",

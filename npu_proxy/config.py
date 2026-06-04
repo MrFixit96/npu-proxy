@@ -54,6 +54,7 @@ ENV_PREFERRED_DEVICE = "NPU_PROXY_PREFERRED_DEVICE"
 ENV_FALLBACK_DEVICE = "NPU_PROXY_FALLBACK_DEVICE"
 ENV_DEVICE_QUEUE_TIMEOUT = "NPU_PROXY_DEVICE_QUEUE_TIMEOUT"
 ENV_FALLBACK_ON_BUSY = "NPU_PROXY_FALLBACK_ON_BUSY"
+ENV_WARMUP_DEVICES = "NPU_PROXY_WARMUP_DEVICES"
 
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 _FALSE_VALUES = {"0", "false", "no", "off"}
@@ -163,12 +164,19 @@ class ProxyBootstrapConfig:
     log_level: str = DEFAULT_LOG_LEVEL
     log_file: str | None = None
     allowed_hosts: tuple[str, ...] = DEFAULT_ALLOWED_HOSTS
+    warmup_devices: tuple[str, ...] = ()
     llm: LLMRuntimeConfig = field(default_factory=LLMRuntimeConfig)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "host", normalize_bind_host(self.host))
         object.__setattr__(self, "log_level", normalize_log_level(self.log_level))
         object.__setattr__(self, "allowed_hosts", normalize_allowed_hosts(self.allowed_hosts))
+        raw_warmup_devices = (
+            self.warmup_devices
+            if isinstance(self.warmup_devices, str)
+            else ",".join(self.warmup_devices)
+        )
+        object.__setattr__(self, "warmup_devices", normalize_warmup_devices(raw_warmup_devices))
         validate_port(self.port)
         if self.workers <= 0:
             raise LLMRuntimeConfigError("workers must be greater than zero")
@@ -189,6 +197,7 @@ class ProxyBootstrapConfig:
             ENV_LLM_BACKEND: self.llm.backend.value,
             ENV_ENABLE_ALPHA_BACKENDS: "1" if self.llm.enable_alpha_backends else "0",
             ENV_ALLOWED_HOSTS: ",".join(self.allowed_hosts),
+            ENV_WARMUP_DEVICES: ",".join(self.warmup_devices),
         }
         if self.llm.compile_cache_dir is not None:
             env[ENV_COMPILE_CACHE_DIR] = str(self.llm.compile_cache_dir)
@@ -435,6 +444,29 @@ def normalize_context_device(value: str | None, *, default: str = DEFAULT_DEVICE
         return normalized
     logger.warning("Ignoring invalid %s=%s, using %s", field_name, value, default)
     return default
+
+
+def normalize_warmup_devices(value: str | None) -> tuple[str, ...]:
+    """Normalize optional startup warmup devices using forgiving parsing."""
+    if value is None or value.strip() == "":
+        return ()
+    devices: list[str] = []
+    for raw_device in value.split(","):
+        device = raw_device.strip().upper()
+        if not device:
+            continue
+        if device not in {"NPU", "GPU", "CPU"}:
+            logger.warning("Ignoring invalid %s device %s", ENV_WARMUP_DEVICES, raw_device.strip())
+            continue
+        if device not in devices:
+            devices.append(device)
+    return tuple(devices)
+
+
+def load_warmup_devices(env: Mapping[str, str] | None = None) -> tuple[str, ...]:
+    """Load optional startup warmup devices from the environment."""
+    env_map = os.environ if env is None else env
+    return normalize_warmup_devices(env_map.get(ENV_WARMUP_DEVICES))
 
 
 def _env_overlay_bootstrap_config(current: ProxyBootstrapConfig) -> ProxyBootstrapConfig | None:
@@ -691,6 +723,7 @@ def load_proxy_bootstrap_config(
         allowed_hosts=normalize_allowed_hosts(
             allowed_hosts if allowed_hosts is not None else env_map.get(ENV_ALLOWED_HOSTS)
         ),
+        warmup_devices=load_warmup_devices(env_map),
         llm=load_llm_runtime_config(
             env_map,
             model_path=model_path,
@@ -729,6 +762,7 @@ def apply_proxy_bootstrap_config_to_env(
         ENV_ENABLE_ALPHA_BACKENDS,
         ENV_LLAMACPP_MODEL_PATH,
         ENV_ALLOWED_HOSTS,
+        ENV_WARMUP_DEVICES,
     }
     for key in mirrored_keys:
         if key in serialized:
