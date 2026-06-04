@@ -67,7 +67,7 @@ from npu_proxy.config import (
     load_device_queue_timeout,
     load_fallback_on_busy,
 )
-from npu_proxy.metrics import record_routing_decision, record_tokens
+from npu_proxy.metrics import record_routing_decision, record_routing_execution, record_tokens
 
 router = APIRouter(prefix="/v1", tags=["chat"])
 logger = logging.getLogger(__name__)
@@ -192,6 +192,9 @@ def _open_routed_engine_slot(device: str):
         except Exception:
             slot.__exit__(None, None, None)
             raise
+        setattr(slot, "routed_device", normalized)
+        setattr(slot, "selected_device", selected_device)
+        setattr(slot, "fallback_reason", "busy" if selected_device != normalized else None)
         return engine, slot
 
     if last_busy is not None:
@@ -202,6 +205,24 @@ def _open_routed_engine_slot(device: str):
 def _close_engine_slot(slot: object) -> None:
     exit_method = getattr(slot, "__exit__")
     exit_method(None, None, None)
+
+
+def _fallback_reason(
+    *,
+    routed_device: str,
+    execution_device: str,
+    engine_slot: object | None = None,
+) -> str | None:
+    routed = str(routed_device).strip().upper()
+    executed = str(execution_device).strip().upper()
+    if not routed or executed == routed:
+        return None
+    reason = getattr(engine_slot, "fallback_reason", None)
+    return str(reason) if reason else "device_fallback"
+
+
+def _record_routing_execution(routed_device: str, execution_device: str, fallback_reason: str | None) -> None:
+    record_routing_execution(routed_device, execution_device, fallback_reason or "none")
 
 
 def _execution_device_from_engine(engine: Any) -> str:
@@ -242,6 +263,7 @@ def add_execution_headers(
     routing_result: RoutingResult,
     execution_device: str,
     request_id: Optional[str] = None,
+    fallback_reason: str | None = None,
 ) -> None:
     """Add truthful single-engine execution headers and request ID.
 
@@ -268,6 +290,8 @@ def add_execution_headers(
         response,
         routing_result.token_count,
         execution_device=execution_device,
+        routed_device=routing_result.device,
+        fallback_reason=fallback_reason,
         request_id=request_id,
     )
 
@@ -518,12 +542,15 @@ def build_stream_headers(
     request_id: str,
     *,
     execution_device: str,
+    fallback_reason: str | None = None,
 ) -> dict[str, str]:
     """Build streaming response headers for truthful single-engine reporting."""
 
     return build_single_engine_execution_headers(
         routing.token_count,
         execution_device=execution_device,
+        routed_device=routing.device,
+        fallback_reason=fallback_reason,
         request_id=request_id,
     )
 
@@ -848,6 +875,12 @@ async def chat_completions(request: ChatRequest, response: Response):
                     )
                 raise
             execution_device = _execution_device_from_engine(engine)
+            fallback_reason = _fallback_reason(
+                routed_device=routing.device,
+                execution_device=execution_device,
+                engine_slot=engine_slot,
+            )
+            _record_routing_execution(routing.device, execution_device, fallback_reason)
             return StreamingResponse(
                 generate_stream_real(
                     request,
@@ -865,9 +898,12 @@ async def chat_completions(request: ChatRequest, response: Response):
                     routing,
                     request_id,
                     execution_device=execution_device,
+                    fallback_reason=fallback_reason,
                 ),
             )
         execution_device = await asyncio.to_thread(_get_execution_device, load_if_needed=False)
+        fallback_reason = _fallback_reason(routed_device=routing.device, execution_device=execution_device)
+        _record_routing_execution(routing.device, execution_device, fallback_reason)
         return StreamingResponse(
             generate_stream(request, chat_id, created, prompt_tokens),
             media_type="text/event-stream",
@@ -875,6 +911,7 @@ async def chat_completions(request: ChatRequest, response: Response):
                 routing,
                 request_id,
                 execution_device=execution_device,
+                fallback_reason=fallback_reason,
             ),
         )
 
@@ -891,20 +928,28 @@ async def chat_completions(request: ChatRequest, response: Response):
                         top_p=_effective_top_p(mapped_options, request.top_p),
                         timeout=float(DEFAULT_INFERENCE_TIMEOUT),
                     )
-                    return engine, text
+                    return engine, text, getattr(engine_slot, "fallback_reason", None)
                 finally:
                     _close_engine_slot(engine_slot)
 
-            engine, response_text = await asyncio.wait_for(
+            engine, response_text, slot_fallback_reason = await asyncio.wait_for(
                 asyncio.to_thread(run_generation),
                 timeout=float(DEFAULT_INFERENCE_TIMEOUT) + load_device_queue_timeout(),
             )
             execution_device = _execution_device_from_engine(engine)
+            fallback_reason = _fallback_reason(
+                routed_device=routing.device,
+                execution_device=execution_device,
+                engine_slot=None,
+            )
+            fallback_reason = slot_fallback_reason or fallback_reason
+            _record_routing_execution(routing.device, execution_device, fallback_reason)
             add_execution_headers(
                 response,
                 routing,
                 execution_device,
                 request_id,
+                fallback_reason,
             )
         except (TimeoutError, asyncio.TimeoutError):
             logger.exception("Inference timed out", extra={"request_id": request_id})
@@ -944,11 +989,15 @@ async def chat_completions(request: ChatRequest, response: Response):
                 request_id=request_id,
             )
     else:
+        execution_device = await asyncio.to_thread(_get_execution_device, load_if_needed=False)
+        fallback_reason = _fallback_reason(routed_device=routing.device, execution_device=execution_device)
+        _record_routing_execution(routing.device, execution_device, fallback_reason)
         add_execution_headers(
             response,
             routing,
-            await asyncio.to_thread(_get_execution_device, load_if_needed=False),
+            execution_device,
             request_id,
+            fallback_reason,
         )
         response_text, finish_reason = _mock_completion_text(
             "Hello! I'm a helpful AI assistant running on Intel NPU via OpenVINO.",

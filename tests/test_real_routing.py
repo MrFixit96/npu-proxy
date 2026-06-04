@@ -83,6 +83,9 @@ def test_openai_chat_non_stream_routes_short_prompt_to_preferred_device(
     assert response.status_code == 200
     assert engine_calls == ["NPU"]
     assert response.headers["x-npu-proxy-device"] == "NPU"
+    assert response.headers["x-npu-proxy-routed-device"] == "NPU"
+    assert response.headers["x-npu-proxy-execution-device"] == "NPU"
+    assert "x-npu-proxy-fallback-reason" not in response.headers
 
 
 def test_openai_chat_stream_routes_short_prompt_to_preferred_device(
@@ -105,6 +108,8 @@ def test_openai_chat_stream_routes_short_prompt_to_preferred_device(
     assert response.status_code == 200
     assert engine_calls == ["NPU"]
     assert response.headers["x-npu-proxy-device"] == "NPU"
+    assert response.headers["x-npu-proxy-routed-device"] == "NPU"
+    assert response.headers["x-npu-proxy-execution-device"] == "NPU"
     assert "stream " in response.text
     assert "NPU" in response.text
 
@@ -125,6 +130,8 @@ def test_ollama_generate_non_stream_routes_short_prompt_to_preferred_device(
     assert response.status_code == 200
     assert engine_calls == ["NPU"]
     assert response.headers["x-npu-proxy-device"] == "NPU"
+    assert response.headers["x-npu-proxy-routed-device"] == "NPU"
+    assert response.headers["x-npu-proxy-execution-device"] == "NPU"
 
 
 def test_ollama_generate_stream_routes_short_prompt_to_preferred_device(
@@ -143,6 +150,8 @@ def test_ollama_generate_stream_routes_short_prompt_to_preferred_device(
     assert response.status_code == 200
     assert engine_calls == ["NPU"]
     assert response.headers["x-npu-proxy-device"] == "NPU"
+    assert response.headers["x-npu-proxy-routed-device"] == "NPU"
+    assert response.headers["x-npu-proxy-execution-device"] == "NPU"
     assert "stream " in response.text
     assert "NPU" in response.text
 
@@ -176,7 +185,11 @@ def test_ollama_chat_real_paths_route_to_preferred_device(
     assert stream.status_code == 200
     assert engine_calls == ["NPU", "NPU"]
     assert non_stream.headers["x-npu-proxy-device"] == "NPU"
+    assert non_stream.headers["x-npu-proxy-routed-device"] == "NPU"
+    assert non_stream.headers["x-npu-proxy-execution-device"] == "NPU"
     assert stream.headers["x-npu-proxy-device"] == "NPU"
+    assert stream.headers["x-npu-proxy-routed-device"] == "NPU"
+    assert stream.headers["x-npu-proxy-execution-device"] == "NPU"
 
 
 def test_openai_chat_long_prompt_routes_to_fallback_device(
@@ -200,6 +213,8 @@ def test_openai_chat_long_prompt_routes_to_fallback_device(
     assert response.status_code == 200
     assert engine_calls == ["CPU"]
     assert response.headers["x-npu-proxy-device"] == "CPU"
+    assert response.headers["x-npu-proxy-routed-device"] == "CPU"
+    assert response.headers["x-npu-proxy-execution-device"] == "CPU"
 
 
 def test_ollama_generate_long_prompt_routes_to_fallback_device(

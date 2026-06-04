@@ -205,6 +205,9 @@ def test_fallback_on_busy_header_reports_actual_device(
     assert response.status_code == 200
     assert calls == ["CPU"]
     assert response.headers["x-npu-proxy-device"] == "CPU"
+    assert response.headers["x-npu-proxy-routed-device"] == "NPU"
+    assert response.headers["x-npu-proxy-execution-device"] == "CPU"
+    assert response.headers["x-npu-proxy-fallback-reason"] == "busy"
 
 
 def test_slot_released_after_successful_request(

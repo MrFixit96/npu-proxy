@@ -203,6 +203,24 @@ class TestMetricsInfrastructure:
         assert sample(registry, "npu_proxy_errors_total", {"endpoint": "/v1/chat", "error_type": "timeout"}) == 1.0
         assert sample(registry, "npu_proxy_errors_total", {"endpoint": "/v1/chat", "error_type": "other"}) == 1.0
 
+    def test_routing_execution_metrics_use_bounded_labels(self, isolated_metrics_module):
+        """Routed-vs-execution metrics keep device and reason cardinality bounded."""
+        metrics, registry = isolated_metrics_module
+
+        metrics.record_routing_execution("NPU", "CPU", "busy")
+        metrics.record_routing_execution("ASIC", "TPU", "surprise")
+
+        assert sample(
+            registry,
+            "npu_proxy_routing_executions_total",
+            {"routed_device": "npu", "execution_device": "cpu", "fallback_reason": "busy"},
+        ) == 1.0
+        assert sample(
+            registry,
+            "npu_proxy_routing_executions_total",
+            {"routed_device": "unknown", "execution_device": "unknown", "fallback_reason": "other"},
+        ) == 1.0
+
     def test_track_request_context_manager_success(self, isolated_metrics_module, monkeypatch):
         """Successful request contexts decrement in-progress and record latency."""
         metrics, registry = isolated_metrics_module

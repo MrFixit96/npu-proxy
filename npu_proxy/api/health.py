@@ -439,6 +439,17 @@ def _summarize_embedding_cache(engine_info: dict[str, Any]) -> EmbeddingCacheSum
     )
 
 
+def _get_device_pool_snapshot() -> list[dict[str, Any]]:
+    """Return loaded per-device LLM engine pool state without side effects."""
+    try:
+        from npu_proxy.inference.engine import get_engine_pool_snapshot
+
+        return get_engine_pool_snapshot()
+    except Exception:
+        logger.exception("Failed to inspect LLM device pool")
+        return []
+
+
 def _get_llm_engine_state() -> tuple[LLMEngineHealthState, dict[str, Any] | None]:
     """Collect additive LLM engine state while preserving legacy fields."""
     runtime_config = _get_llm_runtime_config()
@@ -750,6 +761,7 @@ async def health() -> dict:
     """
     devices, device_error = _get_available_devices()
     llm_state, _ = _get_llm_engine_state()
+    device_pool = _get_device_pool_snapshot()
     embedding_state, _ = _get_embedding_engine_state()
     status, messages = _summarize_health(
         llm_state=llm_state,
@@ -762,6 +774,9 @@ async def health() -> dict:
         "engines": {
             "llm": llm_state.to_dict(),
             "embedding": embedding_state.to_dict(),
+        },
+        "runtime": {
+            "device_pool": device_pool,
         },
         "messages": messages,
         "version": __version__,
@@ -857,6 +872,7 @@ async def get_devices() -> dict:
 
     devices = get_available_devices()
     llm_state, device_info = _get_llm_engine_state()
+    device_pool = _get_device_pool_snapshot()
     embedding_state, embedding_device_info = _get_embedding_engine_state()
 
     return {
@@ -864,6 +880,7 @@ async def get_devices() -> dict:
         "active_device": llm_state.device,
         "device_info": device_info,
         "fallback_chain": DEVICE_FALLBACK_CHAIN,
+        "device_pool": device_pool,
         "active_backend": llm_state.backend,
         "llm": {
             "status": llm_state.status,

@@ -1404,6 +1404,10 @@ def open_routed_engine_slot(
         except Exception:
             slot.__exit__(None, None, None)
             raise
+        requested = str(device).strip().upper()
+        setattr(slot, "routed_device", requested)
+        setattr(slot, "selected_device", selected_device)
+        setattr(slot, "fallback_reason", "busy" if selected_device != requested else None)
         return engine, slot
 
     if last_busy is not None:
@@ -1418,6 +1422,35 @@ def _unique_engines() -> list[InferenceEngine]:
         if engine not in engines:
             engines.append(engine)
     return engines
+
+
+def get_engine_pool_snapshot() -> list[dict[str, object]]:
+    """Return a non-mutating snapshot of loaded engine pool state."""
+    with _engine_lock:
+        items = list(_engine_pool.items())
+
+    snapshot: list[dict[str, object]] = []
+    for (model_path, requested_device), engine in items:
+        lock = _device_lock_for_key((model_path, requested_device))
+        get_device_info = getattr(engine, "get_device_info", None)
+        try:
+            device_info = dict(get_device_info()) if callable(get_device_info) else {}
+        except Exception:
+            device_info = {}
+        model = getattr(engine, "model_name", None) or Path(model_path).name
+        actual_device = str(device_info.get("actual_device") or getattr(engine, "actual_device", requested_device))
+        snapshot.append(
+            {
+                "model": str(model),
+                "model_path": model_path,
+                "device": actual_device,
+                "requested_device": requested_device,
+                "loaded": True,
+                "warmed": bool(device_info.get("is_warmed_up", getattr(engine, "is_warmed_up", False))),
+                "busy": lock.locked(),
+            }
+        )
+    return snapshot
 
 
 def reset_engine(*, force: bool = False) -> None:

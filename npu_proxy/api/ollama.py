@@ -50,7 +50,7 @@ from typing import Any, Literal
 
 from npu_proxy import OLLAMA_VERSION
 from npu_proxy.routing.context_router import get_context_router, RoutingResult
-from npu_proxy.metrics import record_routing_decision
+from npu_proxy.metrics import record_routing_decision, record_routing_execution
 from npu_proxy.api.header_utils import (
     add_request_id_header,
     add_single_engine_execution_headers,
@@ -636,6 +636,24 @@ def _execution_device_from_engine(engine: Any) -> str:
     return str(getattr(engine, "actual_device", None) or "unknown")
 
 
+def _fallback_reason(
+    *,
+    routed_device: str,
+    execution_device: str,
+    engine_slot: object | None = None,
+) -> str | None:
+    routed = str(routed_device).strip().upper()
+    executed = str(execution_device).strip().upper()
+    if not routed or executed == routed:
+        return None
+    reason = getattr(engine_slot, "fallback_reason", None)
+    return str(reason) if reason else "device_fallback"
+
+
+def _record_routing_execution(routed_device: str, execution_device: str, fallback_reason: str | None) -> None:
+    record_routing_execution(routed_device, execution_device, fallback_reason or "none")
+
+
 def _open_routed_engine_slot(device: str):
     """Acquire the routed device slot and return its engine plus release handle."""
     from npu_proxy.inference.engine import open_routed_engine_slot
@@ -659,7 +677,13 @@ def _device_busy_http_exception(exc: Exception, request_id: str) -> HTTPExceptio
     )
 
 
-def add_execution_headers(response: Response, routing_result: RoutingResult, *, execution_device: str) -> None:
+def add_execution_headers(
+    response: Response,
+    routing_result: RoutingResult,
+    *,
+    execution_device: str,
+    fallback_reason: str | None = None,
+) -> None:
     """Add truthful single-engine execution headers to response headers.
 
     Adds headers indicating which device was selected and why,
@@ -673,6 +697,8 @@ def add_execution_headers(response: Response, routing_result: RoutingResult, *, 
         response,
         routing_result.token_count,
         execution_device=execution_device,
+        routed_device=routing_result.device,
+        fallback_reason=fallback_reason,
     )
 
 
@@ -681,11 +707,14 @@ def build_execution_headers(
     *,
     execution_device: str,
     request_id: str,
+    fallback_reason: str | None = None,
 ) -> dict[str, str]:
     """Build truthful single-engine execution headers for streaming responses."""
     return build_single_engine_execution_headers(
         routing_result.token_count,
         execution_device=execution_device,
+        routed_device=routing_result.device,
+        fallback_reason=fallback_reason,
         request_id=request_id,
         extra_headers={
             "Cache-Control": "no-cache",
@@ -976,6 +1005,12 @@ async def generate(request: GenerateRequest, response: Response):
                         lambda: _open_routed_engine_slot(routing.device)
                     )
                     execution_device = _execution_device_from_engine(engine)
+                    fallback_reason = _fallback_reason(
+                        routed_device=routing.device,
+                        execution_device=execution_device,
+                        engine_slot=engine_slot,
+                    )
+                    _record_routing_execution(routing.device, execution_device, fallback_reason)
                 except Exception as exc:
                     from npu_proxy.inference.engine import DeviceBusyError
 
@@ -986,15 +1021,19 @@ async def generate(request: GenerateRequest, response: Response):
                         )
                     engine_setup_error = exc
                     execution_device = routing.device
+                    fallback_reason = None
             else:
                 try:
                     execution_device = _get_execution_device(load_if_needed=False)
+                    fallback_reason = _fallback_reason(routed_device=routing.device, execution_device=execution_device)
+                    _record_routing_execution(routing.device, execution_device, fallback_reason)
                 except Exception as exc:
                     logger.error(
                         "Failed to resolve streaming execution device; using routing device",
                         extra={"request_id": request_id, "error": str(exc)},
                     )
                     execution_device = routing.device
+                    fallback_reason = None
 
             async def stream_generate():
                 try:
@@ -1088,6 +1127,7 @@ async def generate(request: GenerateRequest, response: Response):
                     routing,
                     execution_device=execution_device,
                     request_id=request_id,
+                    fallback_reason=fallback_reason,
                 ),
             )
 
@@ -1104,12 +1144,21 @@ async def generate(request: GenerateRequest, response: Response):
                             top_p=_effective_top_p(mapped_options),
                             timeout=180.0,
                         )
-                        return engine, text
+                        return engine, text, getattr(engine_slot, "fallback_reason", None)
                     finally:
                         _close_engine_slot(engine_slot)
 
-                engine, response_text = await asyncio.to_thread(run_generation)
-                add_execution_headers(response, routing, execution_device=_execution_device_from_engine(engine))
+                engine, response_text, slot_fallback_reason = await asyncio.to_thread(run_generation)
+                execution_device = _execution_device_from_engine(engine)
+                fallback_reason = _fallback_reason(routed_device=routing.device, execution_device=execution_device)
+                fallback_reason = slot_fallback_reason or fallback_reason
+                _record_routing_execution(routing.device, execution_device, fallback_reason)
+                add_execution_headers(
+                    response,
+                    routing,
+                    execution_device=execution_device,
+                    fallback_reason=fallback_reason,
+                )
             except TimeoutError as e:
                 logger.exception("Non-streaming inference timed out", extra={"request_id": request_id})
                 raise HTTPException(
@@ -1133,7 +1182,15 @@ async def generate(request: GenerateRequest, response: Response):
                     detail=_ollama_error_detail("Internal inference error", "inference_failed", request_id),
                 )
         else:
-            add_execution_headers(response, routing, execution_device=_get_execution_device(load_if_needed=False))
+            execution_device = _get_execution_device(load_if_needed=False)
+            fallback_reason = _fallback_reason(routed_device=routing.device, execution_device=execution_device)
+            _record_routing_execution(routing.device, execution_device, fallback_reason)
+            add_execution_headers(
+                response,
+                routing,
+                execution_device=execution_device,
+                fallback_reason=fallback_reason,
+            )
             response_text, finish_reason = _mock_text(
                 "Hello! I'm running on Intel NPU via OpenVINO.",
                 _effective_max_tokens(mapped_options),
@@ -1277,6 +1334,12 @@ async def chat(request: ChatRequest, response: Response):
                         lambda: _open_routed_engine_slot(routing.device)
                     )
                     execution_device = _execution_device_from_engine(engine)
+                    fallback_reason = _fallback_reason(
+                        routed_device=routing.device,
+                        execution_device=execution_device,
+                        engine_slot=engine_slot,
+                    )
+                    _record_routing_execution(routing.device, execution_device, fallback_reason)
                 except Exception as exc:
                     from npu_proxy.inference.engine import DeviceBusyError
 
@@ -1287,15 +1350,19 @@ async def chat(request: ChatRequest, response: Response):
                         )
                     engine_setup_error = exc
                     execution_device = routing.device
+                    fallback_reason = None
             else:
                 try:
                     execution_device = _get_execution_device(load_if_needed=False)
+                    fallback_reason = _fallback_reason(routed_device=routing.device, execution_device=execution_device)
+                    _record_routing_execution(routing.device, execution_device, fallback_reason)
                 except Exception as exc:
                     logger.error(
                         "Failed to resolve streaming execution device; using routing device",
                         extra={"request_id": request_id, "error": str(exc)},
                     )
                     execution_device = routing.device
+                    fallback_reason = None
 
             async def stream_chat():
                 try:
@@ -1389,6 +1456,7 @@ async def chat(request: ChatRequest, response: Response):
                     routing,
                     execution_device=execution_device,
                     request_id=request_id,
+                    fallback_reason=fallback_reason,
                 ),
             )
 
@@ -1405,12 +1473,21 @@ async def chat(request: ChatRequest, response: Response):
                             top_p=_effective_top_p(mapped_options),
                             timeout=180.0,
                         )
-                        return engine, text
+                        return engine, text, getattr(engine_slot, "fallback_reason", None)
                     finally:
                         _close_engine_slot(engine_slot)
 
-                engine, response_text = await asyncio.to_thread(run_generation)
-                add_execution_headers(response, routing, execution_device=_execution_device_from_engine(engine))
+                engine, response_text, slot_fallback_reason = await asyncio.to_thread(run_generation)
+                execution_device = _execution_device_from_engine(engine)
+                fallback_reason = _fallback_reason(routed_device=routing.device, execution_device=execution_device)
+                fallback_reason = slot_fallback_reason or fallback_reason
+                _record_routing_execution(routing.device, execution_device, fallback_reason)
+                add_execution_headers(
+                    response,
+                    routing,
+                    execution_device=execution_device,
+                    fallback_reason=fallback_reason,
+                )
             except TimeoutError as e:
                 logger.exception("Non-streaming chat inference timed out", extra={"request_id": request_id})
                 raise HTTPException(
@@ -1434,7 +1511,15 @@ async def chat(request: ChatRequest, response: Response):
                     detail=_ollama_error_detail("Internal inference error", "inference_failed", request_id),
                 )
         else:
-            add_execution_headers(response, routing, execution_device=_get_execution_device(load_if_needed=False))
+            execution_device = _get_execution_device(load_if_needed=False)
+            fallback_reason = _fallback_reason(routed_device=routing.device, execution_device=execution_device)
+            _record_routing_execution(routing.device, execution_device, fallback_reason)
+            add_execution_headers(
+                response,
+                routing,
+                execution_device=execution_device,
+                fallback_reason=fallback_reason,
+            )
             response_text, finish_reason = _mock_text(
                 "Hello! I'm running on Intel NPU via OpenVINO.",
                 _effective_max_tokens(mapped_options),

@@ -79,16 +79,23 @@ def build_single_engine_execution_headers(
     token_count: int,
     *,
     execution_device: str,
+    routed_device: str | None = None,
+    fallback_reason: str | None = None,
     request_id: str | None = None,
     extra_headers: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     """Build truthful single-engine execution headers."""
 
+    routed = routed_device or execution_device
     headers = {
         "X-NPU-Proxy-Device": execution_device,
+        "X-NPU-Proxy-Execution-Device": execution_device,
+        "X-NPU-Proxy-Routed-Device": routed,
         "X-NPU-Proxy-Route-Reason": SINGLE_ENGINE_ROUTE_REASON,
         "X-NPU-Proxy-Token-Count": str(token_count),
     }
+    if fallback_reason and str(execution_device).upper() != str(routed).upper():
+        headers["X-NPU-Proxy-Fallback-Reason"] = fallback_reason
     if request_id:
         headers["X-Request-ID"] = request_id
     if extra_headers:
@@ -101,6 +108,8 @@ def add_single_engine_execution_headers(
     token_count: int,
     *,
     execution_device: str,
+    routed_device: str | None = None,
+    fallback_reason: str | None = None,
     request_id: str | None = None,
 ) -> None:
     """Attach truthful single-engine execution headers to a response."""
@@ -110,6 +119,8 @@ def add_single_engine_execution_headers(
         build_single_engine_execution_headers(
             token_count,
             execution_device=execution_device,
+            routed_device=routed_device,
+            fallback_reason=fallback_reason,
             request_id=request_id,
         ),
     )

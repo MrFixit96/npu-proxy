@@ -62,7 +62,7 @@ except ImportError:
 _metrics_initialized = False
 _metrics_init_lock = threading.Lock()
 _LABEL_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
-_ALLOWED_DEVICES = {"npu", "gpu", "cpu", "auto", "unknown"}
+_ALLOWED_DEVICES = {"npu", "gpu", "cpu", "auto", "mock", "unknown"}
 _ALLOWED_INFERENCE_TYPES = {"chat", "embeddings", "prompt", "completion"}
 _ALLOWED_ROUTING_REASONS = {
     "within_npu_limit",
@@ -74,6 +74,9 @@ _ALLOWED_ROUTING_REASONS = {
     "load_balance",
     "other",
 }
+
+_ALLOWED_EXECUTION_FALLBACK_REASONS = {"none", "busy", "device_fallback", "other"}
+
 _ALLOWED_ERROR_TYPES = {
     "timeout",
     "oom",
@@ -104,6 +107,7 @@ TOKENS_PER_SECOND = None
 
 # Routing metrics
 ROUTING_DECISIONS = None
+ROUTING_EXECUTIONS = None
 
 # Model metrics
 MODEL_INFO = None
@@ -152,7 +156,7 @@ def _init_metrics() -> None:
     global REQUEST_COUNT, REQUEST_LATENCY, REQUEST_IN_PROGRESS, QUEUE_TIME
     global INFERENCE_COUNT, INFERENCE_LATENCY, INFERENCE_TOKENS
     global TIME_TO_FIRST_TOKEN, INTER_TOKEN_LATENCY, TOKENS_PER_SECOND
-    global ROUTING_DECISIONS, MODEL_INFO, MODEL_LOAD_TIME
+    global ROUTING_DECISIONS, ROUTING_EXECUTIONS, MODEL_INFO, MODEL_LOAD_TIME
     global RUNTIME_FEATURE_STATE, RUNTIME_FEATURE_DEGRADATIONS, ERROR_COUNT
 
     if _metrics_initialized or not PROMETHEUS_AVAILABLE:
@@ -233,6 +237,12 @@ def _init_metrics() -> None:
             'npu_proxy_routing_decisions_total',
             'Routing decisions by device and reason',
             ['device', 'reason']
+        )
+
+        ROUTING_EXECUTIONS = Counter(
+            'npu_proxy_routing_executions_total',
+            'Actual execution device for routed inference requests',
+            ['routed_device', 'execution_device', 'fallback_reason']
         )
 
         MODEL_INFO = Info(
@@ -516,6 +526,26 @@ def record_routing_decision(device: str, reason: str) -> None:
         ROUTING_DECISIONS.labels(
             device=_bounded_label(device, allowed=_ALLOWED_DEVICES, default="unknown"),
             reason=_bounded_label(reason, allowed=_ALLOWED_ROUTING_REASONS),
+        ).inc()
+
+
+def record_routing_execution(
+    routed_device: str,
+    execution_device: str,
+    fallback_reason: str | None = None,
+) -> None:
+    """Record the actual execution device for a routed inference request."""
+    ensure_metrics()
+    if PROMETHEUS_AVAILABLE and ROUTING_EXECUTIONS:
+        reason = fallback_reason or "none"
+        ROUTING_EXECUTIONS.labels(
+            routed_device=_bounded_label(routed_device, allowed=_ALLOWED_DEVICES, default="unknown"),
+            execution_device=_bounded_label(execution_device, allowed=_ALLOWED_DEVICES, default="unknown"),
+            fallback_reason=_bounded_label(
+                reason,
+                allowed=_ALLOWED_EXECUTION_FALLBACK_REASONS,
+                default="other",
+            ),
         ).inc()
 
 
