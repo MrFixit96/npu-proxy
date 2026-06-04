@@ -30,7 +30,7 @@ import threading
 import concurrent.futures
 import time
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Iterator, Callable, Optional, Any, Literal
 
@@ -45,7 +45,12 @@ from npu_proxy.config import (
     normalize_compile_cache_mode,
     normalize_prefix_cache_mode,
 )
-from npu_proxy.inference.devices import DEVICE_FALLBACK_CHAIN, get_available_devices
+from npu_proxy.inference.devices import (
+    DEVICE_FALLBACK_CHAIN,
+    FallbackReason,
+    get_available_devices,
+    normalize_device,
+)
 
 from npu_proxy.metrics import (
     record_error,
@@ -1259,7 +1264,19 @@ class InferenceEngine:
 
 
 # Global engine instances (per-model/device pool with thread safety)
-EnginePoolKey = tuple[str, str]
+@dataclass(frozen=True)
+class EnginePoolKey:
+    """Identity of a pooled engine: the resolved model path and its device.
+
+    Frozen so it can be used as a dict key. ``model_path`` is the resolved
+    absolute path and ``device`` is the canonical upper-cased device string,
+    so equivalent requests map to the same pooled engine and lock.
+    """
+
+    model_path: str
+    device: str
+
+
 _engine_pool: dict[EnginePoolKey, InferenceEngine] = {}
 _device_locks: dict[EnginePoolKey, threading.Lock] = {}
 _loaded_models: dict[str, InferenceEngine] = {}
@@ -1301,7 +1318,10 @@ def _resolve_engine_runtime_config(
 
 def _engine_pool_key(runtime_config: LLMRuntimeConfig) -> EnginePoolKey:
     """Return the normalized model/device cache key for an engine config."""
-    return (str(Path(runtime_config.model_path).resolve()), runtime_config.device.upper())
+    return EnginePoolKey(
+        model_path=str(Path(runtime_config.model_path).resolve()),
+        device=normalize_device(runtime_config.device) or str(runtime_config.device).upper(),
+    )
 
 
 def _normalized_engine_config(
@@ -1327,15 +1347,18 @@ def _device_lock_for_key(pool_key: EnginePoolKey) -> threading.Lock:
         return lock
 
 
-@contextmanager
-def acquire_device_slot(
+def _acquire_device_lock(
     device: str,
     *,
     model_path: Optional[str | Path] = None,
     config: LLMRuntimeConfig | None = None,
     timeout: float,
-):
-    """Acquire the per-(model, device) inference slot or raise DeviceBusyError."""
+) -> tuple[str, threading.Lock]:
+    """Acquire the per-(model, device) lock, returning (selected_device, lock).
+
+    Raises ``DeviceBusyError`` if the lock is not acquired within ``timeout``.
+    The caller owns the returned lock and is responsible for releasing it.
+    """
     runtime_config = _normalized_engine_config(
         config=config,
         model_path=model_path,
@@ -1346,8 +1369,26 @@ def acquire_device_slot(
     acquired = lock.acquire(timeout=max(0.0, float(timeout)))
     if not acquired:
         raise DeviceBusyError(runtime_config.device)
+    return runtime_config.device, lock
+
+
+@contextmanager
+def acquire_device_slot(
+    device: str,
+    *,
+    model_path: Optional[str | Path] = None,
+    config: LLMRuntimeConfig | None = None,
+    timeout: float,
+):
+    """Acquire the per-(model, device) inference slot or raise DeviceBusyError."""
+    selected_device, lock = _acquire_device_lock(
+        device,
+        model_path=model_path,
+        config=config,
+        timeout=timeout,
+    )
     try:
-        yield runtime_config.device
+        yield selected_device
     finally:
         lock.release()
 
@@ -1375,6 +1416,34 @@ def _slot_candidate_devices(device: str, *, fallback_on_busy: bool) -> list[str]
     return candidates
 
 
+@dataclass
+class RoutedEngineSlot:
+    """A held inference slot describing the routed vs. selected device.
+
+    Replaces the previous "contextmanager plus ad-hoc setattr" approach with a
+    typed handle. Supports both explicit ``close()`` and the context-manager
+    protocol so callers can release the underlying device lock exactly once.
+    """
+
+    routed_device: str
+    selected_device: str
+    fallback_reason: str | None
+    lock: threading.Lock
+    _released: bool = field(default=False, init=False, repr=False)
+
+    def close(self) -> None:
+        if not self._released:
+            self._released = True
+            self.lock.release()
+
+    def __enter__(self) -> "RoutedEngineSlot":
+        return self
+
+    def __exit__(self, *exc_info: object) -> bool:
+        self.close()
+        return False
+
+
 def open_routed_engine_slot(
     device: str,
     *,
@@ -1382,37 +1451,51 @@ def open_routed_engine_slot(
     fallback_on_busy: bool = False,
     model_path: Optional[str | Path] = None,
     config: LLMRuntimeConfig | None = None,
-) -> tuple[InferenceEngine, object]:
-    """Acquire a device slot, optionally falling back on busy, and return its engine."""
+    engine_factory: Optional[Callable[[str], InferenceEngine]] = None,
+) -> tuple[InferenceEngine, RoutedEngineSlot]:
+    """Acquire a device slot, optionally falling back on busy, and return its engine.
+
+    ``engine_factory`` lets callers (e.g. the chat API) supply a patchable engine
+    accessor while sharing the acquire/fallback/lock logic. It receives the
+    selected device and must return the engine to use. When omitted, the pooled
+    ``get_llm_engine`` is used.
+    """
+    requested = normalize_device(device) or str(device).strip().upper()
     last_busy: DeviceBusyError | None = None
     for candidate in _slot_candidate_devices(device, fallback_on_busy=fallback_on_busy):
-        slot = acquire_device_slot(
-            candidate,
-            model_path=model_path,
-            config=config,
-            timeout=timeout,
-        )
         try:
-            selected_device = slot.__enter__()
+            selected_device, lock = _acquire_device_lock(
+                candidate,
+                model_path=model_path,
+                config=config,
+                timeout=timeout,
+            )
         except DeviceBusyError as exc:
             last_busy = exc
             if not fallback_on_busy:
                 raise
             continue
         try:
-            engine = get_llm_engine(model_path=model_path, device=selected_device, config=config)
+            if engine_factory is not None:
+                engine = engine_factory(selected_device)
+            else:
+                engine = get_llm_engine(model_path=model_path, device=selected_device, config=config)
         except Exception:
-            slot.__exit__(None, None, None)
+            lock.release()
             raise
-        requested = str(device).strip().upper()
-        setattr(slot, "routed_device", requested)
-        setattr(slot, "selected_device", selected_device)
-        setattr(slot, "fallback_reason", "busy" if selected_device != requested else None)
+        slot = RoutedEngineSlot(
+            routed_device=requested,
+            selected_device=selected_device,
+            fallback_reason=(
+                FallbackReason.BUSY.value if selected_device != requested else None
+            ),
+            lock=lock,
+        )
         return engine, slot
 
     if last_busy is not None:
         raise last_busy
-    raise DeviceBusyError(str(device).strip().upper())
+    raise DeviceBusyError(requested)
 
 
 def _unique_engines() -> list[InferenceEngine]:
@@ -1430,8 +1513,10 @@ def get_engine_pool_snapshot() -> list[dict[str, object]]:
         items = list(_engine_pool.items())
 
     snapshot: list[dict[str, object]] = []
-    for (model_path, requested_device), engine in items:
-        lock = _device_lock_for_key((model_path, requested_device))
+    for pool_key, engine in items:
+        model_path = pool_key.model_path
+        requested_device = pool_key.device
+        lock = _device_lock_for_key(pool_key)
         get_device_info = getattr(engine, "get_device_info", None)
         try:
             device_info = dict(get_device_info()) if callable(get_device_info) else {}

@@ -50,7 +50,7 @@ from typing import Any, Literal
 
 from npu_proxy import OLLAMA_VERSION
 from npu_proxy.routing.context_router import get_context_router, RoutingResult
-from npu_proxy.metrics import record_routing_decision, record_routing_execution
+from npu_proxy.metrics import record_routing_decision
 from npu_proxy.api.header_utils import (
     add_request_id_header,
     add_single_engine_execution_headers,
@@ -65,6 +65,7 @@ from npu_proxy.api.header_utils import (
 from npu_proxy.models.ollama_defaults import merge_with_defaults
 from npu_proxy.models.parameter_mapper import map_parameters
 from npu_proxy.inference.streaming import FinishReason, determine_finish_reason, stream_engine_tokens
+from npu_proxy.inference import routing_service
 from npu_proxy.inference.chat_templates import render_chat_prompt
 from npu_proxy.inference.tokenizer import count_tokens_best_effort
 from npu_proxy.config import DEFAULT_INFERENCE_TIMEOUT, load_device_queue_timeout, load_fallback_on_busy
@@ -625,15 +626,7 @@ def _get_execution_device(*, load_if_needed: bool) -> str:
 
 def _execution_device_from_engine(engine: Any) -> str:
     """Return the actual device reported by an acquired engine."""
-    get_device_info = getattr(engine, "get_device_info", None)
-    if callable(get_device_info):
-        try:
-            info = get_device_info()
-        except Exception:
-            info = {}
-        if isinstance(info, dict) and info.get("actual_device"):
-            return str(info["actual_device"])
-    return str(getattr(engine, "actual_device", None) or "unknown")
+    return routing_service.execution_device_from_engine(engine)
 
 
 def _fallback_reason(
@@ -642,19 +635,18 @@ def _fallback_reason(
     execution_device: str,
     engine_slot: object | None = None,
 ) -> str | None:
-    routed = str(routed_device).strip().upper()
-    executed = str(execution_device).strip().upper()
-    if not routed or executed == routed:
-        return None
-    reason = getattr(engine_slot, "fallback_reason", None)
-    return str(reason) if reason else "device_fallback"
+    return routing_service.fallback_reason(
+        routed_device=routed_device,
+        execution_device=execution_device,
+        engine_slot=engine_slot,
+    )
 
 
 def _record_routing_execution(routed_device: str, execution_device: str, fallback_reason: str | None) -> None:
-    record_routing_execution(routed_device, execution_device, fallback_reason or "none")
+    routing_service.record_routing_execution(routed_device, execution_device, fallback_reason)
 
 
-def _open_routed_engine_slot(device: str):
+def _open_routed_engine_slot(device: str) -> tuple[Any, Any]:
     """Acquire the routed device slot and return its engine plus release handle."""
     from npu_proxy.inference.engine import open_routed_engine_slot
 
@@ -666,8 +658,7 @@ def _open_routed_engine_slot(device: str):
 
 
 def _close_engine_slot(slot: object) -> None:
-    exit_method = getattr(slot, "__exit__")
-    exit_method(None, None, None)
+    routing_service.close_engine_slot(slot)
 
 
 def _device_busy_http_exception(exc: Exception, request_id: str) -> HTTPException:
@@ -1170,23 +1161,23 @@ async def generate(request: GenerateRequest, response: Response):
                 raise HTTPException(
                     status_code=504,
                     detail=_ollama_error_detail("Inference timed out", "inference_timeout", request_id),
-                )
+                ) from e
             except RuntimeError as e:
                 logger.exception("Non-streaming inference failed", extra={"request_id": request_id})
                 raise HTTPException(
                     status_code=503,
                     detail=_ollama_error_detail("Inference service unavailable", "inference_unavailable", request_id),
-                )
+                ) from e
             except Exception as e:
                 from npu_proxy.inference.engine import DeviceBusyError
 
                 if isinstance(e, DeviceBusyError):
-                    raise _device_busy_http_exception(e, request_id)
+                    raise _device_busy_http_exception(e, request_id) from e
                 logger.exception("Unexpected inference error", extra={"request_id": request_id})
                 raise HTTPException(
                     status_code=500,
                     detail=_ollama_error_detail("Internal inference error", "inference_failed", request_id),
-                )
+                ) from e
         else:
             execution_device = _get_execution_device(load_if_needed=False)
             fallback_reason = _fallback_reason(routed_device=routing.device, execution_device=execution_device)
@@ -1505,23 +1496,23 @@ async def chat(request: ChatRequest, response: Response):
                 raise HTTPException(
                     status_code=504,
                     detail=_ollama_error_detail("Inference timed out", "inference_timeout", request_id),
-                )
+                ) from e
             except RuntimeError as e:
                 logger.exception("Non-streaming chat inference failed", extra={"request_id": request_id})
                 raise HTTPException(
                     status_code=503,
                     detail=_ollama_error_detail("Inference service unavailable", "inference_unavailable", request_id),
-                )
+                ) from e
             except Exception as e:
                 from npu_proxy.inference.engine import DeviceBusyError
 
                 if isinstance(e, DeviceBusyError):
-                    raise _device_busy_http_exception(e, request_id)
+                    raise _device_busy_http_exception(e, request_id) from e
                 logger.exception("Unexpected chat inference error", extra={"request_id": request_id})
                 raise HTTPException(
                     status_code=500,
                     detail=_ollama_error_detail("Internal inference error", "inference_failed", request_id),
-                )
+                ) from e
         else:
             execution_device = _get_execution_device(load_if_needed=False)
             fallback_reason = _fallback_reason(routed_device=routing.device, execution_device=execution_device)

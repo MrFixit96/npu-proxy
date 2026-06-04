@@ -38,7 +38,6 @@ def _call_reset_if_loaded(module_name: str, function_name: str, **kwargs: Any) -
 
 def _reset_loaded_global_state() -> None:
     _call_reset_if_loaded("npu_proxy.inference.llm_runtime", "reset_llm_runtime")
-    _call_reset_if_loaded("npu_proxy.inference.runtime_pool", "reset_runtime_pool")
     _call_reset_if_loaded("npu_proxy.inference.engine", "reset_engine", force=True)
     _call_reset_if_loaded("npu_proxy.inference.embedding_engine", "_reset_embedding_engine")
     _call_reset_if_loaded("npu_proxy.routing.context_router", "reset_context_router")

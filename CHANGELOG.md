@@ -17,6 +17,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 - Real inference now binds each generation request to the routed device instead of reusing a single global LLM engine.
 - `X-NPU-Proxy-Device` remains backward-compatible while matching the actual execution device.
+- Internal routing hardening (no external behavior change): introduced typed `Device`/`FallbackReason` string enums and a single `normalize_device()` canonicalizer; the engine pool key is now a frozen `EnginePoolKey` dataclass and acquired slots are a typed `RoutedEngineSlot` instead of an ad-hoc tuple. Shared routing-execution helpers used by the OpenAI and Ollama layers were consolidated into `npu_proxy.inference.routing_service`. Removed the unused `LLMRuntimePool` building block that was never on the live serving path.
+- Routing-execution metrics now collapse multi-instance accelerator identifiers (e.g. `GPU.0`/`GPU.1`) to their device class so discrete-GPU executions are no longer recorded as `unknown`.
 
 ### Fixed
 
@@ -24,6 +26,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - `reset_engine()` no longer discards per-device locks. Dropping a lock raced with in-flight slot acquisition and could allow two concurrent native inferences on one device after a forced reset; locks are now preserved so serialization holds across resets.
 - Startup warmup now logs a device as "warmed" only when the engine actually reports it warmed, and runs off the event loop. Previously a silently-swallowed warmup compile failure was still logged as a successful warmup.
 - `/health` and `/health/devices` now report the default/preferred-device engine as the active device instead of whichever device served the most recent request. Previously, after a long prompt fell back to CPU, the legacy single-active-device fields misreported CPU even though NPU remained the routed default and continued serving short prompts. The additive `device_pool` snapshot remains the source of truth for all loaded per-device engines.
+- Routing observability no longer reports a `device_fallback` reason when the engine cannot resolve its actual execution device (an unresolved device is not evidence of a deliberate fallback). An explicit busy fallback recorded on the acquired slot is still reported truthfully even when the execution device is unknown.
 
 ### Security
 

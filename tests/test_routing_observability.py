@@ -35,7 +35,7 @@ def test_health_device_pool_reports_loaded_warmed_and_busy(client: TestClient, m
     import npu_proxy.api.health as health_module
     import npu_proxy.inference.engine as engine_module
 
-    pool_key = ("C:\\models\\tinyllama", "NPU")
+    pool_key = engine_module.EnginePoolKey(model_path="C:\\models\\tinyllama", device="NPU")
     lock = threading.Lock()
     lock.acquire()
     with engine_module._engine_lock:

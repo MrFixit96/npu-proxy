@@ -4,11 +4,69 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 
 logger = logging.getLogger(__name__)
 
+if sys.version_info >= (3, 11):
+    from enum import StrEnum
+else:  # pragma: no cover - exercised only on Python 3.10
+    from enum import Enum
+
+    class StrEnum(str, Enum):
+        """Minimal StrEnum backport: str() and format() yield the member value."""
+
+        def __str__(self) -> str:
+            return str(self.value)
+
+        __format__ = str.__format__
+
+
+class Device(StrEnum):
+    """Canonical compute device identifiers used across routing and inference."""
+
+    NPU = "NPU"
+    GPU = "GPU"
+    CPU = "CPU"
+
+
+class FallbackReason(StrEnum):
+    """Why an execution device differs from the routed device.
+
+    The string values are part of the public wire/metric contract
+    (``X-NPU-Proxy-Fallback-Reason`` header and the Prometheus
+    ``fallback_reason`` label), so they must stay stable.
+    """
+
+    BUSY = "busy"
+    DEVICE_FALLBACK = "device_fallback"
+
+
 # Device priority for fallback (NPU -> GPU -> CPU)
-DEVICE_FALLBACK_CHAIN: list[str] = ["NPU", "GPU", "CPU"]
+DEVICE_FALLBACK_CHAIN: list[str] = [Device.NPU.value, Device.GPU.value, Device.CPU.value]
+
+# Canonical accelerator identifiers accepted by routing/inference.
+VALID_DEVICES: frozenset[str] = frozenset(member.value for member in Device)
+
+
+def normalize_device(value: object, *, default: str | None = None) -> str | None:
+    """Return the canonical upper-cased device string.
+
+    This is the single place that canonicalizes a free-form device value
+    (trimming whitespace and upper-casing) so that ``npu`` and ``NPU`` cannot
+    create two distinct pool entries or locks. It does not validate membership;
+    callers that need validation should compare against :data:`VALID_DEVICES`.
+
+    Args:
+        value: A device-like value (string or :class:`Device`).
+        default: Returned when ``value`` is empty/None.
+    """
+    if value is None:
+        return default
+    normalized = str(value).strip().upper()
+    if not normalized:
+        return default
+    return normalized
 
 
 def get_available_devices() -> list[str]:

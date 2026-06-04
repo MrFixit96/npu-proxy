@@ -137,6 +137,20 @@ def _bounded_label(value: str, *, allowed: set[str] | None = None, default: str 
     return normalized if _LABEL_RE.fullmatch(normalized) else default
 
 
+def _normalize_device_label(value: str) -> str:
+    """Collapse multi-instance device IDs (e.g. 'GPU.0'/'GPU.1') to their base.
+
+    OpenVINO reports discrete devices as ``GPU.0``, ``GPU.1`` etc. Without this
+    the bounded label rejects them (they aren't in the allow-list) and they all
+    collapse to ``unknown``, hiding that a GPU served the request. Stripping the
+    ``.N`` suffix keeps cardinality low while preserving the true device class.
+    """
+    normalized = str(value or "").strip().lower()
+    if not normalized:
+        return normalized
+    return re.sub(r"\.\d+$", "", normalized)
+
+
 def _short_label(value: str, *, default: str = "unknown", limit: int = 128) -> str:
     normalized = str(value or "").strip()
     if not normalized:
@@ -524,7 +538,9 @@ def record_routing_decision(device: str, reason: str) -> None:
     ensure_metrics()
     if PROMETHEUS_AVAILABLE and ROUTING_DECISIONS:
         ROUTING_DECISIONS.labels(
-            device=_bounded_label(device, allowed=_ALLOWED_DEVICES, default="unknown"),
+            device=_bounded_label(
+                _normalize_device_label(device), allowed=_ALLOWED_DEVICES, default="unknown"
+            ),
             reason=_bounded_label(reason, allowed=_ALLOWED_ROUTING_REASONS),
         ).inc()
 
@@ -539,8 +555,12 @@ def record_routing_execution(
     if PROMETHEUS_AVAILABLE and ROUTING_EXECUTIONS:
         reason = fallback_reason or "none"
         ROUTING_EXECUTIONS.labels(
-            routed_device=_bounded_label(routed_device, allowed=_ALLOWED_DEVICES, default="unknown"),
-            execution_device=_bounded_label(execution_device, allowed=_ALLOWED_DEVICES, default="unknown"),
+            routed_device=_bounded_label(
+                _normalize_device_label(routed_device), allowed=_ALLOWED_DEVICES, default="unknown"
+            ),
+            execution_device=_bounded_label(
+                _normalize_device_label(execution_device), allowed=_ALLOWED_DEVICES, default="unknown"
+            ),
             fallback_reason=_bounded_label(
                 reason,
                 allowed=_ALLOWED_EXECUTION_FALLBACK_REASONS,

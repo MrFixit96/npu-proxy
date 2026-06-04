@@ -147,14 +147,8 @@ class LLMRuntime:
 
 def get_llm_runtime(
     config: LLMRuntimeConfig | None = None,
-    device: str | None = None,
 ) -> LLMRuntime:
-    """Get or create an LLM runtime instance."""
-    if device is not None:
-        from npu_proxy.inference.runtime_pool import get_runtime_pool
-
-        return get_runtime_pool().get_runtime(device)
-
+    """Get or create the singleton LLM runtime instance."""
     global _llm_runtime
 
     if _llm_runtime is None:
@@ -167,15 +161,10 @@ def get_llm_runtime(
 
 
 def reset_llm_runtime() -> None:
-    """Reset singleton and pooled LLM runtime instances."""
+    """Reset the singleton LLM runtime instance."""
     global _llm_runtime
     with _runtime_lock:
         runtime = _llm_runtime
         _llm_runtime = None
-    try:
-        if runtime is not None:
-            runtime.shutdown()
-    finally:
-        from npu_proxy.inference.runtime_pool import reset_runtime_pool
-
-        reset_runtime_pool()
+    if runtime is not None:
+        runtime.shutdown()

@@ -58,6 +58,7 @@ from npu_proxy.api.header_utils import (
     validate_registered_model,
 )
 from npu_proxy.inference.streaming import FinishReason, determine_finish_reason, stream_engine_tokens
+from npu_proxy.inference import routing_service
 from npu_proxy.inference.tokenizer import count_tokens, count_tokens_best_effort
 from npu_proxy.models.ollama_defaults import merge_with_defaults
 from npu_proxy.models.parameter_mapper import map_parameters
@@ -67,7 +68,7 @@ from npu_proxy.config import (
     load_device_queue_timeout,
     load_fallback_on_busy,
 )
-from npu_proxy.metrics import record_routing_decision, record_routing_execution, record_tokens
+from npu_proxy.metrics import record_routing_decision, record_tokens
 
 router = APIRouter(prefix="/v1", tags=["chat"])
 logger = logging.getLogger(__name__)
@@ -166,45 +167,24 @@ def get_engine(device: str | None = None):
     return get_llm_engine(device=device)
 
 
-def _open_routed_engine_slot(device: str):
-    """Acquire the routed device slot and return its engine plus release handle."""
-    from npu_proxy.inference.engine import DeviceBusyError, acquire_device_slot, fallback_devices_after
+def _open_routed_engine_slot(device: str) -> tuple[Any, Any]:
+    """Acquire the routed device slot and return its engine plus release handle.
 
-    timeout = load_device_queue_timeout()
-    fallback_on_busy = load_fallback_on_busy()
-    normalized = str(device).strip().upper()
-    candidates = [normalized]
-    if fallback_on_busy:
-        candidates.extend(fallback_devices_after(normalized))
+    Delegates to the shared engine slot logic while keeping ``chat.get_engine``
+    as the patchable engine accessor used by tests.
+    """
+    from npu_proxy.inference.engine import open_routed_engine_slot
 
-    last_busy: DeviceBusyError | None = None
-    for candidate in candidates:
-        slot = acquire_device_slot(candidate, timeout=timeout)
-        try:
-            selected_device = slot.__enter__()
-        except DeviceBusyError as exc:
-            last_busy = exc
-            if not fallback_on_busy:
-                raise
-            continue
-        try:
-            engine = get_engine(device=selected_device)
-        except Exception:
-            slot.__exit__(None, None, None)
-            raise
-        setattr(slot, "routed_device", normalized)
-        setattr(slot, "selected_device", selected_device)
-        setattr(slot, "fallback_reason", "busy" if selected_device != normalized else None)
-        return engine, slot
-
-    if last_busy is not None:
-        raise last_busy
-    raise DeviceBusyError(normalized)
+    return open_routed_engine_slot(
+        device,
+        timeout=load_device_queue_timeout(),
+        fallback_on_busy=load_fallback_on_busy(),
+        engine_factory=lambda selected: get_engine(device=selected),
+    )
 
 
 def _close_engine_slot(slot: object) -> None:
-    exit_method = getattr(slot, "__exit__")
-    exit_method(None, None, None)
+    routing_service.close_engine_slot(slot)
 
 
 def _fallback_reason(
@@ -213,29 +193,20 @@ def _fallback_reason(
     execution_device: str,
     engine_slot: object | None = None,
 ) -> str | None:
-    routed = str(routed_device).strip().upper()
-    executed = str(execution_device).strip().upper()
-    if not routed or executed == routed:
-        return None
-    reason = getattr(engine_slot, "fallback_reason", None)
-    return str(reason) if reason else "device_fallback"
+    return routing_service.fallback_reason(
+        routed_device=routed_device,
+        execution_device=execution_device,
+        engine_slot=engine_slot,
+    )
 
 
 def _record_routing_execution(routed_device: str, execution_device: str, fallback_reason: str | None) -> None:
-    record_routing_execution(routed_device, execution_device, fallback_reason or "none")
+    routing_service.record_routing_execution(routed_device, execution_device, fallback_reason)
 
 
 def _execution_device_from_engine(engine: Any) -> str:
     """Return the actual device reported by an acquired engine."""
-    get_device_info = getattr(engine, "get_device_info", None)
-    if callable(get_device_info):
-        try:
-            info = get_device_info()
-        except Exception:
-            info = {}
-        if isinstance(info, dict) and info.get("actual_device"):
-            return str(info["actual_device"])
-    return str(getattr(engine, "actual_device", None) or "unknown")
+    return routing_service.execution_device_from_engine(engine)
 
 
 def validate_model_exists(model: str) -> None:
