@@ -23,6 +23,8 @@ DEFAULT_PREFIX_CACHE_MODE: str = "auto"
 DEFAULT_HOST: str = "127.0.0.1"
 DEFAULT_PORT: int = 8080
 DEFAULT_TOKEN_LIMIT: int = 1800
+DEFAULT_DEVICE_QUEUE_TIMEOUT: float = 30.0
+DEFAULT_FALLBACK_ON_BUSY: bool = False
 DEFAULT_WORKERS: int = 1
 DEFAULT_LOG_LEVEL: str = "info"
 DEFAULT_ALLOWED_HOSTS: tuple[str, ...] = ("localhost", "127.0.0.1", "::1", "[::1]", "testserver", "test")
@@ -50,6 +52,8 @@ ENV_LLAMACPP_MODEL_PATH = "NPU_PROXY_LLAMACPP_MODEL_PATH"
 ENV_ALLOWED_HOSTS = "NPU_PROXY_ALLOWED_HOSTS"
 ENV_PREFERRED_DEVICE = "NPU_PROXY_PREFERRED_DEVICE"
 ENV_FALLBACK_DEVICE = "NPU_PROXY_FALLBACK_DEVICE"
+ENV_DEVICE_QUEUE_TIMEOUT = "NPU_PROXY_DEVICE_QUEUE_TIMEOUT"
+ENV_FALLBACK_ON_BUSY = "NPU_PROXY_FALLBACK_ON_BUSY"
 
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 _FALSE_VALUES = {"0", "false", "no", "off"}
@@ -307,6 +311,21 @@ def _parse_int_or_default(name: str, value: str | None, default: int) -> int:
     return parsed
 
 
+def _parse_float_or_default(name: str, value: str | None, default: float) -> float:
+    """Parse a positive float for lazy/observational paths, warning on fallback."""
+    if value is None or value == "":
+        return default
+    try:
+        parsed = float(value)
+    except ValueError:
+        logger.warning("Invalid %s=%s, using default %s", name, value, default)
+        return default
+    if parsed <= 0:
+        logger.warning("Invalid %s=%s, using default %s", name, value, default)
+        return default
+    return parsed
+
+
 def _parse_int(name: str, value: str | None, default: int) -> int:
     if value is None or value == "":
         return default
@@ -435,6 +454,34 @@ def _env_overlay_bootstrap_config(current: ProxyBootstrapConfig) -> ProxyBootstr
             overlay = replace(overlay, token_limit=token_limit)
 
     return overlay if overlay != current else None
+
+
+def load_device_queue_timeout(env: Mapping[str, str] | None = None) -> float:
+    """Load the per-device queue timeout using forgiving environment parsing."""
+    env_map = os.environ if env is None else env
+    return _parse_float_or_default(
+        ENV_DEVICE_QUEUE_TIMEOUT,
+        env_map.get(ENV_DEVICE_QUEUE_TIMEOUT),
+        DEFAULT_DEVICE_QUEUE_TIMEOUT,
+    )
+
+
+def load_fallback_on_busy(env: Mapping[str, str] | None = None) -> bool:
+    """Load whether busy devices may fall back using forgiving environment parsing."""
+    env_map = os.environ if env is None else env
+    raw_value = env_map.get(ENV_FALLBACK_ON_BUSY)
+    if raw_value is None or raw_value == "":
+        return DEFAULT_FALLBACK_ON_BUSY
+    try:
+        return parse_bool(ENV_FALLBACK_ON_BUSY, raw_value, default=DEFAULT_FALLBACK_ON_BUSY)
+    except LLMRuntimeConfigError:
+        logger.warning(
+            "Invalid %s=%s, using default %s",
+            ENV_FALLBACK_ON_BUSY,
+            raw_value,
+            DEFAULT_FALLBACK_ON_BUSY,
+        )
+        return DEFAULT_FALLBACK_ON_BUSY
 
 
 def load_context_routing_config(env: Mapping[str, str] | None = None) -> ContextRoutingConfig:

@@ -67,6 +67,7 @@ from npu_proxy.models.parameter_mapper import map_parameters
 from npu_proxy.inference.streaming import FinishReason, determine_finish_reason, stream_engine_tokens
 from npu_proxy.inference.chat_templates import render_chat_prompt
 from npu_proxy.inference.tokenizer import count_tokens_best_effort
+from npu_proxy.config import load_device_queue_timeout, load_fallback_on_busy
 from npu_proxy.api.embeddings import (
     MAX_EMBEDDING_BATCH_SIZE,
     MAX_EMBEDDING_TEXT_CHARS,
@@ -635,6 +636,29 @@ def _execution_device_from_engine(engine: Any) -> str:
     return str(getattr(engine, "actual_device", None) or "unknown")
 
 
+def _open_routed_engine_slot(device: str):
+    """Acquire the routed device slot and return its engine plus release handle."""
+    from npu_proxy.inference.engine import open_routed_engine_slot
+
+    return open_routed_engine_slot(
+        device,
+        timeout=load_device_queue_timeout(),
+        fallback_on_busy=load_fallback_on_busy(),
+    )
+
+
+def _close_engine_slot(slot: object) -> None:
+    exit_method = getattr(slot, "__exit__")
+    exit_method(None, None, None)
+
+
+def _device_busy_http_exception(exc: Exception, request_id: str) -> HTTPException:
+    return HTTPException(
+        status_code=503,
+        detail=_ollama_error_detail(str(exc), "device_busy", request_id),
+    )
+
+
 def add_execution_headers(response: Response, routing_result: RoutingResult, *, execution_device: str) -> None:
     """Add truthful single-engine execution headers to response headers.
 
@@ -944,14 +968,22 @@ async def generate(request: GenerateRequest, response: Response):
 
         if request.stream:
             engine = None
+            engine_slot = None
             engine_setup_error: Exception | None = None
             if use_real:
-                from npu_proxy.inference.engine import get_llm_engine
-
                 try:
-                    engine = await asyncio.to_thread(lambda: get_llm_engine(device=routing.device))
+                    engine, engine_slot = await asyncio.to_thread(
+                        lambda: _open_routed_engine_slot(routing.device)
+                    )
                     execution_device = _execution_device_from_engine(engine)
                 except Exception as exc:
+                    from npu_proxy.inference.engine import DeviceBusyError
+
+                    if isinstance(exc, DeviceBusyError):
+                        return _ollama_error_response(
+                            _device_busy_http_exception(exc, request_id),
+                            response_headers=dict(response.headers),
+                        )
                     engine_setup_error = exc
                     execution_device = routing.device
             else:
@@ -965,38 +997,68 @@ async def generate(request: GenerateRequest, response: Response):
                     execution_device = routing.device
 
             async def stream_generate():
-                max_new_tokens = _effective_max_tokens(mapped_options)
-                if use_real:
-                    if engine_setup_error is not None:
-                        logger.exception(
-                            "Streaming inference setup failed",
-                            extra={"request_id": request_id},
-                            exc_info=engine_setup_error,
-                        )
-                        yield _build_ollama_stream_error_chunk(
-                            request.model,
-                            "Inference failed",
-                            code="inference_failed",
-                            request_id=request_id,
-                        )
-                        return
-                    stream_error_message: str | None = None
-                    finish_reason: FinishReason = "stop"
+                try:
+                    max_new_tokens = _effective_max_tokens(mapped_options)
+                    if use_real:
+                        if engine_setup_error is not None:
+                            logger.exception(
+                                "Streaming inference setup failed",
+                                extra={"request_id": request_id},
+                                exc_info=engine_setup_error,
+                            )
+                            yield _build_ollama_stream_error_chunk(
+                                request.model,
+                                "Inference failed",
+                                code="inference_failed",
+                                request_id=request_id,
+                            )
+                            return
+                        stream_error_message: str | None = None
+                        finish_reason: FinishReason = "stop"
 
-                    def set_finish_reason(reason: FinishReason) -> None:
-                        nonlocal finish_reason
-                        finish_reason = reason
-                    try:
-                        async for token in stream_engine_tokens(
-                            engine_factory=lambda: engine,
-                            prompt=request.prompt,
-                            max_new_tokens=max_new_tokens,
-                            temperature=mapped_options.get("temperature", 0.8),
-                            request_id=request_id,
-                            top_p=_effective_top_p(mapped_options),
-                            timeout=180.0,
-                            finish_reason_callback=set_finish_reason,
-                        ):
+                        def set_finish_reason(reason: FinishReason) -> None:
+                            nonlocal finish_reason
+                            finish_reason = reason
+                        try:
+                            async for token in stream_engine_tokens(
+                                engine_factory=lambda: engine,
+                                prompt=request.prompt,
+                                max_new_tokens=max_new_tokens,
+                                temperature=mapped_options.get("temperature", 0.8),
+                                request_id=request_id,
+                                top_p=_effective_top_p(mapped_options),
+                                timeout=180.0,
+                                finish_reason_callback=set_finish_reason,
+                            ):
+                                chunk = GenerateResponse(
+                                    model=request.model,
+                                    created_at=time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                    response=token,
+                                    done=False,
+                                )
+                                yield orjson.dumps(chunk.model_dump()).decode() + "\n"
+                        except asyncio.CancelledError:
+                            raise
+                        except TimeoutError as exc:
+                            stream_error_message = "Inference timed out"
+                            logger.exception("Streaming inference timed out", extra={"request_id": request_id})
+                            stream_error_code = "inference_timeout"
+                        except Exception as exc:
+                            stream_error_message = "Inference failed"
+                            logger.exception("Streaming inference failed", extra={"request_id": request_id})
+                            stream_error_code = "inference_failed"
+
+                        if stream_error_message is not None:
+                            yield _build_ollama_stream_error_chunk(
+                                request.model,
+                                stream_error_message,
+                                code=stream_error_code,
+                                request_id=request_id,
+                            )
+                            return
+                    else:
+                        tokens, finish_reason = _mock_tokens("Hello! I'm running on Intel NPU.", max_new_tokens)
+                        for token in tokens:
                             chunk = GenerateResponse(
                                 model=request.model,
                                 created_at=time.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -1004,48 +1066,20 @@ async def generate(request: GenerateRequest, response: Response):
                                 done=False,
                             )
                             yield orjson.dumps(chunk.model_dump()).decode() + "\n"
-                    except asyncio.CancelledError:
-                        raise
-                    except TimeoutError as exc:
-                        stream_error_message = "Inference timed out"
-                        logger.exception("Streaming inference timed out", extra={"request_id": request_id})
-                        stream_error_code = "inference_timeout"
-                    except Exception as exc:
-                        stream_error_message = "Inference failed"
-                        logger.exception("Streaming inference failed", extra={"request_id": request_id})
-                        stream_error_code = "inference_failed"
 
-                    if stream_error_message is not None:
-                        yield _build_ollama_stream_error_chunk(
-                            request.model,
-                            stream_error_message,
-                            code=stream_error_code,
-                            request_id=request_id,
-                        )
-                        return
-                else:
-                    # Mock streaming
-                    tokens, finish_reason = _mock_tokens("Hello! I'm running on Intel NPU.", max_new_tokens)
-                    for token in tokens:
-                        chunk = GenerateResponse(
-                            model=request.model,
-                            created_at=time.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                            response=token,
-                            done=False,
-                        )
-                        yield orjson.dumps(chunk.model_dump()).decode() + "\n"
-
-                # Final chunk
-                final = GenerateResponse(
-                    model=request.model,
-                    created_at=time.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    response="",
-                    done=True,
-                    total_duration=1000000,
-                    eval_count=max_new_tokens if finish_reason == "length" else 10,
-                    done_reason=finish_reason,
-                )
-                yield orjson.dumps(final.model_dump()).decode() + "\n"
+                    final = GenerateResponse(
+                        model=request.model,
+                        created_at=time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        response="",
+                        done=True,
+                        total_duration=1000000,
+                        eval_count=max_new_tokens if finish_reason == "length" else 10,
+                        done_reason=finish_reason,
+                    )
+                    yield orjson.dumps(final.model_dump()).decode() + "\n"
+                finally:
+                    if engine_slot is not None:
+                        await asyncio.to_thread(_close_engine_slot, engine_slot)
 
             return StreamingResponse(
                 stream_generate(),
@@ -1060,20 +1094,22 @@ async def generate(request: GenerateRequest, response: Response):
         # Non-streaming
         if use_real:
             try:
-                from npu_proxy.inference.engine import get_llm_engine
-                engine = await asyncio.to_thread(lambda: get_llm_engine(device=routing.device))
+                def run_generation():
+                    engine, engine_slot = _open_routed_engine_slot(routing.device)
+                    try:
+                        text = engine.generate(
+                            request.prompt,
+                            max_new_tokens=_effective_max_tokens(mapped_options),
+                            temperature=mapped_options.get("temperature", 0.8),
+                            top_p=_effective_top_p(mapped_options),
+                            timeout=180.0,
+                        )
+                        return engine, text
+                    finally:
+                        _close_engine_slot(engine_slot)
+
+                engine, response_text = await asyncio.to_thread(run_generation)
                 add_execution_headers(response, routing, execution_device=_execution_device_from_engine(engine))
-                loop = asyncio.get_event_loop()
-                response_text = await loop.run_in_executor(
-                    None,
-                    lambda: engine.generate(
-                        request.prompt,
-                        max_new_tokens=_effective_max_tokens(mapped_options),
-                        temperature=mapped_options.get("temperature", 0.8),
-                        top_p=_effective_top_p(mapped_options),
-                        timeout=180.0,
-                    )
-                )
             except TimeoutError as e:
                 logger.exception("Non-streaming inference timed out", extra={"request_id": request_id})
                 raise HTTPException(
@@ -1087,6 +1123,10 @@ async def generate(request: GenerateRequest, response: Response):
                     detail=_ollama_error_detail("Inference service unavailable", "inference_unavailable", request_id),
                 )
             except Exception as e:
+                from npu_proxy.inference.engine import DeviceBusyError
+
+                if isinstance(e, DeviceBusyError):
+                    raise _device_busy_http_exception(e, request_id)
                 logger.exception("Unexpected inference error", extra={"request_id": request_id})
                 raise HTTPException(
                     status_code=500,
@@ -1229,14 +1269,22 @@ async def chat(request: ChatRequest, response: Response):
 
         if request.stream:
             engine = None
+            engine_slot = None
             engine_setup_error: Exception | None = None
             if use_real:
-                from npu_proxy.inference.engine import get_llm_engine
-
                 try:
-                    engine = await asyncio.to_thread(lambda: get_llm_engine(device=routing.device))
+                    engine, engine_slot = await asyncio.to_thread(
+                        lambda: _open_routed_engine_slot(routing.device)
+                    )
                     execution_device = _execution_device_from_engine(engine)
                 except Exception as exc:
+                    from npu_proxy.inference.engine import DeviceBusyError
+
+                    if isinstance(exc, DeviceBusyError):
+                        return _ollama_error_response(
+                            _device_busy_http_exception(exc, request_id),
+                            response_headers=dict(response.headers),
+                        )
                     engine_setup_error = exc
                     execution_device = routing.device
             else:
@@ -1250,28 +1298,28 @@ async def chat(request: ChatRequest, response: Response):
                     execution_device = routing.device
 
             async def stream_chat():
-                max_new_tokens = _effective_max_tokens(mapped_options)
-                if use_real:
-                    if engine_setup_error is not None:
-                        logger.exception(
-                            "Streaming chat setup failed",
-                            extra={"request_id": request_id},
-                            exc_info=engine_setup_error,
-                        )
-                        yield _build_ollama_stream_error_chunk(
-                            request.model,
-                            "Inference failed",
-                            code="inference_failed",
-                            request_id=request_id,
-                        )
-                        return
-                    stream_error_message: str | None = None
-                    finish_reason: FinishReason = "stop"
+                try:
+                    max_new_tokens = _effective_max_tokens(mapped_options)
+                    if use_real:
+                        if engine_setup_error is not None:
+                            logger.exception(
+                                "Streaming chat setup failed",
+                                extra={"request_id": request_id},
+                                exc_info=engine_setup_error,
+                            )
+                            yield _build_ollama_stream_error_chunk(
+                                request.model,
+                                "Inference failed",
+                                code="inference_failed",
+                                request_id=request_id,
+                            )
+                            return
+                        stream_error_message: str | None = None
+                        finish_reason: FinishReason = "stop"
 
-                    def set_finish_reason(reason: FinishReason) -> None:
-                        nonlocal finish_reason
-                        finish_reason = reason
-                    try:
+                        def set_finish_reason(reason: FinishReason) -> None:
+                            nonlocal finish_reason
+                            finish_reason = reason
                         try:
                             async for token in stream_engine_tokens(
                                 engine_factory=lambda: engine,
@@ -1309,37 +1357,30 @@ async def chat(request: ChatRequest, response: Response):
                                 request_id=request_id,
                             )
                             return
-                    except Exception as e:
-                        logger.exception("Streaming chat setup failed", extra={"request_id": request_id})
-                        yield _build_ollama_stream_error_chunk(
-                            request.model,
-                            "Inference failed",
-                            code="inference_failed",
-                            request_id=request_id,
-                        )
-                        return
-                else:
-                    tokens, finish_reason = _mock_tokens("Hello! I'm running on Intel NPU.", max_new_tokens)
-                    for token in tokens:
-                        chunk = ChatResponse(
-                            model=request.model,
-                            created_at=time.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                            message=ChatMessage(role="assistant", content=token),
-                            done=False,
-                        )
-                        yield orjson.dumps(chunk.model_dump()).decode() + "\n"
+                    else:
+                        tokens, finish_reason = _mock_tokens("Hello! I'm running on Intel NPU.", max_new_tokens)
+                        for token in tokens:
+                            chunk = ChatResponse(
+                                model=request.model,
+                                created_at=time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                message=ChatMessage(role="assistant", content=token),
+                                done=False,
+                            )
+                            yield orjson.dumps(chunk.model_dump()).decode() + "\n"
 
-                # Final chunk
-                final = ChatResponse(
-                    model=request.model,
-                    created_at=time.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    message=ChatMessage(role="assistant", content=""),
-                    done=True,
-                    total_duration=1000000,
-                    eval_count=max_new_tokens if finish_reason == "length" else 10,
-                    done_reason=finish_reason,
-                )
-                yield orjson.dumps(final.model_dump()).decode() + "\n"
+                    final = ChatResponse(
+                        model=request.model,
+                        created_at=time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        message=ChatMessage(role="assistant", content=""),
+                        done=True,
+                        total_duration=1000000,
+                        eval_count=max_new_tokens if finish_reason == "length" else 10,
+                        done_reason=finish_reason,
+                    )
+                    yield orjson.dumps(final.model_dump()).decode() + "\n"
+                finally:
+                    if engine_slot is not None:
+                        await asyncio.to_thread(_close_engine_slot, engine_slot)
 
             return StreamingResponse(
                 stream_chat(),
@@ -1354,20 +1395,22 @@ async def chat(request: ChatRequest, response: Response):
         # Non-streaming
         if use_real:
             try:
-                from npu_proxy.inference.engine import get_llm_engine
-                engine = await asyncio.to_thread(lambda: get_llm_engine(device=routing.device))
+                def run_generation():
+                    engine, engine_slot = _open_routed_engine_slot(routing.device)
+                    try:
+                        text = engine.generate(
+                            prompt,
+                            max_new_tokens=_effective_max_tokens(mapped_options),
+                            temperature=mapped_options.get("temperature", 0.8),
+                            top_p=_effective_top_p(mapped_options),
+                            timeout=180.0,
+                        )
+                        return engine, text
+                    finally:
+                        _close_engine_slot(engine_slot)
+
+                engine, response_text = await asyncio.to_thread(run_generation)
                 add_execution_headers(response, routing, execution_device=_execution_device_from_engine(engine))
-                loop = asyncio.get_event_loop()
-                response_text = await loop.run_in_executor(
-                    None,
-                    lambda: engine.generate(
-                        prompt,
-                        max_new_tokens=_effective_max_tokens(mapped_options),
-                        temperature=mapped_options.get("temperature", 0.8),
-                        top_p=_effective_top_p(mapped_options),
-                        timeout=180.0,
-                    )
-                )
             except TimeoutError as e:
                 logger.exception("Non-streaming chat inference timed out", extra={"request_id": request_id})
                 raise HTTPException(
@@ -1381,6 +1424,10 @@ async def chat(request: ChatRequest, response: Response):
                     detail=_ollama_error_detail("Inference service unavailable", "inference_unavailable", request_id),
                 )
             except Exception as e:
+                from npu_proxy.inference.engine import DeviceBusyError
+
+                if isinstance(e, DeviceBusyError):
+                    raise _device_busy_http_exception(e, request_id)
                 logger.exception("Unexpected chat inference error", extra={"request_id": request_id})
                 raise HTTPException(
                     status_code=500,

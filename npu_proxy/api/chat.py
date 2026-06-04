@@ -62,7 +62,11 @@ from npu_proxy.inference.tokenizer import count_tokens, count_tokens_best_effort
 from npu_proxy.models.ollama_defaults import merge_with_defaults
 from npu_proxy.models.parameter_mapper import map_parameters
 from npu_proxy.routing.context_router import get_context_router, RoutingResult
-from npu_proxy.config import DEFAULT_INFERENCE_TIMEOUT
+from npu_proxy.config import (
+    DEFAULT_INFERENCE_TIMEOUT,
+    load_device_queue_timeout,
+    load_fallback_on_busy,
+)
 from npu_proxy.metrics import record_routing_decision, record_tokens
 
 router = APIRouter(prefix="/v1", tags=["chat"])
@@ -160,6 +164,44 @@ def get_engine(device: str | None = None):
     from npu_proxy.inference.engine import get_llm_engine
 
     return get_llm_engine(device=device)
+
+
+def _open_routed_engine_slot(device: str):
+    """Acquire the routed device slot and return its engine plus release handle."""
+    from npu_proxy.inference.engine import DeviceBusyError, acquire_device_slot, fallback_devices_after
+
+    timeout = load_device_queue_timeout()
+    fallback_on_busy = load_fallback_on_busy()
+    normalized = str(device).strip().upper()
+    candidates = [normalized]
+    if fallback_on_busy:
+        candidates.extend(fallback_devices_after(normalized))
+
+    last_busy: DeviceBusyError | None = None
+    for candidate in candidates:
+        slot = acquire_device_slot(candidate, timeout=timeout)
+        try:
+            selected_device = slot.__enter__()
+        except DeviceBusyError as exc:
+            last_busy = exc
+            if not fallback_on_busy:
+                raise
+            continue
+        try:
+            engine = get_engine(device=selected_device)
+        except Exception:
+            slot.__exit__(None, None, None)
+            raise
+        return engine, slot
+
+    if last_busy is not None:
+        raise last_busy
+    raise DeviceBusyError(normalized)
+
+
+def _close_engine_slot(slot: object) -> None:
+    exit_method = getattr(slot, "__exit__")
+    exit_method(None, None, None)
 
 
 def _execution_device_from_engine(engine: Any) -> str:
@@ -533,6 +575,7 @@ async def generate_stream_real(
     request_id: str | None = None,
     prompt_tokens: int = 0,
     engine: Any | None = None,
+    engine_slot: object | None = None,
 ) -> AsyncIterator[str]:
     """Generate streaming response with real-time token streaming.
 
@@ -620,6 +663,8 @@ async def generate_stream_real(
         yield f"data: {orjson.dumps(final_chunk.model_dump()).decode()}\n\n"
         yield "data: [DONE]\n\n"
     finally:
+        if engine_slot is not None:
+            await asyncio.to_thread(_close_engine_slot, engine_slot)
         completion_tokens = count_tokens_best_effort(
             "".join(emitted_tokens), model=request.model
         ).count
@@ -786,7 +831,22 @@ async def chat_completions(request: ChatRequest, response: Response):
     if request.stream:
         engine = None
         if use_real_inference:
-            engine = await asyncio.to_thread(lambda: get_engine(device=routing.device))
+            try:
+                engine, engine_slot = await asyncio.to_thread(
+                    lambda: _open_routed_engine_slot(routing.device)
+                )
+            except Exception as exc:
+                from npu_proxy.inference.engine import DeviceBusyError
+
+                if isinstance(exc, DeviceBusyError):
+                    return create_error_response(
+                        status_code=503,
+                        message=str(exc),
+                        error_type="server_error",
+                        code="device_busy",
+                        request_id=request_id,
+                    )
+                raise
             execution_device = _execution_device_from_engine(engine)
             return StreamingResponse(
                 generate_stream_real(
@@ -798,6 +858,7 @@ async def chat_completions(request: ChatRequest, response: Response):
                     request_id,
                     prompt_tokens,
                     engine=engine,
+                    engine_slot=engine_slot,
                 ),
                 media_type="text/event-stream",
                 headers=build_stream_headers(
@@ -820,24 +881,30 @@ async def chat_completions(request: ChatRequest, response: Response):
     # Non-streaming response
     if use_real_inference:
         try:
-            engine = await asyncio.to_thread(lambda: get_engine(device=routing.device))
+            def run_generation():
+                engine, engine_slot = _open_routed_engine_slot(routing.device)
+                try:
+                    text = engine.generate(
+                        prompt,
+                        max_new_tokens=mapped_options.get("max_new_tokens", request.max_tokens),
+                        temperature=mapped_options.get("temperature", request.temperature),
+                        top_p=_effective_top_p(mapped_options, request.top_p),
+                        timeout=float(DEFAULT_INFERENCE_TIMEOUT),
+                    )
+                    return engine, text
+                finally:
+                    _close_engine_slot(engine_slot)
+
+            engine, response_text = await asyncio.wait_for(
+                asyncio.to_thread(run_generation),
+                timeout=float(DEFAULT_INFERENCE_TIMEOUT) + load_device_queue_timeout(),
+            )
             execution_device = _execution_device_from_engine(engine)
             add_execution_headers(
                 response,
                 routing,
                 execution_device,
                 request_id,
-            )
-            response_text = await asyncio.wait_for(
-                asyncio.to_thread(
-                    engine.generate,
-                    prompt,
-                    max_new_tokens=mapped_options.get("max_new_tokens", request.max_tokens),
-                    temperature=mapped_options.get("temperature", request.temperature),
-                    top_p=_effective_top_p(mapped_options, request.top_p),
-                    timeout=float(DEFAULT_INFERENCE_TIMEOUT),
-                ),
-                timeout=float(DEFAULT_INFERENCE_TIMEOUT),
             )
         except (TimeoutError, asyncio.TimeoutError):
             logger.exception("Inference timed out", extra={"request_id": request_id})
@@ -857,7 +924,17 @@ async def chat_completions(request: ChatRequest, response: Response):
                 code="inference_error",
                 request_id=request_id,
             )
-        except Exception:
+        except Exception as exc:
+            from npu_proxy.inference.engine import DeviceBusyError
+
+            if isinstance(exc, DeviceBusyError):
+                return create_error_response(
+                    status_code=503,
+                    message=str(exc),
+                    error_type="server_error",
+                    code="device_busy",
+                    request_id=request_id,
+                )
             logger.exception("Unexpected inference error", extra={"request_id": request_id})
             return create_error_response(
                 status_code=500,
