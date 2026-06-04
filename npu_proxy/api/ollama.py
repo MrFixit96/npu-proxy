@@ -46,7 +46,7 @@ from fastapi import APIRouter, Header, HTTPException, Query
 from fastapi.responses import StreamingResponse, JSONResponse
 from starlette.responses import Response
 from pydantic import BaseModel, Field, SecretStr
-from typing import Literal
+from typing import Any, Literal
 
 from npu_proxy import OLLAMA_VERSION
 from npu_proxy.routing.context_router import get_context_router, RoutingResult
@@ -622,6 +622,19 @@ def _get_execution_device(*, load_if_needed: bool) -> str:
     return get_reportable_execution_device(load_if_needed=load_if_needed)
 
 
+def _execution_device_from_engine(engine: Any) -> str:
+    """Return the actual device reported by an acquired engine."""
+    get_device_info = getattr(engine, "get_device_info", None)
+    if callable(get_device_info):
+        try:
+            info = get_device_info()
+        except Exception:
+            info = {}
+        if isinstance(info, dict) and info.get("actual_device"):
+            return str(info["actual_device"])
+    return str(getattr(engine, "actual_device", None) or "unknown")
+
+
 def add_execution_headers(response: Response, routing_result: RoutingResult, *, execution_device: str) -> None:
     """Add truthful single-engine execution headers to response headers.
 
@@ -930,18 +943,43 @@ async def generate(request: GenerateRequest, response: Response):
         use_real = os.environ.get("NPU_PROXY_REAL_INFERENCE", "0") == "1"
 
         if request.stream:
-            try:
-                execution_device = _get_execution_device(load_if_needed=use_real)
-            except Exception as exc:
-                logger.error(
-                    "Failed to resolve streaming execution device; using routing device",
-                    extra={"request_id": request_id, "error": str(exc)},
-                )
-                execution_device = routing.device
+            engine = None
+            engine_setup_error: Exception | None = None
+            if use_real:
+                from npu_proxy.inference.engine import get_llm_engine
+
+                try:
+                    engine = await asyncio.to_thread(lambda: get_llm_engine(device=routing.device))
+                    execution_device = _execution_device_from_engine(engine)
+                except Exception as exc:
+                    engine_setup_error = exc
+                    execution_device = routing.device
+            else:
+                try:
+                    execution_device = _get_execution_device(load_if_needed=False)
+                except Exception as exc:
+                    logger.error(
+                        "Failed to resolve streaming execution device; using routing device",
+                        extra={"request_id": request_id, "error": str(exc)},
+                    )
+                    execution_device = routing.device
 
             async def stream_generate():
                 max_new_tokens = _effective_max_tokens(mapped_options)
                 if use_real:
+                    if engine_setup_error is not None:
+                        logger.exception(
+                            "Streaming inference setup failed",
+                            extra={"request_id": request_id},
+                            exc_info=engine_setup_error,
+                        )
+                        yield _build_ollama_stream_error_chunk(
+                            request.model,
+                            "Inference failed",
+                            code="inference_failed",
+                            request_id=request_id,
+                        )
+                        return
                     stream_error_message: str | None = None
                     finish_reason: FinishReason = "stop"
 
@@ -949,10 +987,8 @@ async def generate(request: GenerateRequest, response: Response):
                         nonlocal finish_reason
                         finish_reason = reason
                     try:
-                        from npu_proxy.inference.engine import get_llm_engine
-
                         async for token in stream_engine_tokens(
-                            engine_factory=get_llm_engine,
+                            engine_factory=lambda: engine,
                             prompt=request.prompt,
                             max_new_tokens=max_new_tokens,
                             temperature=mapped_options.get("temperature", 0.8),
@@ -1025,8 +1061,8 @@ async def generate(request: GenerateRequest, response: Response):
         if use_real:
             try:
                 from npu_proxy.inference.engine import get_llm_engine
-                engine = get_llm_engine()
-                add_execution_headers(response, routing, execution_device=_get_execution_device(load_if_needed=False))
+                engine = await asyncio.to_thread(lambda: get_llm_engine(device=routing.device))
+                add_execution_headers(response, routing, execution_device=_execution_device_from_engine(engine))
                 loop = asyncio.get_event_loop()
                 response_text = await loop.run_in_executor(
                     None,
@@ -1192,18 +1228,43 @@ async def chat(request: ChatRequest, response: Response):
         mapped_options = map_parameters(full_options)
 
         if request.stream:
-            try:
-                execution_device = _get_execution_device(load_if_needed=use_real)
-            except Exception as exc:
-                logger.error(
-                    "Failed to resolve streaming execution device; using routing device",
-                    extra={"request_id": request_id, "error": str(exc)},
-                )
-                execution_device = routing.device
+            engine = None
+            engine_setup_error: Exception | None = None
+            if use_real:
+                from npu_proxy.inference.engine import get_llm_engine
+
+                try:
+                    engine = await asyncio.to_thread(lambda: get_llm_engine(device=routing.device))
+                    execution_device = _execution_device_from_engine(engine)
+                except Exception as exc:
+                    engine_setup_error = exc
+                    execution_device = routing.device
+            else:
+                try:
+                    execution_device = _get_execution_device(load_if_needed=False)
+                except Exception as exc:
+                    logger.error(
+                        "Failed to resolve streaming execution device; using routing device",
+                        extra={"request_id": request_id, "error": str(exc)},
+                    )
+                    execution_device = routing.device
 
             async def stream_chat():
                 max_new_tokens = _effective_max_tokens(mapped_options)
                 if use_real:
+                    if engine_setup_error is not None:
+                        logger.exception(
+                            "Streaming chat setup failed",
+                            extra={"request_id": request_id},
+                            exc_info=engine_setup_error,
+                        )
+                        yield _build_ollama_stream_error_chunk(
+                            request.model,
+                            "Inference failed",
+                            code="inference_failed",
+                            request_id=request_id,
+                        )
+                        return
                     stream_error_message: str | None = None
                     finish_reason: FinishReason = "stop"
 
@@ -1211,11 +1272,9 @@ async def chat(request: ChatRequest, response: Response):
                         nonlocal finish_reason
                         finish_reason = reason
                     try:
-                        from npu_proxy.inference.engine import get_llm_engine
-
                         try:
                             async for token in stream_engine_tokens(
-                                engine_factory=get_llm_engine,
+                                engine_factory=lambda: engine,
                                 prompt=prompt,
                                 max_new_tokens=max_new_tokens,
                                 temperature=mapped_options.get("temperature", 0.8),
@@ -1296,8 +1355,8 @@ async def chat(request: ChatRequest, response: Response):
         if use_real:
             try:
                 from npu_proxy.inference.engine import get_llm_engine
-                engine = get_llm_engine()
-                add_execution_headers(response, routing, execution_device=_get_execution_device(load_if_needed=False))
+                engine = await asyncio.to_thread(lambda: get_llm_engine(device=routing.device))
+                add_execution_headers(response, routing, execution_device=_execution_device_from_engine(engine))
                 loop = asyncio.get_event_loop()
                 response_text = await loop.run_in_executor(
                     None,

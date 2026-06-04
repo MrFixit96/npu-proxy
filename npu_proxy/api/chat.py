@@ -40,8 +40,7 @@ import uuid
 import asyncio
 import logging
 import os
-import threading
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator, Optional, Any
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, field_validator
@@ -68,11 +67,6 @@ from npu_proxy.metrics import record_routing_decision, record_tokens
 
 router = APIRouter(prefix="/v1", tags=["chat"])
 logger = logging.getLogger(__name__)
-
-# Lazy import to avoid loading model at import time
-_engine = None
-_engine_lock = threading.Lock()
-
 
 def generate_request_id() -> str:
     """Generate a unique request ID for tracking.
@@ -161,26 +155,24 @@ def create_error_response_from_http_exception(
     )
 
 
-def get_engine():
-    """Lazy load the singleton inference engine with synchronized initialization.
+def get_engine(device: str | None = None):
+    """Get an inference engine from the shared per-device engine pool."""
+    from npu_proxy.inference.engine import get_llm_engine
 
-    Defers importing and initializing the LLM engine until first use,
-    reducing startup time and memory usage when the engine isn't needed.
+    return get_llm_engine(device=device)
 
-    Returns:
-        The singleton LLMEngine instance configured for the current device.
 
-    Note:
-        The singleton's lazy initialization is protected by a lock. The engine
-        object itself may still have its own runtime threading constraints.
-    """
-    global _engine
-    if _engine is None:
-        with _engine_lock:
-            if _engine is None:
-                from npu_proxy.inference.engine import get_llm_engine
-                _engine = get_llm_engine()
-    return _engine
+def _execution_device_from_engine(engine: Any) -> str:
+    """Return the actual device reported by an acquired engine."""
+    get_device_info = getattr(engine, "get_device_info", None)
+    if callable(get_device_info):
+        try:
+            info = get_device_info()
+        except Exception:
+            info = {}
+        if isinstance(info, dict) and info.get("actual_device"):
+            return str(info["actual_device"])
+    return str(getattr(engine, "actual_device", None) or "unknown")
 
 
 def validate_model_exists(model: str) -> None:
@@ -540,6 +532,7 @@ async def generate_stream_real(
     mapped_options: dict | None = None,
     request_id: str | None = None,
     prompt_tokens: int = 0,
+    engine: Any | None = None,
 ) -> AsyncIterator[str]:
     """Generate streaming response with real-time token streaming.
 
@@ -574,8 +567,10 @@ async def generate_stream_real(
 
         stream_error_message: str | None = None
         try:
+            if engine is None:
+                engine = get_engine()
             async for token in stream_engine_tokens(
-                engine_factory=get_engine,
+                engine_factory=lambda: engine,
                 prompt=prompt,
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
@@ -789,10 +784,10 @@ async def chat_completions(request: ChatRequest, response: Response):
     mapped_options = map_parameters(full_options)
 
     if request.stream:
-        execution_device = await asyncio.to_thread(
-            _get_execution_device, load_if_needed=use_real_inference
-        )
+        engine = None
         if use_real_inference:
+            engine = await asyncio.to_thread(lambda: get_engine(device=routing.device))
+            execution_device = _execution_device_from_engine(engine)
             return StreamingResponse(
                 generate_stream_real(
                     request,
@@ -802,6 +797,7 @@ async def chat_completions(request: ChatRequest, response: Response):
                     mapped_options,
                     request_id,
                     prompt_tokens,
+                    engine=engine,
                 ),
                 media_type="text/event-stream",
                 headers=build_stream_headers(
@@ -810,6 +806,7 @@ async def chat_completions(request: ChatRequest, response: Response):
                     execution_device=execution_device,
                 ),
             )
+        execution_device = await asyncio.to_thread(_get_execution_device, load_if_needed=False)
         return StreamingResponse(
             generate_stream(request, chat_id, created, prompt_tokens),
             media_type="text/event-stream",
@@ -823,10 +820,8 @@ async def chat_completions(request: ChatRequest, response: Response):
     # Non-streaming response
     if use_real_inference:
         try:
-            engine = await asyncio.to_thread(get_engine)
-            execution_device = await asyncio.to_thread(
-                _get_execution_device, load_if_needed=False
-            )
+            engine = await asyncio.to_thread(lambda: get_engine(device=routing.device))
+            execution_device = _execution_device_from_engine(engine)
             add_execution_headers(
                 response,
                 routing,
