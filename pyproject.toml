@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "npu-proxy"
-version = "0.2.0"
+version = "0.2.1"
 description = "Ollama-compatible API proxy for Intel NPU inference via OpenVINO"
 readme = "README.md"
 requires-python = ">=3.10"

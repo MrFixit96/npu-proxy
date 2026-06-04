@@ -6,6 +6,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-06-03
+
 This release is the result of a comprehensive security, correctness, and code-quality
 review. NPU Proxy is intended for a developer's local workstation (single user, loopback),
 not as a shared production proxy; the changes below harden that local model rather than
@@ -114,3 +116,8 @@ adding multi-tenant features.
 - Streaming response support backed by `AsyncTokenStream`.
 - Prometheus metrics and request tracing headers.
 - Initial Windows and Linux packaging assets.
+
+[Unreleased]: https://github.com/MrFixit96/npu-proxy/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/MrFixit96/npu-proxy/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/MrFixit96/npu-proxy/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/MrFixit96/npu-proxy/releases/tag/v0.1.0
