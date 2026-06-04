@@ -1241,12 +1241,13 @@ class InferenceEngine:
 
 
 # =============================================================================
-# Global Engine Management (Singleton Pattern)
+# Global Engine Management (Per-Model/Device Pool)
 # =============================================================================
 
 
-# Global engine instances (singleton pattern with thread safety)
-_llm_engine: Optional[InferenceEngine] = None
+# Global engine instances (per-model/device pool with thread safety)
+EnginePoolKey = tuple[str, str]
+_engine_pool: dict[EnginePoolKey, InferenceEngine] = {}
 _loaded_models: dict[str, InferenceEngine] = {}
 _engine_lock: threading.Lock = threading.Lock()
 
@@ -1284,12 +1285,26 @@ def _resolve_engine_runtime_config(
     return replace(base_config, **overrides) if overrides else base_config
 
 
+def _engine_pool_key(runtime_config: LLMRuntimeConfig) -> EnginePoolKey:
+    """Return the normalized model/device cache key for an engine config."""
+    return (str(Path(runtime_config.model_path).resolve()), runtime_config.device.upper())
+
+
+def _unique_engines() -> list[InferenceEngine]:
+    """Return unique engines known to the pool and legacy loaded-model index."""
+    engines: list[InferenceEngine] = []
+    for engine in [*_engine_pool.values(), *_loaded_models.values()]:
+        if engine not in engines:
+            engines.append(engine)
+    return engines
+
+
 def reset_engine(*, force: bool = False) -> None:
-    """Reset the global engine to allow reloading with different configuration.
+    """Reset all global engines to allow reloading with different configuration.
     
-    Clears the singleton instance and loaded models dictionary, allowing
-    the next call to get_llm_engine() to create a fresh engine with
-    potentially different device or model settings.
+    Clears the engine pool and loaded models dictionary, allowing the next
+    call to get_llm_engine() to create fresh engines with potentially
+    different device or model settings.
     
     This function is thread-safe.
     
@@ -1299,18 +1314,13 @@ def reset_engine(*, force: bool = False) -> None:
         >>> engine2 = get_llm_engine(device="CPU")  # New instance
     
     Warning:
-        Any references to the previous engine instance become stale. Active
+        Any references to previous engine instances become stale. Active
         inference prevents reset unless force=True is used. Forced reset is
         best-effort because already-running native calls cannot be killed.
     """
-    global _llm_engine, _loaded_models
-    engines_to_shutdown: list[InferenceEngine] = []
+    global _loaded_models
     with _engine_lock:
-        if _llm_engine is not None:
-            engines_to_shutdown.append(_llm_engine)
-        for engine in _loaded_models.values():
-            if engine not in engines_to_shutdown:
-                engines_to_shutdown.append(engine)
+        engines_to_shutdown = _unique_engines()
 
         active_engines = [
             engine
@@ -1330,7 +1340,7 @@ def reset_engine(*, force: bool = False) -> None:
                 "native work may continue until it returns",
                 len(active_engines),
             )
-        _llm_engine = None
+        _engine_pool.clear()
         _loaded_models = {}
     for engine in engines_to_shutdown:
         engine.shutdown(wait=False)
@@ -1346,43 +1356,12 @@ def get_llm_engine(
     prefix_cache_mode: Optional[str] = None,
     config: LLMRuntimeConfig | None = None,
 ) -> InferenceEngine:
-    """Get or create the singleton LLM inference engine instance.
+    """Get or create an LLM inference engine for a model/device pair.
     
-    Implements a thread-safe singleton pattern with double-checked locking.
-    The first call creates the engine; subsequent calls return the same
-    instance regardless of arguments.
-    
-    Args:
-        model_path: Path to the OpenVINO model directory. Defaults to
-            DEFAULT_MODEL_DIR/DEFAULT_LLM_MODEL. Only used on first call.
-        device: Target compute device. Defaults to NPU_PROXY_DEVICE env var
-            or "NPU". Only used on first call.
-    
-    Returns:
-        The singleton InferenceEngine instance.
-    
-    Raises:
-        ModelNotFoundError: If the model path does not exist.
-        DeviceError: If model loading fails on all devices.
-    
-    Example:
-        >>> # First call initializes the engine
-        >>> engine = get_llm_engine(device="NPU")
-        >>> engine.warmup()
-        >>> 
-        >>> # Subsequent calls return the same instance
-        >>> same_engine = get_llm_engine()
-        >>> assert engine is same_engine
-    
-    Thread Safety:
-        This function is thread-safe. Multiple threads can call it
-        concurrently, and all will receive the same engine instance.
-    
-    Note:
-        To change devices or models, call reset_engine() first.
+    Implements a thread-safe per-(model, device) pool with double-checked
+    locking. Calls for the same normalized model/device key return the same
+    instance; calls for different devices create independent engines.
     """
-    global _llm_engine
-    
     runtime_config = _resolve_engine_runtime_config(
         config=config,
         model_path=model_path,
@@ -1393,43 +1372,55 @@ def get_llm_engine(
         compile_cache_mode=compile_cache_mode,
         prefix_cache_mode=prefix_cache_mode,
     )
+    runtime_config = replace(runtime_config, device=runtime_config.device.upper())
+    pool_key = _engine_pool_key(runtime_config)
 
-    # Double-checked locking for thread safety
-    if _llm_engine is None:
-        with _engine_lock:
-            if _llm_engine is None:
-                if runtime_config.backend is not LLMBackend.OPENVINO:
-                    raise InferenceError(
-                        "Legacy engine path only supports the openvino backend; "
-                        "use npu_proxy.inference.llm_runtime.get_llm_runtime() "
-                        "for backend-neutral access.",
-                    )
-                if not runtime_config.model_path.exists():
-                    raise ModelNotFoundError(Path(runtime_config.model_path))
+    engine = _engine_pool.get(pool_key)
+    if engine is not None:
+        return engine
 
-                _llm_engine = InferenceEngine(
-                    runtime_config.model_path,
-                    runtime_config.device,
-                    inference_timeout=runtime_config.inference_timeout,
-                    max_prompt_len=runtime_config.max_prompt_len,
-                    compile_cache_dir=runtime_config.compile_cache_dir,
-                    compile_cache_mode=runtime_config.compile_cache_mode,
-                    prefix_cache_mode=runtime_config.prefix_cache_mode,
+    with _engine_lock:
+        engine = _engine_pool.get(pool_key)
+        if engine is None:
+            if runtime_config.backend is not LLMBackend.OPENVINO:
+                raise InferenceError(
+                    "Legacy engine path only supports the openvino backend; "
+                    "use npu_proxy.inference.llm_runtime.get_llm_runtime() "
+                    "for backend-neutral access.",
                 )
-                _loaded_models[_llm_engine.model_name] = _llm_engine
-    
-    return _llm_engine
+            if not runtime_config.model_path.exists():
+                raise ModelNotFoundError(Path(runtime_config.model_path))
+
+            engine = InferenceEngine(
+                runtime_config.model_path,
+                runtime_config.device,
+                inference_timeout=runtime_config.inference_timeout,
+                max_prompt_len=runtime_config.max_prompt_len,
+                compile_cache_dir=runtime_config.compile_cache_dir,
+                compile_cache_mode=runtime_config.compile_cache_mode,
+                prefix_cache_mode=runtime_config.prefix_cache_mode,
+            )
+            _engine_pool[pool_key] = engine
+            _loaded_models[engine.model_name] = engine
+
+    return engine
 
 
 def get_llm_execution_target(*, load_if_needed: bool = False) -> dict[str, object]:
-    """Return the actual singleton execution target without inventing per-request routing."""
+    """Return the current/default LLM execution target."""
+    runtime_config = get_active_llm_runtime_config()
     if load_if_needed:
-        engine = get_llm_engine()
+        engine = get_llm_engine(config=runtime_config)
     else:
-        engine = _llm_engine
+        default_key = _engine_pool_key(runtime_config)
+        with _engine_lock:
+            engine = _engine_pool.get(default_key)
+            if engine is None:
+                engine = next(iter(_engine_pool.values()), None)
+            if engine is None:
+                engine = next(iter(_loaded_models.values()), None)
 
     if engine is None:
-        runtime_config = get_active_llm_runtime_config()
         return {
             "model": runtime_config.model_path.name,
             "device": runtime_config.device,
@@ -1482,4 +1473,5 @@ def is_model_loaded() -> bool:
         >>> is_model_loaded()
         True
     """
-    return _llm_engine is not None
+    with _engine_lock:
+        return bool(_engine_pool or _loaded_models)
