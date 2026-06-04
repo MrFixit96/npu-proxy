@@ -54,7 +54,7 @@ def test_health_device_pool_reports_loaded_warmed_and_busy(client: TestClient, m
     assert pool == [
         {
             "model": "tinyllama",
-            "model_path": "C:\\models\\tinyllama",
+            "model_path": "tinyllama",
             "device": "NPU",
             "requested_device": "NPU",
             "loaded": True,

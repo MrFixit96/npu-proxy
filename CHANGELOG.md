@@ -20,7 +20,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ### Fixed
 
+- Fixed a device-lock leak in the OpenAI streaming generation path: if routing bookkeeping (metrics or response-header construction) raised after a device slot was acquired but before the streaming response began, the per-`(model, device)` lock was never released, wedging that device into permanent `503 device_busy` until restart. The slot is now released on any such failure. The Ollama streaming paths received the same hardening for response-construction failures.
+- `reset_engine()` no longer discards per-device locks. Dropping a lock raced with in-flight slot acquisition and could allow two concurrent native inferences on one device after a forced reset; locks are now preserved so serialization holds across resets.
+- Startup warmup now logs a device as "warmed" only when the engine actually reports it warmed, and runs off the event loop. Previously a silently-swallowed warmup compile failure was still logged as a successful warmup.
 - `/health` and `/health/devices` now report the default/preferred-device engine as the active device instead of whichever device served the most recent request. Previously, after a long prompt fell back to CPU, the legacy single-active-device fields misreported CPU even though NPU remained the routed default and continued serving short prompts. The additive `device_pool` snapshot remains the source of truth for all loaded per-device engines.
+
+### Security
+
+- The `device_pool` health snapshot (exposed via unauthenticated `/health` and `/health/devices`) now reports only the model directory name instead of its absolute filesystem path, avoiding leaking the OS username and local directory layout.
 
 ## [0.2.1] - 2026-06-03
 

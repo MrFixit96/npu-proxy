@@ -67,7 +67,7 @@ from npu_proxy.models.parameter_mapper import map_parameters
 from npu_proxy.inference.streaming import FinishReason, determine_finish_reason, stream_engine_tokens
 from npu_proxy.inference.chat_templates import render_chat_prompt
 from npu_proxy.inference.tokenizer import count_tokens_best_effort
-from npu_proxy.config import load_device_queue_timeout, load_fallback_on_busy
+from npu_proxy.config import DEFAULT_INFERENCE_TIMEOUT, load_device_queue_timeout, load_fallback_on_busy
 from npu_proxy.api.embeddings import (
     MAX_EMBEDDING_BATCH_SIZE,
     MAX_EMBEDDING_TEXT_CHARS,
@@ -1066,7 +1066,7 @@ async def generate(request: GenerateRequest, response: Response):
                                 temperature=mapped_options.get("temperature", 0.8),
                                 request_id=request_id,
                                 top_p=_effective_top_p(mapped_options),
-                                timeout=180.0,
+                                timeout=float(DEFAULT_INFERENCE_TIMEOUT),
                                 finish_reason_callback=set_finish_reason,
                             ):
                                 chunk = GenerateResponse(
@@ -1120,16 +1120,22 @@ async def generate(request: GenerateRequest, response: Response):
                     if engine_slot is not None:
                         await asyncio.to_thread(_close_engine_slot, engine_slot)
 
-            return StreamingResponse(
-                stream_generate(),
-                media_type="application/x-ndjson",
-                headers=build_execution_headers(
-                    routing,
-                    execution_device=execution_device,
-                    request_id=request_id,
-                    fallback_reason=fallback_reason,
-                ),
-            )
+            try:
+                stream_response = StreamingResponse(
+                    stream_generate(),
+                    media_type="application/x-ndjson",
+                    headers=build_execution_headers(
+                        routing,
+                        execution_device=execution_device,
+                        request_id=request_id,
+                        fallback_reason=fallback_reason,
+                    ),
+                )
+            except Exception:
+                if engine_slot is not None:
+                    await asyncio.to_thread(_close_engine_slot, engine_slot)
+                raise
+            return stream_response
 
         # Non-streaming
         if use_real:
@@ -1142,7 +1148,7 @@ async def generate(request: GenerateRequest, response: Response):
                             max_new_tokens=_effective_max_tokens(mapped_options),
                             temperature=mapped_options.get("temperature", 0.8),
                             top_p=_effective_top_p(mapped_options),
-                            timeout=180.0,
+                            timeout=float(DEFAULT_INFERENCE_TIMEOUT),
                         )
                         return engine, text, getattr(engine_slot, "fallback_reason", None)
                     finally:
@@ -1395,7 +1401,7 @@ async def chat(request: ChatRequest, response: Response):
                                 temperature=mapped_options.get("temperature", 0.8),
                                 request_id=request_id,
                                 top_p=_effective_top_p(mapped_options),
-                                timeout=180.0,
+                                timeout=float(DEFAULT_INFERENCE_TIMEOUT),
                                 finish_reason_callback=set_finish_reason,
                             ):
                                 chunk = ChatResponse(
@@ -1449,16 +1455,22 @@ async def chat(request: ChatRequest, response: Response):
                     if engine_slot is not None:
                         await asyncio.to_thread(_close_engine_slot, engine_slot)
 
-            return StreamingResponse(
-                stream_chat(),
-                media_type="application/x-ndjson",
-                headers=build_execution_headers(
-                    routing,
-                    execution_device=execution_device,
-                    request_id=request_id,
-                    fallback_reason=fallback_reason,
-                ),
-            )
+            try:
+                stream_response = StreamingResponse(
+                    stream_chat(),
+                    media_type="application/x-ndjson",
+                    headers=build_execution_headers(
+                        routing,
+                        execution_device=execution_device,
+                        request_id=request_id,
+                        fallback_reason=fallback_reason,
+                    ),
+                )
+            except Exception:
+                if engine_slot is not None:
+                    await asyncio.to_thread(_close_engine_slot, engine_slot)
+                raise
+            return stream_response
 
         # Non-streaming
         if use_real:
@@ -1471,7 +1483,7 @@ async def chat(request: ChatRequest, response: Response):
                             max_new_tokens=_effective_max_tokens(mapped_options),
                             temperature=mapped_options.get("temperature", 0.8),
                             top_p=_effective_top_p(mapped_options),
-                            timeout=180.0,
+                            timeout=float(DEFAULT_INFERENCE_TIMEOUT),
                         )
                         return engine, text, getattr(engine_slot, "fallback_reason", None)
                     finally:

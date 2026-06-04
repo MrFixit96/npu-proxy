@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
@@ -81,8 +82,15 @@ def _warmup_configured_devices(config: ProxyBootstrapConfig) -> None:
             logger.warning("Skipping %s warmup because the device is not available", device)
             continue
         try:
-            get_llm_engine(device=device).warmup()
-            logger.info("Warmed LLM engine on %s", device)
+            engine = get_llm_engine(device=device)
+            engine.warmup()
+            if engine.is_warmed_up:
+                logger.info("Warmed LLM engine on %s", device)
+            else:
+                logger.warning(
+                    "Warmup did not complete for %s; the device will compile on first request",
+                    device,
+                )
         except Exception:
             logger.exception("Failed to warm LLM engine on %s; continuing startup", device)
 
@@ -107,7 +115,7 @@ def create_app(config: ProxyBootstrapConfig | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-        _warmup_configured_devices(resolved)
+        await asyncio.to_thread(_warmup_configured_devices, resolved)
         yield
 
     application = FastAPI(

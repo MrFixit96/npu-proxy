@@ -29,7 +29,14 @@ def test_startup_warmup_loads_available_configured_devices(monkeypatch):
     warmed: list[str] = []
 
     def fake_get_llm_engine(device: str):
-        return SimpleNamespace(warmup=lambda: warmed.append(device))
+        ns = SimpleNamespace(is_warmed_up=False)
+
+        def _warmup():
+            warmed.append(device)
+            ns.is_warmed_up = True
+
+        ns.warmup = _warmup
+        return ns
 
     monkeypatch.setattr("npu_proxy.inference.engine.get_available_devices", lambda: ["CPU", "NPU"])
     monkeypatch.setattr("npu_proxy.inference.engine.get_llm_engine", fake_get_llm_engine)
@@ -47,7 +54,14 @@ def test_startup_warmup_continues_after_device_failure(monkeypatch):
     def fake_get_llm_engine(device: str):
         if device == "NPU":
             raise RuntimeError("compile failed")
-        return SimpleNamespace(warmup=lambda: warmed.append(device))
+        ns = SimpleNamespace(is_warmed_up=False)
+
+        def _warmup():
+            warmed.append(device)
+            ns.is_warmed_up = True
+
+        ns.warmup = _warmup
+        return ns
 
     monkeypatch.setattr("npu_proxy.inference.engine.get_available_devices", lambda: ["CPU", "NPU"])
     monkeypatch.setattr("npu_proxy.inference.engine.get_llm_engine", fake_get_llm_engine)
@@ -55,3 +69,22 @@ def test_startup_warmup_continues_after_device_failure(monkeypatch):
     _warmup_configured_devices(ProxyBootstrapConfig(real_inference=True, warmup_devices=("NPU", "CPU")))
 
     assert warmed == ["CPU"]
+
+
+def test_startup_warmup_logs_success_only_when_engine_reports_warmed(monkeypatch, caplog):
+    """A swallowed warmup failure must not be logged as a successfully warmed device."""
+
+    def fake_get_llm_engine(device: str):
+        # warmup() silently does nothing (mirrors engine.warmup swallowing failure);
+        # is_warmed_up stays False.
+        return SimpleNamespace(is_warmed_up=False, warmup=lambda: None)
+
+    monkeypatch.setattr("npu_proxy.inference.engine.get_available_devices", lambda: ["NPU"])
+    monkeypatch.setattr("npu_proxy.inference.engine.get_llm_engine", fake_get_llm_engine)
+
+    with caplog.at_level("INFO", logger="npu_proxy.main"):
+        _warmup_configured_devices(ProxyBootstrapConfig(real_inference=True, warmup_devices=("NPU",)))
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert not any("Warmed LLM engine on NPU" in message for message in messages)
+    assert any("Warmup did not complete for NPU" in message for message in messages)

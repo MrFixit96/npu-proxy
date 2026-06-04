@@ -160,3 +160,30 @@ def test_get_primary_loaded_engine_prefers_default_device(fake_engine, tmp_path,
 
     assert primary is npu_engine
     assert primary.requested_device == "NPU"
+
+
+def test_reset_engine_preserves_device_locks(fake_engine, tmp_path) -> None:
+    """All device locks are preserved across reset. Dropping a lock would race with
+    acquire_device_slot (which acquires the lock after releasing the pool lock), so a
+    forced reset must never replace a lock another thread may be about to acquire."""
+    import npu_proxy.inference.engine as engine_module
+    from npu_proxy.inference.engine import _device_lock_for_key
+
+    model_path = tmp_path / "model"
+    model_path.mkdir()
+    engine = get_llm_engine(model_path=model_path, device="CPU")
+    engine.active = True
+
+    pool_key = next(iter(engine_module._engine_pool.keys()))
+    held_lock = _device_lock_for_key(pool_key)
+    held_lock.acquire()
+    try:
+        reset_engine(force=True)
+        # The same held lock object is retained and still locked.
+        assert engine_module._device_locks.get(pool_key) is held_lock
+        assert held_lock.locked() is True
+    finally:
+        held_lock.release()
+
+    # Even now-unlocked locks are kept (same object), so an in-flight acquirer is safe.
+    assert engine_module._device_locks.get(pool_key) is held_lock

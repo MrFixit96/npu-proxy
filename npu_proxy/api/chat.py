@@ -874,33 +874,42 @@ async def chat_completions(request: ChatRequest, response: Response):
                         request_id=request_id,
                     )
                 raise
-            execution_device = _execution_device_from_engine(engine)
-            fallback_reason = _fallback_reason(
-                routed_device=routing.device,
-                execution_device=execution_device,
-                engine_slot=engine_slot,
-            )
-            _record_routing_execution(routing.device, execution_device, fallback_reason)
-            return StreamingResponse(
-                generate_stream_real(
-                    request,
-                    chat_id,
-                    created,
-                    prompt,
-                    mapped_options,
-                    request_id,
-                    prompt_tokens,
-                    engine=engine,
-                    engine_slot=engine_slot,
-                ),
-                media_type="text/event-stream",
-                headers=build_stream_headers(
-                    routing,
-                    request_id,
+            # The slot lock is now held. Anything between here and handing the
+            # slot to generate_stream_real (whose finally releases it) must
+            # release the slot on failure, otherwise the per-(model, device)
+            # lock leaks and that device returns 503 device_busy forever.
+            try:
+                execution_device = _execution_device_from_engine(engine)
+                fallback_reason = _fallback_reason(
+                    routed_device=routing.device,
                     execution_device=execution_device,
-                    fallback_reason=fallback_reason,
-                ),
-            )
+                    engine_slot=engine_slot,
+                )
+                _record_routing_execution(routing.device, execution_device, fallback_reason)
+                response = StreamingResponse(
+                    generate_stream_real(
+                        request,
+                        chat_id,
+                        created,
+                        prompt,
+                        mapped_options,
+                        request_id,
+                        prompt_tokens,
+                        engine=engine,
+                        engine_slot=engine_slot,
+                    ),
+                    media_type="text/event-stream",
+                    headers=build_stream_headers(
+                        routing,
+                        request_id,
+                        execution_device=execution_device,
+                        fallback_reason=fallback_reason,
+                    ),
+                )
+            except Exception:
+                await asyncio.to_thread(_close_engine_slot, engine_slot)
+                raise
+            return response
         execution_device = await asyncio.to_thread(_get_execution_device, load_if_needed=False)
         fallback_reason = _fallback_reason(routed_device=routing.device, execution_device=execution_device)
         _record_routing_execution(routing.device, execution_device, fallback_reason)

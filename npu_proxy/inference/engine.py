@@ -1436,13 +1436,18 @@ def get_engine_pool_snapshot() -> list[dict[str, object]]:
         try:
             device_info = dict(get_device_info()) if callable(get_device_info) else {}
         except Exception:
+            logger.warning(
+                "Failed to read device info for pooled engine on %s; reporting requested device",
+                requested_device,
+                exc_info=True,
+            )
             device_info = {}
         model = getattr(engine, "model_name", None) or Path(model_path).name
         actual_device = str(device_info.get("actual_device") or getattr(engine, "actual_device", requested_device))
         snapshot.append(
             {
                 "model": str(model),
-                "model_path": model_path,
+                "model_path": Path(model_path).name,
                 "device": actual_device,
                 "requested_device": requested_device,
                 "loaded": True,
@@ -1495,7 +1500,13 @@ def reset_engine(*, force: bool = False) -> None:
                 len(active_engines),
             )
         _engine_pool.clear()
-        _device_locks.clear()
+        # Preserve ALL device locks across reset. They serialize native inference
+        # per (model, device); dropping a lock here races with acquire_device_slot,
+        # which fetches the lock under _engine_lock but acquires it *after* releasing
+        # _engine_lock. An "unlocked" lock may therefore have a thread about to
+        # acquire it, so dropping it could let a fresh lock permit a second
+        # concurrent native inference. Unlocked locks left behind are harmless and
+        # the keyspace (model paths x devices) is finite.
         _loaded_models = {}
     for engine in engines_to_shutdown:
         engine.shutdown(wait=False)

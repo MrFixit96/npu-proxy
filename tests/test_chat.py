@@ -467,3 +467,44 @@ async def test_chat_real_engine_contract_expected_top_p_and_timeout_wiring(
     call = (fake_engine.generate_stream_calls if stream else fake_engine.generate_calls)[0]
     assert call["top_p"] == 0.55
     assert call["timeout"] == DEFAULT_INFERENCE_TIMEOUT
+
+
+@pytest.mark.asyncio
+async def test_chat_streaming_releases_slot_when_bookkeeping_fails(async_client, known_llm_model):
+    """Regression: if post-acquire bookkeeping raises in the streaming real path,
+    the acquired device slot must be released so the device lock is not leaked
+    (which would otherwise wedge the device into permanent 503 device_busy)."""
+    closed = {"count": 0}
+
+    class FakeSlot:
+        fallback_reason = None
+        selected_device = "NPU"
+        routed_device = "NPU"
+
+        def __exit__(self, *args):
+            closed["count"] += 1
+            return False
+
+    slot = FakeSlot()
+    engine = Mock()
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("metrics backend exploded")
+
+    with (
+        patch.dict("os.environ", {"NPU_PROXY_REAL_INFERENCE": "1"}),
+        patch("npu_proxy.api.chat._open_routed_engine_slot", return_value=(engine, slot)),
+        patch("npu_proxy.api.chat._execution_device_from_engine", return_value="NPU"),
+        patch("npu_proxy.api.chat._record_routing_execution", side_effect=boom),
+    ):
+        with pytest.raises(RuntimeError, match="metrics backend exploded"):
+            await async_client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": known_llm_model,
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "stream": True,
+                },
+            )
+
+    assert closed["count"] == 1, "device slot was not released after bookkeeping failure"
