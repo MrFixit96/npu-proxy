@@ -41,7 +41,7 @@ from fastapi.responses import JSONResponse
 from npu_proxy import __version__
 from npu_proxy.config import get_active_llm_runtime_config
 from npu_proxy.inference import embedding_config
-from npu_proxy.inference.devices import DEVICE_FALLBACK_CHAIN
+from npu_proxy.inference.devices import DEVICE_FALLBACK_CHAIN, device_class
 from npu_proxy.inference.embedding_engine import (
     DEFAULT_CACHE_SIZE,
     get_loaded_embedding_engine,
@@ -328,6 +328,15 @@ def get_loaded_models() -> dict[str, Any]:
     return _get_loaded_models()
 
 
+def get_primary_loaded_engine() -> Any:
+    """Return the default-device LLM engine, preferring it over recent fallbacks."""
+    from npu_proxy.inference.engine import (
+        get_primary_loaded_engine as _get_primary_loaded_engine,
+    )
+
+    return _get_primary_loaded_engine()
+
+
 def check_npu_available() -> tuple[bool, str | None]:
     """Check if an Intel NPU device is available via OpenVINO.
 
@@ -354,7 +363,8 @@ def check_gpu_available() -> tuple[bool, str | None]:
         Tuple of availability and a stable error code when probing fails.
     """
     try:
-        return "GPU" in get_ov_core().available_devices, None
+        classes = {device_class(d) for d in get_ov_core().available_devices}
+        return "GPU" in classes, None
     except Exception:
         logger.exception("GPU availability probe failed")
         return False, "device_probe_failed"
@@ -439,6 +449,17 @@ def _summarize_embedding_cache(engine_info: dict[str, Any]) -> EmbeddingCacheSum
     )
 
 
+def _get_device_pool_snapshot() -> list[dict[str, Any]]:
+    """Return loaded per-device LLM engine pool state without side effects."""
+    try:
+        from npu_proxy.inference.engine import get_engine_pool_snapshot
+
+        return get_engine_pool_snapshot()
+    except Exception:
+        logger.exception("Failed to inspect LLM device pool")
+        return []
+
+
 def _get_llm_engine_state() -> tuple[LLMEngineHealthState, dict[str, Any] | None]:
     """Collect additive LLM engine state while preserving legacy fields."""
     runtime_config = _get_llm_runtime_config()
@@ -487,11 +508,11 @@ def _get_llm_engine_state() -> tuple[LLMEngineHealthState, dict[str, Any] | None
         return LLMEngineHealthState.from_payload(state), device_info
 
     try:
-        loaded = get_loaded_models()
-        if not loaded:
+        engine = get_primary_loaded_engine()
+        if engine is None:
             return LLMEngineHealthState.from_payload(state), device_info
 
-        name, engine = next(iter(loaded.items()))
+        name = getattr(engine, "model_name", None)
         raw_device_info = engine.get_device_info() if hasattr(engine, "get_device_info") else {}
         device_info = dict(raw_device_info or {})
 
@@ -750,6 +771,7 @@ async def health() -> dict:
     """
     devices, device_error = _get_available_devices()
     llm_state, _ = _get_llm_engine_state()
+    device_pool = _get_device_pool_snapshot()
     embedding_state, _ = _get_embedding_engine_state()
     status, messages = _summarize_health(
         llm_state=llm_state,
@@ -763,12 +785,15 @@ async def health() -> dict:
             "llm": llm_state.to_dict(),
             "embedding": embedding_state.to_dict(),
         },
+        "runtime": {
+            "device_pool": device_pool,
+        },
         "messages": messages,
         "version": __version__,
         # Maintain backward compatibility
-        "npu_available": "NPU" in devices,
-        "gpu_available": "GPU" in devices,
-        "cpu_available": "CPU" in devices,
+        "npu_available": "NPU" in {device_class(d) for d in devices},
+        "gpu_available": "GPU" in {device_class(d) for d in devices},
+        "cpu_available": "CPU" in {device_class(d) for d in devices},
         "devices": devices,
         "openvino_version": _get_openvino_version(),
         "device_probe_error": device_error,
@@ -857,6 +882,7 @@ async def get_devices() -> dict:
 
     devices = get_available_devices()
     llm_state, device_info = _get_llm_engine_state()
+    device_pool = _get_device_pool_snapshot()
     embedding_state, embedding_device_info = _get_embedding_engine_state()
 
     return {
@@ -864,6 +890,7 @@ async def get_devices() -> dict:
         "active_device": llm_state.device,
         "device_info": device_info,
         "fallback_chain": DEVICE_FALLBACK_CHAIN,
+        "device_pool": device_pool,
         "active_backend": llm_state.backend,
         "llm": {
             "status": llm_state.status,

@@ -29,7 +29,8 @@ import logging
 import threading
 import concurrent.futures
 import time
-from dataclasses import replace
+from contextlib import contextmanager
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Iterator, Callable, Optional, Any, Literal
 
@@ -44,7 +45,13 @@ from npu_proxy.config import (
     normalize_compile_cache_mode,
     normalize_prefix_cache_mode,
 )
-from npu_proxy.inference.devices import DEVICE_FALLBACK_CHAIN, get_available_devices
+from npu_proxy.inference.devices import (
+    DEVICE_FALLBACK_CHAIN,
+    FallbackReason,
+    device_class,
+    get_available_devices,
+    normalize_device,
+)
 
 from npu_proxy.metrics import (
     record_error,
@@ -162,6 +169,18 @@ class InferenceTimeoutError(InferenceError, TimeoutError):
             status_code=504
         )
         self.timeout_seconds = timeout_seconds
+
+
+class DeviceBusyError(InferenceError):
+    """Raised when a routed device cannot accept work before queue timeout."""
+
+    def __init__(self, device: str) -> None:
+        super().__init__(
+            f"Device {device} is busy; retry shortly",
+            status_code=503,
+        )
+        self.device = device
+        self.reason = "device_busy"
 
 
 class DeviceError(InferenceError):
@@ -292,22 +311,25 @@ def select_best_device(preferred: Optional[str] = None) -> tuple[str | None, Opt
         while still supporting the standard fallback behavior.
     """
     available = get_available_devices()
+    available_classes = {device_class(d) for d in available if d}
     logger.info(f"Available devices: {available}")
     
     # If user specified a device, try to use it
     if preferred:
         preferred = preferred.upper()
-        if preferred in available:
+        preferred_is_chain_class = preferred in DEVICE_FALLBACK_CHAIN
+        # A bare class like "GPU" must match OpenVINO's enumerated "GPU.0"/"GPU.1".
+        if preferred in available or (preferred_is_chain_class and preferred in available_classes):
             # Find fallback from chain
             fallback: Optional[str] = None
-            if preferred in DEVICE_FALLBACK_CHAIN:
+            if preferred_is_chain_class:
                 chain_idx = DEVICE_FALLBACK_CHAIN.index(preferred)
                 for device in DEVICE_FALLBACK_CHAIN[chain_idx + 1:]:
-                    if device in available:
+                    if device in available_classes:
                         fallback = device
                         break
             return preferred, fallback
-        if preferred not in DEVICE_FALLBACK_CHAIN:
+        if not preferred_is_chain_class:
             logger.warning(
                 "Requested custom device %s is unavailable and has no fallback chain",
                 preferred,
@@ -320,12 +342,12 @@ def select_best_device(preferred: Optional[str] = None) -> tuple[str | None, Opt
     
     # Select best available from fallback chain
     for device in DEVICE_FALLBACK_CHAIN:
-        if device in available:
+        if device in available_classes:
             # Find fallback
             fallback = None
             chain_idx = DEVICE_FALLBACK_CHAIN.index(device)
             for fb_device in DEVICE_FALLBACK_CHAIN[chain_idx + 1:]:
-                if fb_device in available:
+                if fb_device in available_classes:
                     fallback = fb_device
                     break
             return device, fallback
@@ -1241,12 +1263,26 @@ class InferenceEngine:
 
 
 # =============================================================================
-# Global Engine Management (Singleton Pattern)
+# Global Engine Management (Per-Model/Device Pool)
 # =============================================================================
 
 
-# Global engine instances (singleton pattern with thread safety)
-_llm_engine: Optional[InferenceEngine] = None
+# Global engine instances (per-model/device pool with thread safety)
+@dataclass(frozen=True)
+class EnginePoolKey:
+    """Identity of a pooled engine: the resolved model path and its device.
+
+    Frozen so it can be used as a dict key. ``model_path`` is the resolved
+    absolute path and ``device`` is the canonical upper-cased device string,
+    so equivalent requests map to the same pooled engine and lock.
+    """
+
+    model_path: str
+    device: str
+
+
+_engine_pool: dict[EnginePoolKey, InferenceEngine] = {}
+_device_locks: dict[EnginePoolKey, threading.Lock] = {}
 _loaded_models: dict[str, InferenceEngine] = {}
 _engine_lock: threading.Lock = threading.Lock()
 
@@ -1284,12 +1320,239 @@ def _resolve_engine_runtime_config(
     return replace(base_config, **overrides) if overrides else base_config
 
 
+def _engine_pool_key(runtime_config: LLMRuntimeConfig) -> EnginePoolKey:
+    """Return the normalized model/device cache key for an engine config."""
+    return EnginePoolKey(
+        model_path=str(Path(runtime_config.model_path).resolve()),
+        device=normalize_device(runtime_config.device) or str(runtime_config.device).upper(),
+    )
+
+
+def _normalized_engine_config(
+    *,
+    config: LLMRuntimeConfig | None = None,
+    model_path: Optional[str | Path] = None,
+    device: Optional[str] = None,
+) -> LLMRuntimeConfig:
+    runtime_config = _resolve_engine_runtime_config(
+        config=config,
+        model_path=model_path,
+        device=device,
+    )
+    return replace(runtime_config, device=runtime_config.device.upper())
+
+
+def _device_lock_for_key(pool_key: EnginePoolKey) -> threading.Lock:
+    with _engine_lock:
+        lock = _device_locks.get(pool_key)
+        if lock is None:
+            lock = threading.Lock()
+            _device_locks[pool_key] = lock
+        return lock
+
+
+def _acquire_device_lock(
+    device: str,
+    *,
+    model_path: Optional[str | Path] = None,
+    config: LLMRuntimeConfig | None = None,
+    timeout: float,
+) -> tuple[str, threading.Lock]:
+    """Acquire the per-(model, device) lock, returning (selected_device, lock).
+
+    Raises ``DeviceBusyError`` if the lock is not acquired within ``timeout``.
+    The caller owns the returned lock and is responsible for releasing it.
+    """
+    runtime_config = _normalized_engine_config(
+        config=config,
+        model_path=model_path,
+        device=device,
+    )
+    pool_key = _engine_pool_key(runtime_config)
+    lock = _device_lock_for_key(pool_key)
+    acquired = lock.acquire(timeout=max(0.0, float(timeout)))
+    if not acquired:
+        raise DeviceBusyError(runtime_config.device)
+    return runtime_config.device, lock
+
+
+@contextmanager
+def acquire_device_slot(
+    device: str,
+    *,
+    model_path: Optional[str | Path] = None,
+    config: LLMRuntimeConfig | None = None,
+    timeout: float,
+):
+    """Acquire the per-(model, device) inference slot or raise DeviceBusyError."""
+    selected_device, lock = _acquire_device_lock(
+        device,
+        model_path=model_path,
+        config=config,
+        timeout=timeout,
+    )
+    try:
+        yield selected_device
+    finally:
+        lock.release()
+
+
+def fallback_devices_after(device: str) -> list[str]:
+    """Return available fallback devices after the requested device in priority order."""
+    normalized = device_class(device)
+    available = {device_class(candidate) for candidate in get_available_devices() if candidate}
+    try:
+        start_index = DEVICE_FALLBACK_CHAIN.index(normalized) + 1
+    except ValueError:
+        start_index = 0
+    return [
+        candidate
+        for candidate in DEVICE_FALLBACK_CHAIN[start_index:]
+        if candidate != normalized and candidate in available
+    ]
+
+
+def _slot_candidate_devices(device: str, *, fallback_on_busy: bool) -> list[str]:
+    normalized = str(device).strip().upper()
+    candidates = [normalized]
+    if fallback_on_busy:
+        candidates.extend(fallback_devices_after(normalized))
+    return candidates
+
+
+@dataclass
+class RoutedEngineSlot:
+    """A held inference slot describing the routed vs. selected device.
+
+    Replaces the previous "contextmanager plus ad-hoc setattr" approach with a
+    typed handle. Supports both explicit ``close()`` and the context-manager
+    protocol so callers can release the underlying device lock exactly once.
+    """
+
+    routed_device: str
+    selected_device: str
+    fallback_reason: str | None
+    lock: threading.Lock
+    _released: bool = field(default=False, init=False, repr=False)
+
+    def close(self) -> None:
+        if not self._released:
+            self._released = True
+            self.lock.release()
+
+    def __enter__(self) -> "RoutedEngineSlot":
+        return self
+
+    def __exit__(self, *exc_info: object) -> bool:
+        self.close()
+        return False
+
+
+def open_routed_engine_slot(
+    device: str,
+    *,
+    timeout: float,
+    fallback_on_busy: bool = False,
+    model_path: Optional[str | Path] = None,
+    config: LLMRuntimeConfig | None = None,
+    engine_factory: Optional[Callable[[str], InferenceEngine]] = None,
+) -> tuple[InferenceEngine, RoutedEngineSlot]:
+    """Acquire a device slot, optionally falling back on busy, and return its engine.
+
+    ``engine_factory`` lets callers (e.g. the chat API) supply a patchable engine
+    accessor while sharing the acquire/fallback/lock logic. It receives the
+    selected device and must return the engine to use. When omitted, the pooled
+    ``get_llm_engine`` is used.
+    """
+    requested = normalize_device(device) or str(device).strip().upper()
+    last_busy: DeviceBusyError | None = None
+    for candidate in _slot_candidate_devices(device, fallback_on_busy=fallback_on_busy):
+        try:
+            selected_device, lock = _acquire_device_lock(
+                candidate,
+                model_path=model_path,
+                config=config,
+                timeout=timeout,
+            )
+        except DeviceBusyError as exc:
+            last_busy = exc
+            if not fallback_on_busy:
+                raise
+            continue
+        try:
+            if engine_factory is not None:
+                engine = engine_factory(selected_device)
+            else:
+                engine = get_llm_engine(model_path=model_path, device=selected_device, config=config)
+        except Exception:
+            lock.release()
+            raise
+        slot = RoutedEngineSlot(
+            routed_device=requested,
+            selected_device=selected_device,
+            fallback_reason=(
+                FallbackReason.BUSY.value if selected_device != requested else None
+            ),
+            lock=lock,
+        )
+        return engine, slot
+
+    if last_busy is not None:
+        raise last_busy
+    raise DeviceBusyError(requested)
+
+
+def _unique_engines() -> list[InferenceEngine]:
+    """Return unique engines known to the pool and legacy loaded-model index."""
+    engines: list[InferenceEngine] = []
+    for engine in [*_engine_pool.values(), *_loaded_models.values()]:
+        if engine not in engines:
+            engines.append(engine)
+    return engines
+
+
+def get_engine_pool_snapshot() -> list[dict[str, object]]:
+    """Return a non-mutating snapshot of loaded engine pool state."""
+    with _engine_lock:
+        items = list(_engine_pool.items())
+
+    snapshot: list[dict[str, object]] = []
+    for pool_key, engine in items:
+        model_path = pool_key.model_path
+        requested_device = pool_key.device
+        lock = _device_lock_for_key(pool_key)
+        get_device_info = getattr(engine, "get_device_info", None)
+        try:
+            device_info = dict(get_device_info()) if callable(get_device_info) else {}
+        except Exception:
+            logger.warning(
+                "Failed to read device info for pooled engine on %s; reporting requested device",
+                requested_device,
+                exc_info=True,
+            )
+            device_info = {}
+        model = getattr(engine, "model_name", None) or Path(model_path).name
+        actual_device = str(device_info.get("actual_device") or getattr(engine, "actual_device", requested_device))
+        snapshot.append(
+            {
+                "model": str(model),
+                "model_path": Path(model_path).name,
+                "device": actual_device,
+                "requested_device": requested_device,
+                "loaded": True,
+                "warmed": bool(device_info.get("is_warmed_up", getattr(engine, "is_warmed_up", False))),
+                "busy": lock.locked(),
+            }
+        )
+    return snapshot
+
+
 def reset_engine(*, force: bool = False) -> None:
-    """Reset the global engine to allow reloading with different configuration.
+    """Reset all global engines to allow reloading with different configuration.
     
-    Clears the singleton instance and loaded models dictionary, allowing
-    the next call to get_llm_engine() to create a fresh engine with
-    potentially different device or model settings.
+    Clears the engine pool and loaded models dictionary, allowing the next
+    call to get_llm_engine() to create fresh engines with potentially
+    different device or model settings.
     
     This function is thread-safe.
     
@@ -1299,18 +1562,13 @@ def reset_engine(*, force: bool = False) -> None:
         >>> engine2 = get_llm_engine(device="CPU")  # New instance
     
     Warning:
-        Any references to the previous engine instance become stale. Active
+        Any references to previous engine instances become stale. Active
         inference prevents reset unless force=True is used. Forced reset is
         best-effort because already-running native calls cannot be killed.
     """
-    global _llm_engine, _loaded_models
-    engines_to_shutdown: list[InferenceEngine] = []
+    global _loaded_models
     with _engine_lock:
-        if _llm_engine is not None:
-            engines_to_shutdown.append(_llm_engine)
-        for engine in _loaded_models.values():
-            if engine not in engines_to_shutdown:
-                engines_to_shutdown.append(engine)
+        engines_to_shutdown = _unique_engines()
 
         active_engines = [
             engine
@@ -1330,7 +1588,14 @@ def reset_engine(*, force: bool = False) -> None:
                 "native work may continue until it returns",
                 len(active_engines),
             )
-        _llm_engine = None
+        _engine_pool.clear()
+        # Preserve ALL device locks across reset. They serialize native inference
+        # per (model, device); dropping a lock here races with acquire_device_slot,
+        # which fetches the lock under _engine_lock but acquires it *after* releasing
+        # _engine_lock. An "unlocked" lock may therefore have a thread about to
+        # acquire it, so dropping it could let a fresh lock permit a second
+        # concurrent native inference. Unlocked locks left behind are harmless and
+        # the keyspace (model paths x devices) is finite.
         _loaded_models = {}
     for engine in engines_to_shutdown:
         engine.shutdown(wait=False)
@@ -1346,43 +1611,12 @@ def get_llm_engine(
     prefix_cache_mode: Optional[str] = None,
     config: LLMRuntimeConfig | None = None,
 ) -> InferenceEngine:
-    """Get or create the singleton LLM inference engine instance.
+    """Get or create an LLM inference engine for a model/device pair.
     
-    Implements a thread-safe singleton pattern with double-checked locking.
-    The first call creates the engine; subsequent calls return the same
-    instance regardless of arguments.
-    
-    Args:
-        model_path: Path to the OpenVINO model directory. Defaults to
-            DEFAULT_MODEL_DIR/DEFAULT_LLM_MODEL. Only used on first call.
-        device: Target compute device. Defaults to NPU_PROXY_DEVICE env var
-            or "NPU". Only used on first call.
-    
-    Returns:
-        The singleton InferenceEngine instance.
-    
-    Raises:
-        ModelNotFoundError: If the model path does not exist.
-        DeviceError: If model loading fails on all devices.
-    
-    Example:
-        >>> # First call initializes the engine
-        >>> engine = get_llm_engine(device="NPU")
-        >>> engine.warmup()
-        >>> 
-        >>> # Subsequent calls return the same instance
-        >>> same_engine = get_llm_engine()
-        >>> assert engine is same_engine
-    
-    Thread Safety:
-        This function is thread-safe. Multiple threads can call it
-        concurrently, and all will receive the same engine instance.
-    
-    Note:
-        To change devices or models, call reset_engine() first.
+    Implements a thread-safe per-(model, device) pool with double-checked
+    locking. Calls for the same normalized model/device key return the same
+    instance; calls for different devices create independent engines.
     """
-    global _llm_engine
-    
     runtime_config = _resolve_engine_runtime_config(
         config=config,
         model_path=model_path,
@@ -1393,43 +1627,71 @@ def get_llm_engine(
         compile_cache_mode=compile_cache_mode,
         prefix_cache_mode=prefix_cache_mode,
     )
+    runtime_config = replace(runtime_config, device=runtime_config.device.upper())
+    pool_key = _engine_pool_key(runtime_config)
 
-    # Double-checked locking for thread safety
-    if _llm_engine is None:
-        with _engine_lock:
-            if _llm_engine is None:
-                if runtime_config.backend is not LLMBackend.OPENVINO:
-                    raise InferenceError(
-                        "Legacy engine path only supports the openvino backend; "
-                        "use npu_proxy.inference.llm_runtime.get_llm_runtime() "
-                        "for backend-neutral access.",
-                    )
-                if not runtime_config.model_path.exists():
-                    raise ModelNotFoundError(Path(runtime_config.model_path))
+    engine = _engine_pool.get(pool_key)
+    if engine is not None:
+        return engine
 
-                _llm_engine = InferenceEngine(
-                    runtime_config.model_path,
-                    runtime_config.device,
-                    inference_timeout=runtime_config.inference_timeout,
-                    max_prompt_len=runtime_config.max_prompt_len,
-                    compile_cache_dir=runtime_config.compile_cache_dir,
-                    compile_cache_mode=runtime_config.compile_cache_mode,
-                    prefix_cache_mode=runtime_config.prefix_cache_mode,
+    with _engine_lock:
+        engine = _engine_pool.get(pool_key)
+        if engine is None:
+            if runtime_config.backend is not LLMBackend.OPENVINO:
+                raise InferenceError(
+                    "Legacy engine path only supports the openvino backend; "
+                    "use npu_proxy.inference.llm_runtime.get_llm_runtime() "
+                    "for backend-neutral access.",
                 )
-                _loaded_models[_llm_engine.model_name] = _llm_engine
-    
-    return _llm_engine
+            if not runtime_config.model_path.exists():
+                raise ModelNotFoundError(Path(runtime_config.model_path))
+
+            engine = InferenceEngine(
+                runtime_config.model_path,
+                runtime_config.device,
+                inference_timeout=runtime_config.inference_timeout,
+                max_prompt_len=runtime_config.max_prompt_len,
+                compile_cache_dir=runtime_config.compile_cache_dir,
+                compile_cache_mode=runtime_config.compile_cache_mode,
+                prefix_cache_mode=runtime_config.prefix_cache_mode,
+            )
+            _engine_pool[pool_key] = engine
+            if pool_key not in _device_locks:
+                _device_locks[pool_key] = threading.Lock()
+            _loaded_models[engine.model_name] = engine
+
+    return engine
+
+
+def get_primary_loaded_engine() -> InferenceEngine | None:
+    """Return the default-device engine if loaded, else any loaded engine.
+
+    With the per-(model, device) pool a single model can have several engines
+    loaded at once. Observability surfaces need a stable "primary" engine that
+    reflects the configured/default device rather than whichever device served
+    the most recent request, so they don't misreport the active device after a
+    cross-device fallback.
+    """
+    runtime_config = get_active_llm_runtime_config()
+    default_key = _engine_pool_key(runtime_config)
+    with _engine_lock:
+        engine = _engine_pool.get(default_key)
+        if engine is None:
+            engine = next(iter(_engine_pool.values()), None)
+        if engine is None:
+            engine = next(iter(_loaded_models.values()), None)
+    return engine
 
 
 def get_llm_execution_target(*, load_if_needed: bool = False) -> dict[str, object]:
-    """Return the actual singleton execution target without inventing per-request routing."""
+    """Return the current/default LLM execution target."""
+    runtime_config = get_active_llm_runtime_config()
     if load_if_needed:
-        engine = get_llm_engine()
+        engine = get_llm_engine(config=runtime_config)
     else:
-        engine = _llm_engine
+        engine = get_primary_loaded_engine()
 
     if engine is None:
-        runtime_config = get_active_llm_runtime_config()
         return {
             "model": runtime_config.model_path.name,
             "device": runtime_config.device,
@@ -1450,7 +1712,15 @@ def get_llm_execution_target(*, load_if_needed: bool = False) -> dict[str, objec
 
 def get_loaded_models() -> dict[str, InferenceEngine]:
     """Get dictionary of all currently loaded model engines.
-    
+
+    .. note::
+        This is a legacy index keyed by model NAME only. With the
+        per-(model, device) engine pool a single model can have several
+        engines loaded at once (e.g. NPU and CPU), but this mapping retains
+        only the most recently loaded engine per model name. For complete
+        per-device state use :func:`get_engine_pool_snapshot`, and for the
+        primary/default-device engine use :func:`get_primary_loaded_engine`.
+
     Returns:
         Dictionary mapping model names to their InferenceEngine instances.
         Empty if no models have been loaded.
@@ -1482,4 +1752,5 @@ def is_model_loaded() -> bool:
         >>> is_model_loaded()
         True
     """
-    return _llm_engine is not None
+    with _engine_lock:
+        return bool(_engine_pool or _loaded_models)

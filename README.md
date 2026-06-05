@@ -24,28 +24,18 @@ This repository currently ships:
 - **Default LLM model path:** `~/.cache/npu-proxy/models/tinyllama-1.1b-chat-int4-ov`
 - **Host-header allow-list:** loopback and test clients by default (`localhost`, `127.0.0.1`, `::1`, `[::1]`, `testserver`, `test`)
 
-## Routing truth and roadmap
+## Routing truth
 
-There are two different ideas that are easy to blur together:
+Real inference now uses **per-request routing** for OpenAI and Ollama generation APIs. The context router classifies each prompt as `NPU`, `GPU`, or `CPU`, and the runtime acquires an engine for that routed device instead of silently reusing a single global engine.
 
-1. **Current routing classification** — the router can classify a request as better suited for `NPU`, `GPU`, or `CPU` based on prompt size.
-2. **Real per-request routing** — the runtime actually executes that request on the classified device.
+- `X-NPU-Proxy-Routed-Device` reports the router's choice.
+- `X-NPU-Proxy-Execution-Device` and the existing `X-NPU-Proxy-Device` report the device that actually executed.
+- `X-NPU-Proxy-Fallback-Reason` appears only when execution differs from the routed device.
+- Requests for the same `(model, device)` are serialized by default; busy devices return `503` unless explicit busy fallback is enabled.
+- `/health` exposes the LLM engine pool, and Prometheus metrics count routed-vs-executed device pairs.
+- Device matching is accelerator-aware: a `GPU` request resolves to OpenVINO's enumerated `GPU.0`/`GPU.1` instead of silently falling back to another device. Per-request routing is certified on real Intel hardware for `NPU`, `GPU`, and `CPU`.
 
-### Current release truth
-
-Today the service should be understood as **truthful single-engine execution**:
-
-- the router can still make an advisory choice
-- the API may report that choice for diagnostics
-- the real inference path still runs through the currently loaded engine/runtime state
-- the service should not promise that each request can switch devices independently
-
-In other words, the router is currently more like a **dispatcher recommendation** than an automatic train-track switch.
-
-### Roadmap
-
-- **Current release**: harden the current behavior so headers, health, and documentation describe what the runtime really does today
-- **Future release**: real per-request engine/device routing would need truthful execution binding, observability, certification, and concurrency rules
+Think of the router as a train switch now: short prompts can stay on the NPU track while long prompts can move to the configured fallback track.
 
 ## Release-truth snapshot for this docs pass
 
@@ -54,6 +44,7 @@ In other words, the router is currently more like a **dispatcher recommendation*
 - Host-header allow-listing, path hardening, and sanitized errors are implemented.
 - `/api/tags` is implemented and `/api/show` returns registry-backed model metadata.
 - OpenAI and Ollama generation responses now expose stop/length reasons.
+- Real generation requests route to per-device engine pools with truthful routing/execution headers.
 - Embedding inputs are validated before engine execution, with a batch limit of 128.
 
 ## Quick start
@@ -395,10 +386,13 @@ See:
 | `NPU_PROXY_ENABLE_ALPHA_BACKENDS` | `0` | Required for alpha backends |
 | `NPU_PROXY_LLAMACPP_MODEL_PATH` | unset | Local `.gguf` path for alpha `llama.cpp` backend |
 | `NPU_PROXY_ALLOWED_HOSTS` | loopback/test clients | Comma-separated Host-header allow-list |
-| `NPU_PROXY_PREFERRED_DEVICE` | `NPU` | Advisory context-router preference |
-| `NPU_PROXY_FALLBACK_DEVICE` | auto | Advisory context-router fallback override |
+| `NPU_PROXY_PREFERRED_DEVICE` | `NPU` | Context-router preference for short prompts |
+| `NPU_PROXY_FALLBACK_DEVICE` | auto | Context-router fallback override for long prompts |
+| `NPU_PROXY_DEVICE_QUEUE_TIMEOUT` | `30` | Seconds to wait for an in-use `(model, device)` slot |
+| `NPU_PROXY_FALLBACK_ON_BUSY` | `0` | Set `1` to try fallback devices when the routed device is busy |
+| `NPU_PROXY_WARMUP_DEVICES` | unset | Optional comma-separated startup warmup devices, e.g. `NPU,CPU` |
 
-Invalid `TOKEN_LIMIT`, `PREFERRED_DEVICE`, and `FALLBACK_DEVICE` values warn and fall back to defaults in request-time routing paths; explicit startup validation can still fail for invalid bootstrap settings.
+Invalid `TOKEN_LIMIT`, `PREFERRED_DEVICE`, `FALLBACK_DEVICE`, warmup device, busy fallback, and queue-timeout values warn and fall back to defaults in lazy runtime paths; explicit startup validation can still fail for invalid bootstrap settings.
 
 ### Other runtime environment variables
 
@@ -447,7 +441,7 @@ uvicorn npu_proxy.main:app --reload --host 127.0.0.1 --port 8080 --log-level deb
 - Real LLM inference needs a local OpenVINO model directory.
 - Mock mode is the default unless real inference is explicitly enabled.
 - OpenAI chat streaming and Ollama streaming use different wire formats.
-- Routing is advisory only in this release; per-request LLM device switching is not implemented.
+- Per-request LLM device routing is implemented: each generation executes on the device the context router classifies for it (`NPU`/`GPU`/`CPU`). The prompt-size classification is a heuristic threshold, not a guarantee of optimal placement.
 - Validated NPU embedding support is currently limited to the static-shape `all-minilm` path; `bge-small` still failed workstation validation on NPU.
 - The alpha GGUF backend is intentionally not documented as a packaged/default runtime path.
 - NPU Proxy is documented for native host deployment; this repo does not document containerized NPU serving.

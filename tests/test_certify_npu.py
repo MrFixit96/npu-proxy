@@ -162,12 +162,17 @@ def test_main_terminates_server_process_on_success(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(
         certify_npu,
         "collect_openvino_runtime_details",
-        lambda: {"npu_visible": True},
+        lambda: {"npu_visible": True, "available_devices": ["CPU", "NPU"]},
     )
     monkeypatch.setattr(certify_npu, "_get_certification_log_path", lambda repo_root, requested_device: log_path)
     monkeypatch.setattr(certify_npu, "_start_server", lambda **kwargs: (process, "http://127.0.0.1:9000", 0.5))
     monkeypatch.setattr(certify_npu.httpx, "Client", lambda *args, **kwargs: _FakeClient())
     monkeypatch.setattr(certify_npu, "_run_llm_workload", lambda client, args, log_path: ({"response": "ok"}, 1.2))
+    monkeypatch.setattr(
+        certify_npu,
+        "_run_routing_checks",
+        lambda client, args, log_path: {"short_headers": {}, "long_headers": {}, "fallback_device": "CPU"},
+    )
     monkeypatch.setattr(
         certify_npu,
         "_collect_observability_snapshots",
@@ -206,7 +211,7 @@ def test_main_kills_server_process_in_finally_after_failure(monkeypatch, tmp_pat
     monkeypatch.setattr(
         certify_npu,
         "collect_openvino_runtime_details",
-        lambda: {"npu_visible": True},
+        lambda: {"npu_visible": True, "available_devices": ["CPU", "NPU"]},
     )
     monkeypatch.setattr(certify_npu, "_get_certification_log_path", lambda repo_root, requested_device: log_path)
     monkeypatch.setattr(certify_npu, "_start_server", lambda **kwargs: (process, "http://127.0.0.1:9000", 0.5))

@@ -40,8 +40,7 @@ import uuid
 import asyncio
 import logging
 import os
-import threading
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator, Optional, Any
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, field_validator
@@ -59,20 +58,20 @@ from npu_proxy.api.header_utils import (
     validate_registered_model,
 )
 from npu_proxy.inference.streaming import FinishReason, determine_finish_reason, stream_engine_tokens
+from npu_proxy.inference import routing_service
 from npu_proxy.inference.tokenizer import count_tokens, count_tokens_best_effort
 from npu_proxy.models.ollama_defaults import merge_with_defaults
 from npu_proxy.models.parameter_mapper import map_parameters
 from npu_proxy.routing.context_router import get_context_router, RoutingResult
-from npu_proxy.config import DEFAULT_INFERENCE_TIMEOUT
+from npu_proxy.config import (
+    DEFAULT_INFERENCE_TIMEOUT,
+    load_device_queue_timeout,
+    load_fallback_on_busy,
+)
 from npu_proxy.metrics import record_routing_decision, record_tokens
 
 router = APIRouter(prefix="/v1", tags=["chat"])
 logger = logging.getLogger(__name__)
-
-# Lazy import to avoid loading model at import time
-_engine = None
-_engine_lock = threading.Lock()
-
 
 def generate_request_id() -> str:
     """Generate a unique request ID for tracking.
@@ -161,26 +160,53 @@ def create_error_response_from_http_exception(
     )
 
 
-def get_engine():
-    """Lazy load the singleton inference engine with synchronized initialization.
+def get_engine(device: str | None = None):
+    """Get an inference engine from the shared per-device engine pool."""
+    from npu_proxy.inference.engine import get_llm_engine
 
-    Defers importing and initializing the LLM engine until first use,
-    reducing startup time and memory usage when the engine isn't needed.
+    return get_llm_engine(device=device)
 
-    Returns:
-        The singleton LLMEngine instance configured for the current device.
 
-    Note:
-        The singleton's lazy initialization is protected by a lock. The engine
-        object itself may still have its own runtime threading constraints.
+def _open_routed_engine_slot(device: str) -> tuple[Any, Any]:
+    """Acquire the routed device slot and return its engine plus release handle.
+
+    Delegates to the shared engine slot logic while keeping ``chat.get_engine``
+    as the patchable engine accessor used by tests.
     """
-    global _engine
-    if _engine is None:
-        with _engine_lock:
-            if _engine is None:
-                from npu_proxy.inference.engine import get_llm_engine
-                _engine = get_llm_engine()
-    return _engine
+    from npu_proxy.inference.engine import open_routed_engine_slot
+
+    return open_routed_engine_slot(
+        device,
+        timeout=load_device_queue_timeout(),
+        fallback_on_busy=load_fallback_on_busy(),
+        engine_factory=lambda selected: get_engine(device=selected),
+    )
+
+
+def _close_engine_slot(slot: object) -> None:
+    routing_service.close_engine_slot(slot)
+
+
+def _fallback_reason(
+    *,
+    routed_device: str,
+    execution_device: str,
+    engine_slot: object | None = None,
+) -> str | None:
+    return routing_service.fallback_reason(
+        routed_device=routed_device,
+        execution_device=execution_device,
+        engine_slot=engine_slot,
+    )
+
+
+def _record_routing_execution(routed_device: str, execution_device: str, fallback_reason: str | None) -> None:
+    routing_service.record_routing_execution(routed_device, execution_device, fallback_reason)
+
+
+def _execution_device_from_engine(engine: Any) -> str:
+    """Return the actual device reported by an acquired engine."""
+    return routing_service.execution_device_from_engine(engine)
 
 
 def validate_model_exists(model: str) -> None:
@@ -208,6 +234,7 @@ def add_execution_headers(
     routing_result: RoutingResult,
     execution_device: str,
     request_id: Optional[str] = None,
+    fallback_reason: str | None = None,
 ) -> None:
     """Add truthful single-engine execution headers and request ID.
 
@@ -234,6 +261,8 @@ def add_execution_headers(
         response,
         routing_result.token_count,
         execution_device=execution_device,
+        routed_device=routing_result.device,
+        fallback_reason=fallback_reason,
         request_id=request_id,
     )
 
@@ -484,12 +513,15 @@ def build_stream_headers(
     request_id: str,
     *,
     execution_device: str,
+    fallback_reason: str | None = None,
 ) -> dict[str, str]:
     """Build streaming response headers for truthful single-engine reporting."""
 
     return build_single_engine_execution_headers(
         routing.token_count,
         execution_device=execution_device,
+        routed_device=routing.device,
+        fallback_reason=fallback_reason,
         request_id=request_id,
     )
 
@@ -540,6 +572,8 @@ async def generate_stream_real(
     mapped_options: dict | None = None,
     request_id: str | None = None,
     prompt_tokens: int = 0,
+    engine: Any | None = None,
+    engine_slot: object | None = None,
 ) -> AsyncIterator[str]:
     """Generate streaming response with real-time token streaming.
 
@@ -574,8 +608,10 @@ async def generate_stream_real(
 
         stream_error_message: str | None = None
         try:
+            if engine is None:
+                engine = get_engine()
             async for token in stream_engine_tokens(
-                engine_factory=get_engine,
+                engine_factory=lambda: engine,
                 prompt=prompt,
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
@@ -625,6 +661,8 @@ async def generate_stream_real(
         yield f"data: {orjson.dumps(final_chunk.model_dump()).decode()}\n\n"
         yield "data: [DONE]\n\n"
     finally:
+        if engine_slot is not None:
+            await asyncio.to_thread(_close_engine_slot, engine_slot)
         completion_tokens = count_tokens_best_effort(
             "".join(emitted_tokens), model=request.model
         ).count
@@ -789,27 +827,63 @@ async def chat_completions(request: ChatRequest, response: Response):
     mapped_options = map_parameters(full_options)
 
     if request.stream:
-        execution_device = await asyncio.to_thread(
-            _get_execution_device, load_if_needed=use_real_inference
-        )
+        engine = None
         if use_real_inference:
-            return StreamingResponse(
-                generate_stream_real(
-                    request,
-                    chat_id,
-                    created,
-                    prompt,
-                    mapped_options,
-                    request_id,
-                    prompt_tokens,
-                ),
-                media_type="text/event-stream",
-                headers=build_stream_headers(
-                    routing,
-                    request_id,
+            try:
+                engine, engine_slot = await asyncio.to_thread(
+                    lambda: _open_routed_engine_slot(routing.device)
+                )
+            except Exception as exc:
+                from npu_proxy.inference.engine import DeviceBusyError
+
+                if isinstance(exc, DeviceBusyError):
+                    return create_error_response(
+                        status_code=503,
+                        message=str(exc),
+                        error_type="server_error",
+                        code="device_busy",
+                        request_id=request_id,
+                    )
+                raise
+            # The slot lock is now held. Anything between here and handing the
+            # slot to generate_stream_real (whose finally releases it) must
+            # release the slot on failure, otherwise the per-(model, device)
+            # lock leaks and that device returns 503 device_busy forever.
+            try:
+                execution_device = _execution_device_from_engine(engine)
+                fallback_reason = _fallback_reason(
+                    routed_device=routing.device,
                     execution_device=execution_device,
-                ),
-            )
+                    engine_slot=engine_slot,
+                )
+                _record_routing_execution(routing.device, execution_device, fallback_reason)
+                response = StreamingResponse(
+                    generate_stream_real(
+                        request,
+                        chat_id,
+                        created,
+                        prompt,
+                        mapped_options,
+                        request_id,
+                        prompt_tokens,
+                        engine=engine,
+                        engine_slot=engine_slot,
+                    ),
+                    media_type="text/event-stream",
+                    headers=build_stream_headers(
+                        routing,
+                        request_id,
+                        execution_device=execution_device,
+                        fallback_reason=fallback_reason,
+                    ),
+                )
+            except Exception:
+                await asyncio.to_thread(_close_engine_slot, engine_slot)
+                raise
+            return response
+        execution_device = await asyncio.to_thread(_get_execution_device, load_if_needed=False)
+        fallback_reason = _fallback_reason(routed_device=routing.device, execution_device=execution_device)
+        _record_routing_execution(routing.device, execution_device, fallback_reason)
         return StreamingResponse(
             generate_stream(request, chat_id, created, prompt_tokens),
             media_type="text/event-stream",
@@ -817,32 +891,45 @@ async def chat_completions(request: ChatRequest, response: Response):
                 routing,
                 request_id,
                 execution_device=execution_device,
+                fallback_reason=fallback_reason,
             ),
         )
 
     # Non-streaming response
     if use_real_inference:
         try:
-            engine = await asyncio.to_thread(get_engine)
-            execution_device = await asyncio.to_thread(
-                _get_execution_device, load_if_needed=False
+            def run_generation():
+                engine, engine_slot = _open_routed_engine_slot(routing.device)
+                try:
+                    text = engine.generate(
+                        prompt,
+                        max_new_tokens=mapped_options.get("max_new_tokens", request.max_tokens),
+                        temperature=mapped_options.get("temperature", request.temperature),
+                        top_p=_effective_top_p(mapped_options, request.top_p),
+                        timeout=float(DEFAULT_INFERENCE_TIMEOUT),
+                    )
+                    return engine, text, getattr(engine_slot, "fallback_reason", None)
+                finally:
+                    _close_engine_slot(engine_slot)
+
+            engine, response_text, slot_fallback_reason = await asyncio.wait_for(
+                asyncio.to_thread(run_generation),
+                timeout=float(DEFAULT_INFERENCE_TIMEOUT) + load_device_queue_timeout(),
             )
+            execution_device = _execution_device_from_engine(engine)
+            fallback_reason = _fallback_reason(
+                routed_device=routing.device,
+                execution_device=execution_device,
+                engine_slot=None,
+            )
+            fallback_reason = slot_fallback_reason or fallback_reason
+            _record_routing_execution(routing.device, execution_device, fallback_reason)
             add_execution_headers(
                 response,
                 routing,
                 execution_device,
                 request_id,
-            )
-            response_text = await asyncio.wait_for(
-                asyncio.to_thread(
-                    engine.generate,
-                    prompt,
-                    max_new_tokens=mapped_options.get("max_new_tokens", request.max_tokens),
-                    temperature=mapped_options.get("temperature", request.temperature),
-                    top_p=_effective_top_p(mapped_options, request.top_p),
-                    timeout=float(DEFAULT_INFERENCE_TIMEOUT),
-                ),
-                timeout=float(DEFAULT_INFERENCE_TIMEOUT),
+                fallback_reason,
             )
         except (TimeoutError, asyncio.TimeoutError):
             logger.exception("Inference timed out", extra={"request_id": request_id})
@@ -862,7 +949,17 @@ async def chat_completions(request: ChatRequest, response: Response):
                 code="inference_error",
                 request_id=request_id,
             )
-        except Exception:
+        except Exception as exc:
+            from npu_proxy.inference.engine import DeviceBusyError
+
+            if isinstance(exc, DeviceBusyError):
+                return create_error_response(
+                    status_code=503,
+                    message=str(exc),
+                    error_type="server_error",
+                    code="device_busy",
+                    request_id=request_id,
+                )
             logger.exception("Unexpected inference error", extra={"request_id": request_id})
             return create_error_response(
                 status_code=500,
@@ -872,11 +969,15 @@ async def chat_completions(request: ChatRequest, response: Response):
                 request_id=request_id,
             )
     else:
+        execution_device = await asyncio.to_thread(_get_execution_device, load_if_needed=False)
+        fallback_reason = _fallback_reason(routed_device=routing.device, execution_device=execution_device)
+        _record_routing_execution(routing.device, execution_device, fallback_reason)
         add_execution_headers(
             response,
             routing,
-            await asyncio.to_thread(_get_execution_device, load_if_needed=False),
+            execution_device,
             request_id,
+            fallback_reason,
         )
         response_text, finish_reason = _mock_completion_text(
             "Hello! I'm a helpful AI assistant running on Intel NPU via OpenVINO.",

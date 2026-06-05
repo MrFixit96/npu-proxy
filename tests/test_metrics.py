@@ -203,6 +203,60 @@ class TestMetricsInfrastructure:
         assert sample(registry, "npu_proxy_errors_total", {"endpoint": "/v1/chat", "error_type": "timeout"}) == 1.0
         assert sample(registry, "npu_proxy_errors_total", {"endpoint": "/v1/chat", "error_type": "other"}) == 1.0
 
+    def test_routing_execution_metrics_use_bounded_labels(self, isolated_metrics_module):
+        """Routed-vs-execution metrics keep device and reason cardinality bounded."""
+        metrics, registry = isolated_metrics_module
+
+        metrics.record_routing_execution("NPU", "CPU", "busy")
+        metrics.record_routing_execution("ASIC", "TPU", "surprise")
+
+        assert sample(
+            registry,
+            "npu_proxy_routing_executions_total",
+            {"routed_device": "npu", "execution_device": "cpu", "fallback_reason": "busy"},
+        ) == 1.0
+        assert sample(
+            registry,
+            "npu_proxy_routing_executions_total",
+            {"routed_device": "unknown", "execution_device": "unknown", "fallback_reason": "other"},
+        ) == 1.0
+
+    def test_routing_execution_collapses_multi_instance_gpu_labels(self, isolated_metrics_module):
+        """Discrete GPUs (GPU.0/GPU.1) collapse to 'gpu' instead of 'unknown'."""
+        metrics, registry = isolated_metrics_module
+
+        metrics.record_routing_execution("GPU.0", "GPU.1", "device_fallback")
+
+        assert sample(
+            registry,
+            "npu_proxy_routing_executions_total",
+            {"routed_device": "gpu", "execution_device": "gpu", "fallback_reason": "device_fallback"},
+        ) == 1.0
+
+    def test_record_inference_collapses_multi_instance_gpu_label(self, isolated_metrics_module):
+        """Per-inference counters collapse GPU.1 to 'gpu', not 'unknown'."""
+        metrics, registry = isolated_metrics_module
+
+        metrics.record_inference("tinyllama", "GPU.1", "chat", 1.0)
+
+        assert sample(
+            registry,
+            "npu_proxy_inference_total",
+            {"model": "tinyllama", "device": "gpu", "type": "chat"},
+        ) == 1.0
+
+    def test_record_tokens_per_second_collapses_multi_instance_gpu_label(self, isolated_metrics_module):
+        """Tokens/sec gauge collapses GPU.0 to 'gpu', not 'unknown'."""
+        metrics, registry = isolated_metrics_module
+
+        metrics.record_tokens_per_second("tinyllama", "GPU.0", 42.0)
+
+        assert sample(
+            registry,
+            "npu_proxy_tokens_per_second",
+            {"model": "tinyllama", "device": "gpu"},
+        ) == 42.0
+
     def test_track_request_context_manager_success(self, isolated_metrics_module, monkeypatch):
         """Successful request contexts decrement in-progress and record latency."""
         metrics, registry = isolated_metrics_module

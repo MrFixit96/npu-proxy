@@ -333,7 +333,7 @@ Current response includes:
 - Real inference requires local model directories to exist first
 - Mock mode is the default
 - OpenAI streaming and Ollama streaming use different wire formats
-- Routing is advisory only in this release; per-request LLM device switching is not implemented
+- Per-request LLM device routing is implemented: each generation executes on the device the context router classifies for it (`NPU`/`GPU`/`CPU`). The prompt-size classification is a heuristic threshold, not a guarantee of optimal placement.
 - The repository contains packaging assets and manifests, but this spec only claims what exists in-tree
 
 ## Related docs

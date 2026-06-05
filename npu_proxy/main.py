@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
+from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator
+
 from fastapi import FastAPI, Request
 from starlette.responses import PlainTextResponse
 
@@ -14,6 +19,8 @@ from npu_proxy.config import (
     normalize_allowed_hosts,
     validate_port,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _split_host_header(value: str) -> tuple[str, int | None]:
@@ -62,6 +69,33 @@ def _host_header_allowed(host_header: str, config: ProxyBootstrapConfig) -> bool
     return (host, port) in _allowed_host_entries(config)
 
 
+def _warmup_configured_devices(config: ProxyBootstrapConfig) -> None:
+    """Optionally warm startup LLM engines for configured available devices."""
+    if not config.real_inference or not config.warmup_devices:
+        return
+
+    from npu_proxy.inference.engine import get_available_devices, get_llm_engine
+    from npu_proxy.inference.devices import device_class
+
+    available = {device_class(d) for d in get_available_devices() if d}
+    for device in config.warmup_devices:
+        if device_class(device) not in available:
+            logger.warning("Skipping %s warmup because the device is not available", device)
+            continue
+        try:
+            engine = get_llm_engine(device=device)
+            engine.warmup()
+            if engine.is_warmed_up:
+                logger.info("Warmed LLM engine on %s", device)
+            else:
+                logger.warning(
+                    "Warmup did not complete for %s; the device will compile on first request",
+                    device,
+                )
+        except Exception:
+            logger.exception("Failed to warm LLM engine on %s; continuing startup", device)
+
+
 def bootstrap_runtime(
     config: ProxyBootstrapConfig | None = None,
 ) -> ProxyBootstrapConfig:
@@ -80,10 +114,16 @@ def create_app(config: ProxyBootstrapConfig | None = None) -> FastAPI:
     """Create the FastAPI application with an authoritative bootstrap config."""
     resolved = activate_proxy_bootstrap_config(config or load_proxy_bootstrap_config())
 
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        await asyncio.to_thread(_warmup_configured_devices, resolved)
+        yield
+
     application = FastAPI(
         title="NPU Proxy",
         description="Ollama-compatible API proxy for Intel NPU inference via OpenVINO",
         version=__version__,
+        lifespan=lifespan,
     )
     application.state.proxy_config = resolved
 

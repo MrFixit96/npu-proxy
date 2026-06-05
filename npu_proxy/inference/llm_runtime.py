@@ -145,7 +145,9 @@ class LLMRuntime:
 
 
 
-def get_llm_runtime(config: LLMRuntimeConfig | None = None) -> LLMRuntime:
+def get_llm_runtime(
+    config: LLMRuntimeConfig | None = None,
+) -> LLMRuntime:
     """Get or create the singleton LLM runtime instance."""
     global _llm_runtime
 
@@ -159,7 +161,7 @@ def get_llm_runtime(config: LLMRuntimeConfig | None = None) -> LLMRuntime:
 
 
 def reset_llm_runtime() -> None:
-    """Reset the singleton LLM runtime instance and close its backend."""
+    """Reset the singleton LLM runtime instance."""
     global _llm_runtime
     with _runtime_lock:
         runtime = _llm_runtime

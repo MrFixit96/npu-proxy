@@ -92,6 +92,8 @@ def _start_server(
 ) -> tuple[subprocess.Popen, str, float]:
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
+    env.setdefault("NPU_PROXY_FALLBACK_DEVICE", "CPU")
+    env.setdefault("NPU_PROXY_WARMUP_DEVICES", requested_device)
 
     attempts = 1 if port is not None else 5
     last_error: Exception | None = None
@@ -161,6 +163,14 @@ def _collect_observability_snapshots(
     return health_response.json(), devices_response.json()
 
 
+def _response_routing_headers(response: httpx.Response) -> dict[str, str]:
+    return {
+        "X-NPU-Proxy-Routed-Device": response.headers.get("X-NPU-Proxy-Routed-Device", ""),
+        "X-NPU-Proxy-Execution-Device": response.headers.get("X-NPU-Proxy-Execution-Device", ""),
+        "X-NPU-Proxy-Fallback-Reason": response.headers.get("X-NPU-Proxy-Fallback-Reason", ""),
+    }
+
+
 def _run_llm_workload(
     client: httpx.Client,
     args: argparse.Namespace,
@@ -185,6 +195,41 @@ def _run_llm_workload(
         )
 
     return generate_response.json(), inference_seconds
+
+
+def _run_routing_checks(
+    client: httpx.Client,
+    args: argparse.Namespace,
+    log_path: Path,
+) -> dict[str, object]:
+    short_response = client.post(
+        "/api/generate",
+        json={"model": args.model, "prompt": "Reply with OK.", "stream": False},
+    )
+    if short_response.status_code != 200:
+        raise RuntimeError(
+            f"Short routing check failed with {short_response.status_code}.\n"
+            f"Body: {short_response.text}\n"
+            f"Server log:\n{_tail_log(log_path)}"
+        )
+
+    long_prompt = " ".join(["routing-certification"] * 2000)
+    long_response = client.post(
+        "/api/generate",
+        json={"model": args.model, "prompt": long_prompt, "stream": False},
+    )
+    if long_response.status_code != 200:
+        raise RuntimeError(
+            f"Long routing check failed with {long_response.status_code}.\n"
+            f"Body: {long_response.text}\n"
+            f"Server log:\n{_tail_log(log_path)}"
+        )
+
+    return {
+        "short_headers": _response_routing_headers(short_response),
+        "long_headers": _response_routing_headers(long_response),
+        "fallback_device": os.environ.get("NPU_PROXY_FALLBACK_DEVICE", "CPU"),
+    }
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -235,8 +280,15 @@ def main() -> int:
     runtime_details = collect_openvino_runtime_details()
     log_path = _get_certification_log_path(repo_root, args.device)
 
-    if not runtime_details["npu_visible"]:
-        print("Certification failed: OpenVINO does not see an NPU on this host.", file=sys.stderr)
+    from npu_proxy.inference.devices import device_class
+
+    requested_class = device_class(args.device)
+    available_classes = {device_class(d) for d in runtime_details.get("available_devices", [])}
+    if requested_class in {"NPU", "GPU", "CPU"} and requested_class not in available_classes:
+        print(
+            f"Certification failed: OpenVINO does not see a {requested_class} device on this host.",
+            file=sys.stderr,
+        )
         return 1
 
     if not model_path.exists():
@@ -263,6 +315,7 @@ def main() -> int:
                 raise RuntimeError(f"Unexpected /health response before certification: {pre_health.status_code}")
 
             generate_data, inference_seconds = _run_llm_workload(client, args, log_path)
+            routing_data = _run_routing_checks(client, args, log_path)
             health_data, devices_data = _collect_observability_snapshots(client, log_path)
 
         report = evaluate_hardware_certification(
@@ -274,6 +327,7 @@ def main() -> int:
             model=args.model,
             startup_seconds=startup_seconds,
             inference_seconds=inference_seconds,
+            routing_data=routing_data,
         )
 
         if args.output:
