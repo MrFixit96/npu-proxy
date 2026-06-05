@@ -103,8 +103,11 @@ Cancellation is cooperative, or a **soft cancel**. If a client disconnects or th
 Streaming chat/generate responses can include:
 
 - `X-Request-ID`
-- `X-NPU-Proxy-Device` - the actual configured/loaded single-engine runtime device
-- `X-NPU-Proxy-Route-Reason` - currently `single_engine_runtime` because per-request routing is advisory in this release
+- `X-NPU-Proxy-Device` - the device that actually executed the request (kept for backward compatibility; equals the execution device)
+- `X-NPU-Proxy-Routed-Device` - the device the context router classified the request for
+- `X-NPU-Proxy-Execution-Device` - the device the request actually executed on
+- `X-NPU-Proxy-Fallback-Reason` - present only when the execution device differs from the routed device (e.g. `busy`, `device_fallback`)
+- `X-NPU-Proxy-Route-Reason` - routing provenance marker (`single_engine_runtime`)
 - `X-NPU-Proxy-Token-Count`
 
 ## Practical guidance

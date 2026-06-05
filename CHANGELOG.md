@@ -4,7 +4,13 @@ All notable changes to NPU Proxy are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] - 2026-06-05
+
+This release makes context routing real: each OpenAI/Ollama generation request now
+executes on the device the router classifies for it (`NPU`/`GPU`/`CPU`) via lazy
+per-`(model, device)` engine pools, with truthful routed/execution/fallback
+observability. Per-request routing is certified on real Intel hardware for NPU, GPU,
+and CPU. NPU Proxy remains a single-user local-workstation tool, not a shared gateway.
 
 ### Added
 
@@ -28,6 +34,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - `/health` and `/health/devices` now report the default/preferred-device engine as the active device instead of whichever device served the most recent request. Previously, after a long prompt fell back to CPU, the legacy single-active-device fields misreported CPU even though NPU remained the routed default and continued serving short prompts. The additive `device_pool` snapshot remains the source of truth for all loaded per-device engines.
 - Routing observability no longer reports a `device_fallback` reason when the engine cannot resolve its actual execution device (an unresolved device is not evidence of a deliberate fallback). An explicit busy fallback recorded on the acquired slot is still reported truthfully even when the execution device is unknown.
 - Fixed GPU routing being silently redirected to NPU. OpenVINO enumerates accelerators as `GPU.0`/`GPU.1`, but device-availability checks compared the bare class `GPU` against that enumerated list, decided `GPU` was unavailable, and quietly selected the next device in the fallback chain (`NPU`) with `used_fallback=False` — so a request routed to `GPU` actually executed on `NPU` while the headers and `/health` claimed otherwise. Device matching is now class-aware (`GPU` matches `GPU.0`/`GPU.1`) in engine selection (`select_best_device`, `fallback_devices_after`), advisory routing (`get_fallback_device`), startup warmup, and `/health` GPU/NPU availability. The live hardware certification (`scripts/certify_npu.py`) now certifies against the requested device, so `--device GPU` and `--device CPU` runs are validated in addition to `--device NPU`.
+- Per-inference Prometheus series (`npu_proxy_inference_total`, `npu_proxy_inference_latency_seconds`, `npu_proxy_tokens_per_second`) now collapse enumerated accelerator identifiers (`GPU.0`/`GPU.1`) to their device class, matching the routing series; an explicit discrete-GPU run is no longer recorded as `device="unknown"`.
+- `fallback_devices_after()` now resolves the chain position by device class, so a busy suffixed device (e.g. `GPU.1`) descends the priority chain (to `CPU`) instead of incorrectly offering a higher-priority device (`NPU`) as a fallback.
 
 ### Security
 
@@ -144,7 +152,8 @@ adding multi-tenant features.
 - Prometheus metrics and request tracing headers.
 - Initial Windows and Linux packaging assets.
 
-[Unreleased]: https://github.com/MrFixit96/npu-proxy/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/MrFixit96/npu-proxy/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/MrFixit96/npu-proxy/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/MrFixit96/npu-proxy/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/MrFixit96/npu-proxy/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/MrFixit96/npu-proxy/releases/tag/v0.1.0

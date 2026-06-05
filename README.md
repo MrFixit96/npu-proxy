@@ -33,6 +33,7 @@ Real inference now uses **per-request routing** for OpenAI and Ollama generation
 - `X-NPU-Proxy-Fallback-Reason` appears only when execution differs from the routed device.
 - Requests for the same `(model, device)` are serialized by default; busy devices return `503` unless explicit busy fallback is enabled.
 - `/health` exposes the LLM engine pool, and Prometheus metrics count routed-vs-executed device pairs.
+- Device matching is accelerator-aware: a `GPU` request resolves to OpenVINO's enumerated `GPU.0`/`GPU.1` instead of silently falling back to another device. Per-request routing is certified on real Intel hardware for `NPU`, `GPU`, and `CPU`.
 
 Think of the router as a train switch now: short prompts can stay on the NPU track while long prompts can move to the configured fallback track.
 
@@ -440,7 +441,7 @@ uvicorn npu_proxy.main:app --reload --host 127.0.0.1 --port 8080 --log-level deb
 - Real LLM inference needs a local OpenVINO model directory.
 - Mock mode is the default unless real inference is explicitly enabled.
 - OpenAI chat streaming and Ollama streaming use different wire formats.
-- Routing is advisory only in this release; per-request LLM device switching is not implemented.
+- Per-request LLM device routing is implemented: each generation executes on the device the context router classifies for it (`NPU`/`GPU`/`CPU`). The prompt-size classification is a heuristic threshold, not a guarantee of optimal placement.
 - Validated NPU embedding support is currently limited to the static-shape `all-minilm` path; `bge-small` still failed workstation validation on NPU.
 - The alpha GGUF backend is intentionally not documented as a packaged/default runtime path.
 - NPU Proxy is documented for native host deployment; this repo does not document containerized NPU serving.

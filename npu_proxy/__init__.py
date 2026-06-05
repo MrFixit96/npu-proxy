@@ -8,7 +8,7 @@ def _detect_version() -> str:
     try:
         return version("npu-proxy")
     except PackageNotFoundError:
-        return "0.2.0"
+        return "0.3.0"
 
 
 __version__ = _detect_version()
