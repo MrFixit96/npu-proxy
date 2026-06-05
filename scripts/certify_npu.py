@@ -280,8 +280,15 @@ def main() -> int:
     runtime_details = collect_openvino_runtime_details()
     log_path = _get_certification_log_path(repo_root, args.device)
 
-    if not runtime_details["npu_visible"]:
-        print("Certification failed: OpenVINO does not see an NPU on this host.", file=sys.stderr)
+    from npu_proxy.inference.devices import device_class
+
+    requested_class = device_class(args.device)
+    available_classes = {device_class(d) for d in runtime_details.get("available_devices", [])}
+    if requested_class in {"NPU", "GPU", "CPU"} and requested_class not in available_classes:
+        print(
+            f"Certification failed: OpenVINO does not see a {requested_class} device on this host.",
+            file=sys.stderr,
+        )
         return 1
 
     if not model_path.exists():

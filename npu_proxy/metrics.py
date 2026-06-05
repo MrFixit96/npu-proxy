@@ -407,13 +407,17 @@ def record_inference(model: str, device: str, inference_type: str, latency: floa
     if INFERENCE_COUNT:
         INFERENCE_COUNT.labels(
             model=_short_label(model),
-            device=_bounded_label(device, allowed=_ALLOWED_DEVICES, default="unknown"),
+            device=_bounded_label(
+                _normalize_device_label(device), allowed=_ALLOWED_DEVICES, default="unknown"
+            ),
             type=_bounded_label(inference_type, allowed=_ALLOWED_INFERENCE_TYPES),
         ).inc()
     if INFERENCE_LATENCY:
         INFERENCE_LATENCY.labels(
             model=_short_label(model),
-            device=_bounded_label(device, allowed=_ALLOWED_DEVICES, default="unknown"),
+            device=_bounded_label(
+                _normalize_device_label(device), allowed=_ALLOWED_DEVICES, default="unknown"
+            ),
         ).observe(latency)
 
 
@@ -516,7 +520,9 @@ def record_tokens_per_second(model: str, device: str, tokens_per_sec: float) -> 
     if PROMETHEUS_AVAILABLE and TOKENS_PER_SECOND:
         TOKENS_PER_SECOND.labels(
             model=_short_label(model),
-            device=_bounded_label(device, allowed=_ALLOWED_DEVICES, default="unknown"),
+            device=_bounded_label(
+                _normalize_device_label(device), allowed=_ALLOWED_DEVICES, default="unknown"
+            ),
         ).set(tokens_per_sec)
 
 

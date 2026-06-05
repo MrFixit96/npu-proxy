@@ -233,6 +233,30 @@ class TestMetricsInfrastructure:
             {"routed_device": "gpu", "execution_device": "gpu", "fallback_reason": "device_fallback"},
         ) == 1.0
 
+    def test_record_inference_collapses_multi_instance_gpu_label(self, isolated_metrics_module):
+        """Per-inference counters collapse GPU.1 to 'gpu', not 'unknown'."""
+        metrics, registry = isolated_metrics_module
+
+        metrics.record_inference("tinyllama", "GPU.1", "chat", 1.0)
+
+        assert sample(
+            registry,
+            "npu_proxy_inference_total",
+            {"model": "tinyllama", "device": "gpu", "type": "chat"},
+        ) == 1.0
+
+    def test_record_tokens_per_second_collapses_multi_instance_gpu_label(self, isolated_metrics_module):
+        """Tokens/sec gauge collapses GPU.0 to 'gpu', not 'unknown'."""
+        metrics, registry = isolated_metrics_module
+
+        metrics.record_tokens_per_second("tinyllama", "GPU.0", 42.0)
+
+        assert sample(
+            registry,
+            "npu_proxy_tokens_per_second",
+            {"model": "tinyllama", "device": "gpu"},
+        ) == 42.0
+
     def test_track_request_context_manager_success(self, isolated_metrics_module, monkeypatch):
         """Successful request contexts decrement in-progress and record latency."""
         metrics, registry = isolated_metrics_module

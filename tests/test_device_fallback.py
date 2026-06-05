@@ -157,6 +157,18 @@ def test_fallback_devices_after_matches_enumerated_gpu():
         assert fallback_devices_after("NPU") == ["GPU", "CPU"]
 
 
+def test_fallback_devices_after_suffixed_device_descends_chain():
+    """A suffixed routed device (GPU.1) must descend to CPU, never back up to NPU."""
+    from npu_proxy.inference.engine import fallback_devices_after
+
+    with patch(
+        "npu_proxy.inference.engine.get_available_devices",
+        return_value=["CPU", "GPU.0", "GPU.1", "NPU"],
+    ):
+        # Must not include NPU (higher priority) — only devices after GPU in the chain.
+        assert fallback_devices_after("GPU.1") == ["CPU"]
+
+
 @pytest.mark.asyncio
 async def test_health_devices_reports_advisory_fallback_runtime_state(monkeypatch, async_client):
     """Device health should report requested, actual, and fallback devices without rerouting requests."""

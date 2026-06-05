@@ -1399,7 +1399,7 @@ def acquire_device_slot(
 
 def fallback_devices_after(device: str) -> list[str]:
     """Return available fallback devices after the requested device in priority order."""
-    normalized = str(device).strip().upper()
+    normalized = device_class(device)
     available = {device_class(candidate) for candidate in get_available_devices() if candidate}
     try:
         start_index = DEVICE_FALLBACK_CHAIN.index(normalized) + 1

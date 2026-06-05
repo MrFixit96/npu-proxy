@@ -162,7 +162,7 @@ def test_main_terminates_server_process_on_success(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(
         certify_npu,
         "collect_openvino_runtime_details",
-        lambda: {"npu_visible": True},
+        lambda: {"npu_visible": True, "available_devices": ["CPU", "NPU"]},
     )
     monkeypatch.setattr(certify_npu, "_get_certification_log_path", lambda repo_root, requested_device: log_path)
     monkeypatch.setattr(certify_npu, "_start_server", lambda **kwargs: (process, "http://127.0.0.1:9000", 0.5))
@@ -211,7 +211,7 @@ def test_main_kills_server_process_in_finally_after_failure(monkeypatch, tmp_pat
     monkeypatch.setattr(
         certify_npu,
         "collect_openvino_runtime_details",
-        lambda: {"npu_visible": True},
+        lambda: {"npu_visible": True, "available_devices": ["CPU", "NPU"]},
     )
     monkeypatch.setattr(certify_npu, "_get_certification_log_path", lambda repo_root, requested_device: log_path)
     monkeypatch.setattr(certify_npu, "_start_server", lambda **kwargs: (process, "http://127.0.0.1:9000", 0.5))
