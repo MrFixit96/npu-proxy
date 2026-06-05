@@ -75,10 +75,11 @@ def _warmup_configured_devices(config: ProxyBootstrapConfig) -> None:
         return
 
     from npu_proxy.inference.engine import get_available_devices, get_llm_engine
+    from npu_proxy.inference.devices import device_class
 
-    available = {str(device).strip().upper() for device in get_available_devices() if device}
+    available = {device_class(d) for d in get_available_devices() if d}
     for device in config.warmup_devices:
-        if device not in available:
+        if device_class(device) not in available:
             logger.warning("Skipping %s warmup because the device is not available", device)
             continue
         try:

@@ -8,6 +8,10 @@ from typing import Any
 
 import openvino as ov
 
+from npu_proxy.inference.devices import device_class
+
+_PRIMARY_DEVICES = frozenset({"NPU", "GPU", "CPU"})
+
 
 def _coalesce(*values: Any) -> Any:
     """Return the first value that is not None."""
@@ -301,9 +305,15 @@ def evaluate_routing_certification(
     short_headers: dict[str, Any],
     long_headers: dict[str, Any],
     fallback_device: str,
-    npu_expected: bool,
+    expected_primary_device: str | None,
 ) -> tuple[dict[str, Any], list[str]]:
-    """Evaluate per-request routing headers captured from live certification calls."""
+    """Evaluate per-request routing headers captured from live certification calls.
+
+    ``expected_primary_device`` is the device class a short prompt is expected to
+    execute on (the requested/preferred device, e.g. ``NPU`` or ``GPU``). When
+    ``None`` (e.g. an ``AUTO`` run), the specific-device assertion is skipped but
+    routed/execution truthfulness is still enforced.
+    """
     expected_fallback = fallback_device.strip().upper()
     short_routed = _header_value(short_headers, "X-NPU-Proxy-Routed-Device")
     short_execution = _header_value(short_headers, "X-NPU-Proxy-Execution-Device")
@@ -318,8 +328,10 @@ def evaluate_routing_certification(
         failures.append(
             f"Short routing check routed to {short_routed!r} but executed on {short_execution!r}."
         )
-    elif npu_expected and short_execution != "NPU":
-        failures.append(f"Short routing check executed on {short_execution!r}, not 'NPU'.")
+    elif expected_primary_device and short_execution != expected_primary_device:
+        failures.append(
+            f"Short routing check executed on {short_execution!r}, not {expected_primary_device!r}."
+        )
 
     if not long_execution:
         failures.append("Long routing check did not return an execution device header.")
@@ -354,8 +366,9 @@ def evaluate_hardware_certification(
     inference_seconds: float,
     routing_data: dict[str, Any] | None = None,
 ) -> CertificationReport:
-    """Evaluate whether a live run qualifies as real NPU certification."""
+    """Evaluate whether a live run qualifies as real certification on the requested device."""
     failures: list[str] = []
+    expected_primary = device_class(requested_device)
     runtime = RuntimeDetails.from_payload(runtime_details)
     llm_engine = EngineSnapshot.from_payload(dict(health_data.get("engines", {}).get("llm", {})))
     embedding_engine = EngineSnapshot.from_payload(
@@ -382,8 +395,9 @@ def evaluate_hardware_certification(
             embedding_device_info,
         ).to_dict()
 
-    if not runtime.npu_visible:
-        failures.append("OpenVINO did not report an NPU device on this host.")
+    available_classes = {device_class(device) for device in runtime.available_devices}
+    if expected_primary in _PRIMARY_DEVICES and expected_primary not in available_classes:
+        failures.append(f"OpenVINO did not report a {expected_primary} device on this host.")
 
     if health_data.get("status") != "healthy":
         failures.append(f"Service health was {health_data.get('status')!r}, not 'healthy'.")
@@ -394,18 +408,20 @@ def evaluate_hardware_certification(
     if llm_backend and llm_backend != "openvino":
         failures.append(f"LLM backend was {llm_backend!r}, not 'openvino'.")
 
-    if llm_engine.device != "NPU":
+    if expected_primary in _PRIMARY_DEVICES and llm_engine.device != expected_primary:
         failures.append(
-            f"/health reported the LLM engine on {llm_engine.device!r}, not 'NPU'."
+            f"/health reported the LLM engine on {llm_engine.device!r}, not {expected_primary!r}."
         )
 
-    if active_device != "NPU":
+    if expected_primary in _PRIMARY_DEVICES and active_device != expected_primary:
         failures.append(
-            f"/health/devices reported active_device={active_device!r}, not 'NPU'."
+            f"/health/devices reported active_device={active_device!r}, not {expected_primary!r}."
         )
 
     if used_fallback is not False:
-        failures.append("The live inference path used a fallback device instead of staying on NPU.")
+        failures.append(
+            "The live inference path used a fallback device instead of staying on the requested device."
+        )
 
     if not response_text:
         failures.append("The generate endpoint returned an empty response.")
@@ -416,7 +432,9 @@ def evaluate_hardware_certification(
             short_headers=dict(routing_data.get("short_headers") or {}),
             long_headers=dict(routing_data.get("long_headers") or {}),
             fallback_device=str(routing_data.get("fallback_device") or "CPU"),
-            npu_expected=runtime.npu_visible,
+            expected_primary_device=(
+                expected_primary if expected_primary in _PRIMARY_DEVICES else None
+            ),
         )
         failures.extend(routing_failures)
 

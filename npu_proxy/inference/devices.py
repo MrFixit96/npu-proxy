@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 
 logger = logging.getLogger(__name__)
@@ -67,6 +68,19 @@ def normalize_device(value: object, *, default: str | None = None) -> str | None
     if not normalized:
         return default
     return normalized
+
+
+def device_class(value: object) -> str:
+    """Collapse an enumerated accelerator id to its canonical device class.
+
+    OpenVINO enumerates multiple accelerators of the same kind with a numeric
+    suffix (e.g. ``GPU.0``, ``GPU.1``). Routing and availability decisions reason
+    about the device *class* (``GPU``), and OpenVINO accepts the bare class name
+    as an alias for the first instance when compiling. Returns ``""`` for empty
+    input so callers can filter it out.
+    """
+    normalized = normalize_device(value) or ""
+    return re.sub(r"\.\d+$", "", normalized)
 
 
 def get_available_devices() -> list[str]:

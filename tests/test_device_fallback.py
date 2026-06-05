@@ -127,6 +127,36 @@ def test_select_best_device_fallback_chain_contract(available, preferred, expect
         assert select_best_device(preferred=preferred) == expected
 
 
+@pytest.mark.parametrize(
+    ("available", "preferred", "expected"),
+    [
+        # OpenVINO enumerates accelerators as GPU.0/GPU.1; bare "GPU" must still match.
+        (["CPU", "GPU.0", "GPU.1", "NPU"], "GPU", ("GPU", "CPU")),
+        (["CPU", "GPU.0", "GPU.1", "NPU"], "NPU", ("NPU", "GPU")),
+        (["CPU", "GPU.0"], None, ("GPU", "CPU")),
+        # An explicit enumerated instance is honored verbatim (no chain fallback).
+        (["CPU", "GPU.0", "GPU.1"], "GPU.1", ("GPU.1", None)),
+    ],
+)
+def test_select_best_device_matches_enumerated_gpu(available, preferred, expected):
+    """A bare GPU request must resolve to GPU even when OpenVINO reports GPU.0/GPU.1."""
+    from npu_proxy.inference.engine import select_best_device
+
+    with patch("npu_proxy.inference.engine.get_available_devices", return_value=available):
+        assert select_best_device(preferred=preferred) == expected
+
+
+def test_fallback_devices_after_matches_enumerated_gpu():
+    """fallback_devices_after must offer GPU even when reported as GPU.0/GPU.1."""
+    from npu_proxy.inference.engine import fallback_devices_after
+
+    with patch(
+        "npu_proxy.inference.engine.get_available_devices",
+        return_value=["CPU", "GPU.0", "GPU.1", "NPU"],
+    ):
+        assert fallback_devices_after("NPU") == ["GPU", "CPU"]
+
+
 @pytest.mark.asyncio
 async def test_health_devices_reports_advisory_fallback_runtime_state(monkeypatch, async_client):
     """Device health should report requested, actual, and fallback devices without rerouting requests."""

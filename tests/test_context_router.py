@@ -260,6 +260,20 @@ class TestDeviceFallbackChain:
                 os.environ.pop("NPU_PROXY_PREFERRED_DEVICE", None)
                 fallback = get_fallback_device()
                 assert fallback == "GPU", f"Expected GPU as fallback when available, got {fallback}"
+
+    def test_fallback_uses_enumerated_gpu_when_available(self):
+        """A GPU reported as GPU.0/GPU.1 must still be offered as the advisory fallback."""
+        from npu_proxy.routing.context_router import get_fallback_device, reset_context_router
+
+        reset_context_router()
+        with patch(
+            'npu_proxy.routing.context_router.get_available_devices',
+            return_value=["NPU", "GPU.0", "GPU.1", "CPU"],
+        ):
+            with patch.dict(os.environ, {}, clear=True):
+                os.environ.pop("NPU_PROXY_FALLBACK_DEVICE", None)
+                os.environ.pop("NPU_PROXY_PREFERRED_DEVICE", None)
+                assert get_fallback_device() == "GPU"
     
     def test_fallback_uses_cpu_when_no_gpu(self):
         """When GPU is not available, CPU should be fallback."""

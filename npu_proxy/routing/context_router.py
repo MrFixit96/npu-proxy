@@ -18,7 +18,11 @@ from npu_proxy.config import (
     load_context_routing_config,
     normalize_context_device,
 )
-from npu_proxy.inference.devices import DEVICE_FALLBACK_CHAIN, get_available_devices
+from npu_proxy.inference.devices import (
+    DEVICE_FALLBACK_CHAIN,
+    device_class,
+    get_available_devices,
+)
 from npu_proxy.inference.tokenizer import count_tokens
 
 # Default configuration values
@@ -84,14 +88,10 @@ def get_fallback_device(preferred_device: str | None = None) -> str:
         default=DEFAULT_PREFERRED_DEVICE,
         field_name="preferred_device",
     )
-    available = {
-        _safe_device(device, default="CPU")
-        for device in get_available_devices()
-        if device
-    }
+    available = {device_class(device) for device in get_available_devices() if device}
 
     try:
-        chain_idx = DEVICE_FALLBACK_CHAIN.index(preferred)
+        chain_idx = DEVICE_FALLBACK_CHAIN.index(device_class(preferred))
     except ValueError:
         chain_idx = -1
 

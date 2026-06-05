@@ -41,7 +41,7 @@ from fastapi.responses import JSONResponse
 from npu_proxy import __version__
 from npu_proxy.config import get_active_llm_runtime_config
 from npu_proxy.inference import embedding_config
-from npu_proxy.inference.devices import DEVICE_FALLBACK_CHAIN
+from npu_proxy.inference.devices import DEVICE_FALLBACK_CHAIN, device_class
 from npu_proxy.inference.embedding_engine import (
     DEFAULT_CACHE_SIZE,
     get_loaded_embedding_engine,
@@ -363,7 +363,8 @@ def check_gpu_available() -> tuple[bool, str | None]:
         Tuple of availability and a stable error code when probing fails.
     """
     try:
-        return "GPU" in get_ov_core().available_devices, None
+        classes = {device_class(d) for d in get_ov_core().available_devices}
+        return "GPU" in classes, None
     except Exception:
         logger.exception("GPU availability probe failed")
         return False, "device_probe_failed"
@@ -790,9 +791,9 @@ async def health() -> dict:
         "messages": messages,
         "version": __version__,
         # Maintain backward compatibility
-        "npu_available": "NPU" in devices,
-        "gpu_available": "GPU" in devices,
-        "cpu_available": "CPU" in devices,
+        "npu_available": "NPU" in {device_class(d) for d in devices},
+        "gpu_available": "GPU" in {device_class(d) for d in devices},
+        "cpu_available": "CPU" in {device_class(d) for d in devices},
         "devices": devices,
         "openvino_version": _get_openvino_version(),
         "device_probe_error": device_error,

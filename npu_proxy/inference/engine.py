@@ -48,6 +48,7 @@ from npu_proxy.config import (
 from npu_proxy.inference.devices import (
     DEVICE_FALLBACK_CHAIN,
     FallbackReason,
+    device_class,
     get_available_devices,
     normalize_device,
 )
@@ -310,22 +311,25 @@ def select_best_device(preferred: Optional[str] = None) -> tuple[str | None, Opt
         while still supporting the standard fallback behavior.
     """
     available = get_available_devices()
+    available_classes = {device_class(d) for d in available if d}
     logger.info(f"Available devices: {available}")
     
     # If user specified a device, try to use it
     if preferred:
         preferred = preferred.upper()
-        if preferred in available:
+        preferred_is_chain_class = preferred in DEVICE_FALLBACK_CHAIN
+        # A bare class like "GPU" must match OpenVINO's enumerated "GPU.0"/"GPU.1".
+        if preferred in available or (preferred_is_chain_class and preferred in available_classes):
             # Find fallback from chain
             fallback: Optional[str] = None
-            if preferred in DEVICE_FALLBACK_CHAIN:
+            if preferred_is_chain_class:
                 chain_idx = DEVICE_FALLBACK_CHAIN.index(preferred)
                 for device in DEVICE_FALLBACK_CHAIN[chain_idx + 1:]:
-                    if device in available:
+                    if device in available_classes:
                         fallback = device
                         break
             return preferred, fallback
-        if preferred not in DEVICE_FALLBACK_CHAIN:
+        if not preferred_is_chain_class:
             logger.warning(
                 "Requested custom device %s is unavailable and has no fallback chain",
                 preferred,
@@ -338,12 +342,12 @@ def select_best_device(preferred: Optional[str] = None) -> tuple[str | None, Opt
     
     # Select best available from fallback chain
     for device in DEVICE_FALLBACK_CHAIN:
-        if device in available:
+        if device in available_classes:
             # Find fallback
             fallback = None
             chain_idx = DEVICE_FALLBACK_CHAIN.index(device)
             for fb_device in DEVICE_FALLBACK_CHAIN[chain_idx + 1:]:
-                if fb_device in available:
+                if fb_device in available_classes:
                     fallback = fb_device
                     break
             return device, fallback
@@ -1396,7 +1400,7 @@ def acquire_device_slot(
 def fallback_devices_after(device: str) -> list[str]:
     """Return available fallback devices after the requested device in priority order."""
     normalized = str(device).strip().upper()
-    available = {str(candidate).strip().upper() for candidate in get_available_devices() if candidate}
+    available = {device_class(candidate) for candidate in get_available_devices() if candidate}
     try:
         start_index = DEVICE_FALLBACK_CHAIN.index(normalized) + 1
     except ValueError:
