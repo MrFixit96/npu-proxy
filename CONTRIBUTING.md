@@ -65,6 +65,10 @@ To build the Windows executable, create/use the virtual environment above, then 
 - Run tests before submitting PRs
 - If behavior changes, update the release-truth docs in `README.md`, `SPEC.md`, and the relevant files under `docs/` and `packaging/`
 
+## Agent Skills
+
+This repo ships [Agent Skills](https://agentskills.io) in [`.agents/skills/`](.agents/skills/) — packaged procedural knowledge that AI coding agents (Claude Code, Cursor, GitHub Copilot, Gemini CLI, etc.) discover automatically on clone. They encode this codebase's fragile invariants (device routing, model conversion, embeddings, API compatibility, operations, releasing). If you change one of those subsystems, update the matching skill in the same PR. See [`.agents/skills/README.md`](.agents/skills/README.md).
+
 ## License
 
 By contributing, you agree that your contributions will be licensed under the MIT License.
